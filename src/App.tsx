@@ -515,6 +515,10 @@ function App() {
         await signer.close?.()
         return
       }
+      if (activeSignerRef.current) {
+        await signer.close?.()
+        return
+      }
 
       if (storedSession) await writeStoredNostrConnectSession(storedSession)
       await applySigner(signer)
@@ -540,21 +544,32 @@ function App() {
     })
     connectSessionRef.current = session
     setConnectSession(session)
-    setAuthDetail(`scan QR; listening on ${session.relays.map(relayHostLabel).join(', ')}`)
+    setNostrConnectQr(null)
+    setAuthDetail(`opening listener on ${session.relays.map(relayHostLabel).join(', ')}`)
 
-    try {
-      const dataUrl = await QRCode.toDataURL(session.uri, {
-        margin: 1,
-        width: 180,
-        color: {
-          dark: '#171922',
-          light: '#fffdf8',
-        },
+    session.ready
+      .then(async () => {
+        if (attempt !== authAttemptRef.current) return
+        setAuthDetail(`scan QR; listening on ${session.relays.map(relayHostLabel).join(', ')}`)
+        try {
+          const dataUrl = await QRCode.toDataURL(session.uri, {
+            margin: 1,
+            width: 180,
+            color: {
+              dark: '#171922',
+              light: '#fffdf8',
+            },
+          })
+          if (attempt === authAttemptRef.current) setNostrConnectQr(dataUrl)
+        } catch {
+          if (attempt === authAttemptRef.current) setNostrConnectQr(null)
+        }
       })
-      setNostrConnectQr(dataUrl)
-    } catch {
-      setNostrConnectQr(null)
-    }
+      .catch((error) => {
+        if (attempt !== authAttemptRef.current) return
+        setAuthStatus('Nostr Connect listener failed')
+        setAuthDetail(errorMessage(error))
+      })
 
     session.waitForSigner
       .then((result) => completeAuthAttempt(attempt, result.signer, result.storedSession))
@@ -563,7 +578,18 @@ function App() {
         setAuthDetail(`Nostr Connect unavailable: ${errorMessage(error)}`)
       })
 
-    if (window.nostr) {
+    const waitForNip07 = async () => {
+      const startedAt = Date.now()
+      while (!window.nostr && Date.now() - startedAt < 4_000) {
+        await new Promise((resolve) => window.setTimeout(resolve, 120))
+      }
+      return Boolean(window.nostr)
+    }
+
+    waitForNip07().then((available) => {
+      if (!available || attempt !== authAttemptRef.current || activeSignerRef.current) return
+      setAuthStatus('asking NIP-07 signer')
+      setAuthDetail(`NIP-07 prompt open; QR also listening on ${session.relays.map(relayHostLabel).join(', ')}`)
       connectNip07Signer()
         .then((signer) => completeAuthAttempt(attempt, signer))
         .catch((error) => {
@@ -571,7 +597,7 @@ function App() {
           setAuthStatus('waiting for Nostr Connect')
           setAuthDetail(`NIP-07 unavailable: ${errorMessage(error)}`)
         })
-    }
+    })
   }, [clearConnectSession, completeAuthAttempt, launch, relay])
 
   const beginAutoAuth = useCallback(async () => {

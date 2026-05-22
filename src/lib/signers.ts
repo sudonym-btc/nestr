@@ -1,6 +1,9 @@
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js'
 import { BunkerSigner, createNostrConnectURI, type BunkerPointer } from 'nostr-tools/nip46'
+import { NostrConnect } from 'nostr-tools/kinds'
+import { decrypt, getConversationKey } from 'nostr-tools/nip44'
 import { generateSecretKey, getPublicKey } from 'nostr-tools/pure'
+import { Relay } from 'nostr-tools/relay'
 import type { NestrSigner } from './nostr'
 
 declare global {
@@ -101,6 +104,7 @@ export async function connectNip07Signer(): Promise<NestrSigner> {
 export interface NostrConnectSession {
   uri: string
   relays: string[]
+  ready: Promise<void>
   waitForSigner: Promise<NostrConnectResult>
   abort: () => void
 }
@@ -120,6 +124,10 @@ export interface NostrConnectResult {
   storedSession: NostrConnectStoredSession
 }
 
+interface NostrConnectResponse {
+  result?: unknown
+}
+
 export function nostrConnectAppMetadata(origin: string) {
   return {
     name: 'Nestr',
@@ -130,6 +138,122 @@ export function nostrConnectAppMetadata(origin: string) {
 
 function openAuthUrl(url: string) {
   window.open(url, '_blank', 'noopener,noreferrer')
+}
+
+function abortError() {
+  return new Error('Nostr Connect cancelled')
+}
+
+function parseConnectResponse(clientSecretKey: Uint8Array, event: { pubkey: string; content: string }, secret: string) {
+  const conversationKey = getConversationKey(clientSecretKey, event.pubkey)
+  const response = JSON.parse(decrypt(event.content, conversationKey)) as NostrConnectResponse
+  return response.result === secret
+}
+
+function waitForNostrConnectBunker(
+  clientSecretKey: Uint8Array,
+  relays: string[],
+  secret: string,
+  signal: AbortSignal,
+) {
+  const clientPubkey = getPublicKey(clientSecretKey)
+  const since = Math.floor(Date.now() / 1000) - 600
+  const relayConnections: Relay[] = []
+  const subscriptions: ReturnType<Relay['subscribe']>[] = []
+  let settled = false
+  let activeSubscriptions = 0
+  let resolveReady: () => void = () => undefined
+  let rejectReady: (error: Error) => void = () => undefined
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve
+    rejectReady = reject
+  })
+
+  const waitForBunker = new Promise<BunkerPointer>((resolve, reject) => {
+    const cleanup = () => {
+      subscriptions.splice(0).forEach((subscription) => subscription.close('nostr-connect-complete'))
+      relayConnections.splice(0).forEach((relay) => relay.close())
+    }
+
+    const rejectOnce = (error: Error) => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener('abort', onAbort)
+      cleanup()
+      reject(error)
+    }
+
+    const resolveOnce = (pointer: BunkerPointer) => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener('abort', onAbort)
+      cleanup()
+      resolve(pointer)
+    }
+
+    const onAbort = () => rejectOnce(abortError())
+    signal.addEventListener('abort', onAbort, { once: true })
+
+    Promise.allSettled(
+      relays.map(async (relayUrl) => {
+        const relay = await Relay.connect(relayUrl, { enableReconnect: true })
+        if (signal.aborted) throw abortError()
+
+        relayConnections.push(relay)
+        activeSubscriptions += 1
+        const subscription = relay.subscribe(
+          [
+            {
+              kinds: [NostrConnect],
+              '#p': [clientPubkey],
+              since,
+              limit: 10,
+            },
+          ],
+          {
+            onevent: (event) => {
+              try {
+                if (parseConnectResponse(clientSecretKey, event, secret)) {
+                  signal.removeEventListener('abort', onAbort)
+                  resolveOnce({ pubkey: event.pubkey, relays, secret })
+                }
+              } catch {
+                // Other NIP-46 traffic for this client pubkey is ignored.
+              }
+            },
+            onclose: (reason) => {
+              activeSubscriptions -= 1
+              if (activeSubscriptions <= 0 && !settled) {
+                rejectOnce(new Error(reason || 'Nostr Connect listener closed'))
+              }
+            },
+            eoseTimeout: 300_000,
+            abort: signal,
+          },
+        )
+        subscriptions.push(subscription)
+      }),
+    ).then((results) => {
+      if (settled) return
+      const connected = results.some((result) => result.status === 'fulfilled')
+      if (!connected) {
+        const reason = results
+          .map((result) => (result.status === 'rejected' ? String(result.reason) : ''))
+          .filter(Boolean)
+          .join('; ')
+        const error = new Error(reason || 'Could not connect to Nostr Connect relay')
+        rejectReady(error)
+        rejectOnce(error)
+        return
+      }
+
+      resolveReady()
+    })
+  })
+
+  waitForBunker.catch(() => undefined)
+
+  return { ready, waitForBunker }
 }
 
 function signerAdapter(signer: BunkerSigner, pubkey: string): NestrSigner {
@@ -164,34 +288,41 @@ export function startNostrConnect(options: NostrConnectStartOptions): NostrConne
     perms: NESTR_NIP46_PERMISSIONS,
     ...appMetadata,
   })
+  const listener = waitForNostrConnectBunker(clientSecretKey, relays, connectionSecret, controller.signal)
 
-  const waitForSigner = BunkerSigner.fromURI(
-    clientSecretKey,
-    uri,
-    {
+  const waitForSigner = listener.waitForBunker.then(async (bunkerPointer) => {
+    const signer = BunkerSigner.fromBunker(clientSecretKey, bunkerPointer, {
       onauth: openAuthUrl,
       skipSwitchRelays: true,
-    },
-    controller.signal,
-  ).then(async (signer) => {
-    const pubkey = await signer.getPublicKey()
-    return {
-      signer: signerAdapter(signer, pubkey),
-      storedSession: {
-        version: 1 as const,
-        clientSecretKey: clientSecretHex,
-        bunkerPointer: signer.bp,
-        userPubkey: pubkey,
-        relayUrl: relays[0],
-        relayUrls: relays,
-        connectedAt: Date.now(),
-      },
+    })
+    const onAbort = () => {
+      void signer.close().catch(() => undefined)
+    }
+    controller.signal.addEventListener('abort', onAbort, { once: true })
+
+    try {
+      const pubkey = await signer.getPublicKey()
+      return {
+        signer: signerAdapter(signer, pubkey),
+        storedSession: {
+          version: 1 as const,
+          clientSecretKey: clientSecretHex,
+          bunkerPointer: signer.bp,
+          userPubkey: pubkey,
+          relayUrl: relays[0],
+          relayUrls: relays,
+          connectedAt: Date.now(),
+        },
+      }
+    } finally {
+      controller.signal.removeEventListener('abort', onAbort)
     }
   })
 
   return {
     uri,
     relays,
+    ready: listener.ready,
     waitForSigner,
     abort: () => controller.abort('cancelled'),
   }
