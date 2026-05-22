@@ -23,8 +23,9 @@ import { avatarCss, npubForPubkey, seededPubkey, shortNpub } from './lib/avatar'
 import { parseLaunch } from './lib/launch'
 import { createLiveRelay } from './lib/liveRelay'
 import { createMockRelay, type MockUser, type RelaySnapshot } from './lib/mockRelay'
-import { hasTag, tagValue, type NestrSigner } from './lib/nostr'
+import { hasTag, tagValue, type NestrEvent, type NestrSigner } from './lib/nostr'
 import { createMockPeerVideo, type MockPeerVideo } from './lib/mockVideo'
+import { parseNostrReferences, type EntityPart } from './lib/nostrReferences'
 import {
   connectNip07Signer,
   restoreNostrConnectSigner,
@@ -82,6 +83,64 @@ function AvatarChip({ pubkey, user, small = false }: AvatarChipProps) {
         />
       )}
     </span>
+  )
+}
+
+interface NostrEntityChipProps {
+  entity: EntityPart
+  users: MockUser[]
+}
+
+function entityLabel(entity: EntityPart, users: MockUser[]) {
+  if (entity.entityType === 'profile' && entity.pubkey) {
+    const user = users.find((candidate) => candidate.pubkey === entity.pubkey)
+    return user?.name ?? shortNpub(entity.pubkey)
+  }
+
+  if (entity.entityType === 'address') {
+    return entity.kind ? `address:${entity.kind}` : 'address'
+  }
+
+  return entity.kind ? `event:${entity.kind}` : 'event'
+}
+
+function NostrEntityChip({ entity, users }: NostrEntityChipProps) {
+  const user = entity.pubkey ? users.find((candidate) => candidate.pubkey === entity.pubkey) : undefined
+
+  return (
+    <a
+      className={`nostr-chip ${entity.entityType}`}
+      href={entity.href}
+      target="_blank"
+      rel="noreferrer"
+      title={entity.code}
+    >
+      {entity.entityType === 'profile' && entity.pubkey && (
+        <AvatarChip pubkey={entity.pubkey} user={user} small />
+      )}
+      <span>{entityLabel(entity, users)}</span>
+    </a>
+  )
+}
+
+interface MessageContentProps {
+  event: NestrEvent
+  users: MockUser[]
+}
+
+function MessageContent({ event, users }: MessageContentProps) {
+  const parts = parseNostrReferences(event.content, event.tags)
+
+  return (
+    <p>
+      {parts.map((part, index) =>
+        part.type === 'text' ? (
+          <span key={`${index}-text`}>{part.text}</span>
+        ) : (
+          <NostrEntityChip key={`${index}-${part.code}`} entity={part} users={users} />
+        ),
+      )}
+    </p>
   )
 }
 
@@ -646,16 +705,6 @@ function App() {
       </aside>
 
       <section className="world-panel" aria-label="Spatial office">
-        <div className="world-topbar">
-          <div>
-            <span className="eyebrow">NIP-29 group</span>
-            <strong>{snapshot.group.id}</strong>
-          </div>
-          <div className="topbar-meta">
-            <span>{snapshot.group.relay}</span>
-            <span>{officeMap.infinite ? 'infinite' : `${officeMap.cols}x${officeMap.rows}`}</span>
-          </div>
-        </div>
         <PhaserOffice
           snapshot={{
             map: officeMap,
@@ -760,7 +809,7 @@ function App() {
                     minute: '2-digit',
                   })}</time>
                 </div>
-                <p>{event.content}</p>
+                <MessageContent event={event} users={snapshot.users} />
               </article>
             )
           })}

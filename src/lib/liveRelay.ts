@@ -17,6 +17,7 @@ import {
   type NestrSigner,
 } from './nostr'
 import type { MockUser, Nip29Group, RelaySnapshot } from './mockRelay'
+import { profilePubkeysFromReferences } from './nostrReferences'
 import {
   blossomServersFromTags,
   buildProfilePictureCandidates,
@@ -325,7 +326,7 @@ export class LiveNip29Relay {
       this.timelineRefs.splice(50)
     }
     this.upsertUser(event.pubkey)
-    this.queueProfileFetch([event.pubkey])
+    this.queueProfileFetch([event.pubkey, ...profilePubkeysFromReferences(event.content, event.tags)])
 
     if (event.kind === OFFICE_KINDS.avatarPosition) {
       try {

@@ -32,7 +32,7 @@
 .world-panel {
   position: relative;
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  grid-template-rows: 1fr auto;
   overflow: hidden;
 }
 
@@ -693,7 +693,42 @@ input:focus {
   font-size: 14px;
   line-height: 1.38;
   overflow-wrap: anywhere;
+  white-space: pre-wrap;
   word-break: break-word;
+}
+
+.nostr-chip {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  gap: 6px;
+  margin: 0 2px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-soft);
+  color: var(--ink);
+  font-weight: 800;
+  padding: 3px 8px 3px 4px;
+  text-decoration: none;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.nostr-chip.event,
+.nostr-chip.address {
+  padding-left: 9px;
+}
+
+.nostr-chip span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nostr-chip:hover {
+  border-color: rgba(45, 64, 220, 0.32);
+  background: var(--blue-soft);
+  color: var(--blue);
 }
 
 @media (max-width: 1120px) {
