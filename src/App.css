@@ -2120,6 +2120,138 @@ input:focus {
   color: #fecdd3;
 }
 
+* {
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+  scrollbar-width: thin;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  min-height: 56px;
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.14);
+  background-clip: content-box;
+}
+
+*:hover::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.22);
+  background-clip: content-box;
+}
+
+.left-panel,
+.people-list,
+.messages,
+.relay-directory-panel,
+.dm-main-panel,
+.stream-grid {
+  scrollbar-gutter: stable;
+}
+
+.messages {
+  gap: 4px;
+  padding-right: 8px;
+}
+
+.message {
+  display: grid;
+  gap: 5px;
+  border: 0 !important;
+  border-radius: 10px;
+  background: transparent !important;
+  box-shadow: none !important;
+  padding: 8px 2px;
+}
+
+.message:hover {
+  background: rgba(255, 255, 255, 0.035) !important;
+}
+
+.message-meta {
+  display: flex;
+  min-width: 0;
+  gap: 8px;
+}
+
+.message-meta strong {
+  min-width: 0;
+  overflow: hidden;
+  color: #f4f4f5;
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.message time {
+  flex: 0 0 auto;
+  color: #71717a;
+}
+
+.message p {
+  margin: 0 0 0 32px;
+  color: #d4d4d8;
+}
+
+.message-delete {
+  opacity: 0.28;
+  transition: opacity 140ms ease, background 140ms ease, color 140ms ease;
+}
+
+.message:hover .message-delete,
+.message-delete:focus-visible {
+  opacity: 1;
+}
+
+.dm-message.outgoing {
+  background: rgba(255, 255, 255, 0.045) !important;
+}
+
+.people-list {
+  padding-right: 8px;
+}
+
+.person {
+  border: 0 !important;
+  border-radius: 10px;
+  background: transparent !important;
+  box-shadow: none !important;
+  padding: 7px 5px;
+}
+
+.person:hover,
+.person.active {
+  border-color: transparent !important;
+  background: rgba(255, 255, 255, 0.045) !important;
+}
+
+.person.active {
+  box-shadow: inset 2px 0 0 rgba(163, 230, 53, 0.72) !important;
+}
+
+.person:disabled {
+  opacity: 0.86;
+}
+
+.dm-thread {
+  border: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.dm-thread:hover,
+.dm-thread:focus-visible,
+.dm-thread.active {
+  background: rgba(255, 255, 255, 0.045) !important;
+}
+
 @media (max-width: 760px) {
   .side-panel,
   .world-panel,
