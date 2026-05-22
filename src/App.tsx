@@ -8,6 +8,7 @@ import {
   DoorOpen,
   Edit3,
   LockKeyhole,
+  LoaderCircle,
   LogIn,
   LogOut,
   Maximize2,
@@ -30,6 +31,20 @@ import {
   X,
 } from 'lucide-react'
 import './App.css'
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
+import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Card } from '@/components/ui/card'
+import { Checkbox } from '@/components/ui/checkbox'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { TooltipProvider } from '@/components/ui/tooltip'
 import { OfficeRenderer } from './game/OfficeRenderer'
 import { avatarCss, npubForPubkey, resolvePubkey, seededPubkey, shortNpub } from './lib/avatar'
 import { parseLaunch } from './lib/launch'
@@ -140,20 +155,23 @@ function AvatarChip({ pubkey, user, small = false }: AvatarChipProps) {
   const src = candidateIndex < candidates.length ? candidates[candidateIndex] : undefined
 
   return (
-    <span
+    <Avatar
       className={`avatar-chip ${small ? 'small' : ''} ${src ? 'has-image' : ''}`}
+      size={small ? 'sm' : 'default'}
       style={avatarCss(pubkey)}
     >
       {src && (
-        <img
+        <AvatarImage
           src={src}
           alt=""
-          loading="lazy"
           referrerPolicy="no-referrer"
-          onError={() => setFailed({ key: candidatesKey, index: candidateIndex + 1 })}
+          onLoadingStatusChange={(status) => {
+            if (status === 'error') setFailed({ key: candidatesKey, index: candidateIndex + 1 })
+          }}
         />
       )}
-    </span>
+      <AvatarFallback />
+    </Avatar>
   )
 }
 
@@ -264,7 +282,7 @@ function StreamTile({ label, sublabel, stream, muted = false, micMuted = false, 
   }, [stream])
 
   return (
-    <article className={`stream-tile ${stream ? '' : 'empty'} ${status}`}>
+    <Card className={`stream-tile ${stream ? '' : 'empty'} ${status}`} size="sm">
       {stream ? <video ref={videoRef} autoPlay muted={muted} playsInline /> : <div className="stream-empty" />}
       <div className="stream-label">
         <strong>{label}</strong>
@@ -273,7 +291,7 @@ function StreamTile({ label, sublabel, stream, muted = false, micMuted = false, 
       <span className={`stream-mic ${micMuted ? 'muted' : ''}`} aria-label={micMuted ? `${label} muted` : `${label} unmuted`}>
         {micMuted ? <MicOff size={14} /> : <Mic size={14} />}
       </span>
-    </article>
+    </Card>
   )
 }
 
@@ -303,13 +321,13 @@ function App() {
   const [callExpanded, setCallExpanded] = useState(false)
   const [authState, setAuthState] = useState<AuthState>(() => (launch.mode === 'live' ? 'idle' : 'mock'))
   const [authStatus, setAuthStatus] = useState(() =>
-    launch.mode === 'live' ? 'opening live NIP-29 room' : 'local mock relay',
+    launch.mode === 'live' ? 'opening live chatroom' : 'local mock relay',
   )
   const [authDetail, setAuthDetail] = useState(() =>
     launch.mode === 'live' ? 'waiting for signer' : 'local mock relay',
   )
   const [activeSigner, setActiveSigner] = useState<NestrSigner | null>(null)
-  const [adminStatus, setAdminStatus] = useState('NIP-29 controls ready')
+  const [adminStatus, setAdminStatus] = useState('Chatroom controls ready')
   const [joinReason, setJoinReason] = useState('')
   const [joinCode, setJoinCode] = useState('')
   const [targetInput, setTargetInput] = useState('')
@@ -339,7 +357,7 @@ function App() {
   const nearby = nearbyPeers(selfPubkey, snapshot.positions, 136)
   const mesh = estimateWebRtcMesh(nearby.length + 1)
   const health = meshHealth(mesh.participants)
-  const metadataName = tagValue(snapshot.group.metadata, 'name') ?? 'NIP-29 office'
+  const metadataName = tagValue(snapshot.group.metadata, 'name') ?? 'Chatroom'
   const groupAbout = tagValue(snapshot.group.metadata, 'about') ?? ''
   const relayHost = relayHostLabel(snapshot.group.relay)
   const hasSelectedGroup = relay.mode === 'mock' || (launch.mode === 'live' && Boolean(launch.groupId))
@@ -616,12 +634,12 @@ function App() {
       prompt ?? {
         kind: 'manual',
         title: authPromptTitle('manual'),
-        detail: 'Choose NIP-07 or scan Nostr Connect to continue.',
+        detail: 'Choose your browser signer or scan Nostr Connect to continue.',
       },
     )
     setAuthState('connecting')
-    setAuthStatus(window.nostr ? 'asking NIP-07 signer' : 'waiting for Nostr Connect')
-    setAuthDetail(window.nostr ? 'NIP-07 prompt open; QR also ready' : 'scan the QR with your signer')
+    setAuthStatus(window.nostr ? 'asking browser signer' : 'waiting for Nostr Connect')
+    setAuthDetail(window.nostr ? 'signer prompt open; QR also ready' : 'scan the QR with your signer')
     clearConnectSession()
 
     const session = startNostrConnect({
@@ -674,14 +692,14 @@ function App() {
 
     waitForNip07().then((available) => {
       if (!available || attempt !== authAttemptRef.current || activeSignerRef.current) return
-      setAuthStatus('asking NIP-07 signer')
-      setAuthDetail(`NIP-07 prompt open; QR also listening on ${session.relays.map(relayHostLabel).join(', ')}`)
+      setAuthStatus('asking browser signer')
+      setAuthDetail(`signer prompt open; QR also listening on ${session.relays.map(relayHostLabel).join(', ')}`)
       connectNip07Signer()
         .then((signer) => completeAuthAttempt(attempt, signer))
         .catch((error) => {
           if (attempt !== authAttemptRef.current || activeSignerRef.current) return
           setAuthStatus('waiting for Nostr Connect')
-          setAuthDetail(`NIP-07 unavailable: ${errorMessage(error)}`)
+          setAuthDetail(`browser signer unavailable: ${errorMessage(error)}`)
         })
     })
   }, [clearConnectSession, completeAuthAttempt, launch, relay])
@@ -782,7 +800,7 @@ function App() {
       void beginLogin({
         kind: 'relay',
         title: authPromptTitle('relay'),
-        detail: `${relayHost} rejected a subscription until NIP-42 auth succeeds. The room query will retry after signing in.`,
+        detail: `${relayHost} wants relay auth before returning this chatroom. The room query will retry after signing in.`,
       })
     }, 0)
 
@@ -796,7 +814,7 @@ function App() {
       void beginLogin({
         kind: 'dm',
         title: authPromptTitle('dm'),
-        detail: `NIP-17 gift wrap subscriptions need your signer so ${relayHost} can return your threads.`,
+        detail: `Direct messages need your signer so ${relayHost} can return your threads.`,
       })
     }, 0)
 
@@ -895,7 +913,7 @@ function App() {
     const result = await relay.publishDirectMessage(selfPubkey, activeDmPubkey, dmMessage)
     if (!result.ok) {
       if (signerRequired(result.reason)) {
-        requestAuth('dm', 'Sign in to send encrypted NIP-17 direct messages.')
+        requestAuth('dm', 'Sign in to send encrypted direct messages.')
       } else {
         setAuthStatus(String(result.reason))
       }
@@ -923,7 +941,7 @@ function App() {
       const result = await action()
       setAdminStatus(result.ok ? `${label} published` : `${label} failed: ${result.reason}`)
       if (!result.ok && signerRequired(result.reason)) {
-        requestAuth('admin', `Sign in to publish the ${label} NIP-29 admin event.`)
+        requestAuth('admin', `Sign in to publish the ${label} chatroom admin action.`)
       }
       return result.ok
     } catch (error) {
@@ -985,7 +1003,7 @@ function App() {
 
   async function editMetadata(event: FormEvent) {
     event.preventDefault()
-    const ok = await runNip29Action('edit-metadata', () =>
+    const ok = await runNip29Action('details', () =>
       relay.publishEditMetadata(selfPubkey, metadataDraft, 'metadata updated from nestr'),
     )
     if (ok) setMetadataEdits({})
@@ -1067,15 +1085,20 @@ function App() {
     setMediaState('requesting')
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: nextMic,
-        video: nextCamera
-          ? {
-              width: { ideal: 640 },
-              height: { ideal: 360 },
-            }
-          : false,
-      })
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error('media devices unavailable')
+      const stream = await withTimeout(
+        navigator.mediaDevices.getUserMedia({
+          audio: nextMic,
+          video: nextCamera
+            ? {
+                width: { ideal: 640 },
+                height: { ideal: 360 },
+              }
+            : false,
+        }),
+        8000,
+        'camera request timed out',
+      )
       stream.getAudioTracks().forEach((track) => {
         track.enabled = nextMic
       })
@@ -1171,6 +1194,7 @@ function App() {
   }
 
   return (
+    <TooltipProvider>
     <main className="app-shell" data-auth-state={authState} data-view={appView}>
       {showSignerPill && (
         <section className={`signer-pill ${authState}`} aria-label="Signer status">
@@ -1186,32 +1210,33 @@ function App() {
             <span>{authDetail}</span>
           </div>
           {authState === 'disconnected' && (
-            <button type="button" className="icon-soft" onClick={() => void retrySigner()} aria-label="Retry signer">
+            <Button type="button" className="icon-soft" onClick={() => void retrySigner()} aria-label="Retry signer">
               <RefreshCcw size={15} />
-            </button>
+            </Button>
           )}
           {authState === 'connected' && (
-            <button type="button" className="icon-soft" onClick={() => void logoutSigner()} aria-label="Logout signer">
+            <Button type="button" className="icon-soft" onClick={() => void logoutSigner()} aria-label="Logout signer">
               <LogOut size={15} />
-            </button>
+            </Button>
           )}
         </section>
       )}
 
-      {showAuthPrompt && authPrompt && (
-        <div className="auth-modal-backdrop" role="presentation">
-          <section className="auth-modal" role="dialog" aria-modal="true" aria-label="Nostr sign in">
-            <div className="auth-modal-header">
+      {authPrompt && (
+        <Dialog open={showAuthPrompt} onOpenChange={(open) => !open && cancelAuthPrompt()}>
+          <DialogContent className="auth-modal" showCloseButton={false}>
+            <DialogHeader className="auth-modal-header">
               <div>
                 <p className="eyebrow">nostr auth</p>
+                <DialogTitle className="sr-only">Nostr sign in</DialogTitle>
                 <h2>{authPrompt.title}</h2>
               </div>
-              <button type="button" className="icon-soft" onClick={cancelAuthPrompt} aria-label="Close auth prompt">
+              <Button type="button" className="icon-soft" onClick={cancelAuthPrompt} aria-label="Close auth prompt">
                 <X size={15} />
-              </button>
-            </div>
+              </Button>
+            </DialogHeader>
 
-            <p className="auth-modal-copy">{authPrompt.detail}</p>
+            <DialogDescription className="auth-modal-copy">{authPrompt.detail}</DialogDescription>
 
             <div className="auth-status">
               <AvatarChip pubkey={selfPubkey} user={currentUser} small />
@@ -1222,41 +1247,44 @@ function App() {
             </div>
 
             {connectSession && nostrConnectQr && authState === 'connecting' && (
-              <div className="connect-card">
+              <Card className="connect-card" size="sm">
                 <img src={nostrConnectQr} alt="Nostr Connect QR" />
                 <span>Listening on {connectSession.relays.map(relayHostLabel).join(', ')}</span>
                 <a href={connectSession.uri}>Open Nostr Connect</a>
-              </div>
+              </Card>
             )}
 
             {authState === 'connecting' && !nostrConnectQr && (
-              <div className="auth-pending">Opening relay listener for Nostr Connect...</div>
+              <div className="auth-pending">
+                <LoaderCircle size={15} className="spin-icon" />
+                Opening relay listener for Nostr Connect...
+              </div>
             )}
 
             <div className="auth-actions">
               {authState === 'disconnected' ? (
                 <>
-                  <button type="button" className="secondary-action" onClick={() => void retrySigner()}>
+                  <Button type="button" className="secondary-action" onClick={() => void retrySigner()}>
                     <RefreshCcw size={16} />
                     Retry
-                  </button>
-                  <button type="button" className="secondary-action danger" onClick={() => void logoutSigner()}>
+                  </Button>
+                  <Button type="button" className="secondary-action danger" onClick={() => void logoutSigner()}>
                     <LogOut size={16} />
                     Logout
-                  </button>
+                  </Button>
                 </>
               ) : (
-                <button type="button" className="secondary-action admin-wide" onClick={cancelAuthPrompt}>
+                <Button type="button" className="secondary-action admin-wide" onClick={cancelAuthPrompt}>
                   Cancel
-                </button>
+                </Button>
               )}
             </div>
-          </section>
-        </div>
+          </DialogContent>
+        </Dialog>
       )}
 
       <nav className="app-rail" aria-label="Primary navigation">
-        <button
+        <Button
           type="button"
           className={`rail-button ${appView === 'dm' ? 'active' : ''}`}
           onClick={() => {
@@ -1269,9 +1297,9 @@ function App() {
           aria-label="Direct messages"
         >
           <Send size={23} />
-        </button>
+        </Button>
         <div className="rail-divider" />
-        <button
+        <Button
           type="button"
           className={`rail-button relay ${appView !== 'dm' ? 'active' : ''}`}
           onClick={() => setAppView('relay')}
@@ -1279,7 +1307,7 @@ function App() {
           title={relayHost}
         >
           <Radio size={22} />
-        </button>
+        </Button>
       </nav>
 
       <aside
@@ -1298,18 +1326,18 @@ function App() {
               <span className="relay-dot" data-status={connectionStatus} />
             </div>
 
-            <section className="panel-section dm-thread-list" aria-label="Gift wrap threads">
+            <section className="panel-section dm-thread-list" aria-label="Direct message threads">
               <div className="section-title">
-                <span>Gift wraps</span>
+                <span>Threads</span>
                 <span>{dmThreads.length} threads</span>
               </div>
               {dmThreads.length === 0 ? (
-                <div className="empty-state">No gift-wrapped DMs have arrived yet.</div>
+                <div className="empty-state">No direct messages have arrived yet.</div>
               ) : (
                 dmThreads.map((thread) => {
                   const user = snapshot.users.find((candidate) => candidate.pubkey === thread.pubkey)
                   return (
-                    <button
+                    <Button
                       key={thread.pubkey}
                       type="button"
                       className={`dm-thread ${activeDmPubkey === thread.pubkey ? 'active' : ''}`}
@@ -1326,7 +1354,7 @@ function App() {
                         <strong>{nameFor(thread.pubkey, snapshot.users)}</strong>
                         <small>{thread.preview}</small>
                       </span>
-                    </button>
+                    </Button>
                   )
                 })
               )}
@@ -1342,34 +1370,23 @@ function App() {
               <span className="relay-dot" data-status={connectionStatus} />
             </div>
 
-            <div className="status-grid">
-              <span>
-                <Radio size={15} />
-                {connectionStatus}
-              </span>
-              <span>
-                <MessageCircle size={15} />
-                {relayGroupCountLabel} chats
-              </span>
-            </div>
-
             <section className="panel-section relay-channel-list" aria-label="Relay group chats">
               <div className="section-title">
                 <span>Channels</span>
                 <span>{relayGroupCountLabel}</span>
               </div>
-              <label className="relay-search">
+              <Label className="relay-search">
                 <Search size={15} />
-                <input
+                <Input
                   type="search"
                   value={relaySearch}
                   onChange={(event) => setRelaySearch(event.target.value)}
                   placeholder="Search groups"
                   aria-label="Search relay groups"
                 />
-              </label>
+              </Label>
               {relayGroups.length === 0 ? (
-                <div className="empty-state">Waiting for NIP-29 group metadata from this relay.</div>
+                <div className="empty-state">Waiting for chatrooms from this relay.</div>
               ) : filteredRelayGroups.length === 0 ? (
                 <div className="empty-state">No groups match that search.</div>
               ) : (
@@ -1378,7 +1395,7 @@ function App() {
                   const name = tagValue(groupEvent, 'name') ?? groupId
 
                   return (
-                    <button
+                    <Button
                       type="button"
                       key={`${groupEvent.pubkey}:${groupId}`}
                       className={`relay-nav-row ${hasSelectedGroup && groupId === snapshot.group.id ? 'active' : ''}`}
@@ -1386,7 +1403,7 @@ function App() {
                     >
                       <MessageCircle size={16} />
                       <span>{name}</span>
-                    </button>
+                    </Button>
                   )
                 })
               )}
@@ -1396,7 +1413,7 @@ function App() {
           <>
         <div className="brand-row">
           <div>
-            <p className="eyebrow">nestr</p>
+            <p className="eyebrow">{relayHost}</p>
             <h1>{metadataName}</h1>
           </div>
           <span className="relay-dot" data-status={connectionStatus} />
@@ -1413,58 +1430,27 @@ function App() {
             <Users size={15} />
             {groupMemberPubkeys.length} members
           </span>
-          <span>
-            <Radio size={15} />
-            {connectionStatus}
-          </span>
-          <span>
-            <MessageCircle size={15} />
-            {snapshot.group.id}
-          </span>
         </div>
-
-        <section className="relay-nav" aria-label="Relay channels">
-          <button
-            type="button"
-            className="relay-nav-row"
-            onClick={() => setAppView('relay')}
-          >
-            <Radio size={16} />
-            <span>{relayHost}</span>
-          </button>
-          <button
-            type="button"
-            className={`relay-nav-row ${appView === 'group' ? 'active' : ''}`}
-            onClick={() => setAppView('group')}
-          >
-            <MessageCircle size={16} />
-            <span>{metadataName}</span>
-          </button>
-        </section>
 
         {relay.mode === 'mock' && (
           <form className="signin" onSubmit={joinOffice}>
-            <label htmlFor="npub">npub</label>
+            <Label htmlFor="npub">npub</Label>
             <div className="input-row">
-              <input
+              <Input
                 id="npub"
                 value={npubInput}
                 onChange={(event) => setNpubInput(event.target.value)}
                 spellCheck={false}
               />
-              <button type="submit" aria-label="Join office">
+              <Button type="submit" aria-label="Join office">
                 <LogIn size={18} />
-              </button>
+              </Button>
             </div>
           </form>
         )}
 
-        <section className="panel-section admin-panel" aria-label="NIP-29 controls">
-          <div className="section-title">
-            <span>NIP-29 controls</span>
-            <span>{canManageGroup ? 'admin' : currentIsMember ? 'member' : 'visitor'}</span>
-          </div>
-          <div className="admin-card">
+        <section className="panel-section admin-panel" aria-label="Chatroom controls">
+          <Card className="admin-card" size="sm">
             <div className="admin-status">
               <ShieldCheck size={16} />
               <span>{adminStatus}</span>
@@ -1472,36 +1458,36 @@ function App() {
 
             {!currentIsMember ? (
               <form className="admin-form" onSubmit={requestJoin}>
-                <label htmlFor="join-reason">Join request</label>
-                <input
+                <Label htmlFor="join-reason">Join request</Label>
+                <Input
                   id="join-reason"
                   value={joinReason}
                   onChange={(event) => setJoinReason(event.target.value)}
                   placeholder="Reason"
                 />
-                <input
+                <Input
                   value={joinCode}
                   onChange={(event) => setJoinCode(event.target.value)}
                   placeholder="Invite code"
                   aria-label="Invite code"
                 />
-                <button type="submit" className="secondary-action">
+                <Button type="submit" className="secondary-action">
                   <DoorOpen size={16} />
                   Request
-                </button>
+                </Button>
               </form>
             ) : (
-              <button type="button" className="secondary-action admin-wide" onClick={() => void leaveGroup()}>
+              <Button type="button" className="secondary-action admin-wide" onClick={() => void leaveGroup()}>
                 <DoorOpen size={16} />
                 Leave group
-              </button>
+              </Button>
             )}
 
             {canManageGroup && (
               <>
                 {snapshot.joinRequests.length > 0 && (
                   <div className="admin-stack">
-                    <label>Pending joins</label>
+                    <Label>Pending joins</Label>
                     {snapshot.joinRequests.slice(0, 4).map((request) => (
                       <div className="join-request" key={request.id}>
                         <AvatarChip
@@ -1510,84 +1496,84 @@ function App() {
                           small
                         />
                         <span>{nameFor(request.pubkey, snapshot.users)}</span>
-                        <button
+                        <Button
                           type="button"
                           className="icon-soft"
                           onClick={() => void acceptJoin(request.pubkey)}
                           aria-label={`Accept ${nameFor(request.pubkey, snapshot.users)}`}
                         >
                           <Check size={15} />
-                        </button>
-                        <button
+                        </Button>
+                        <Button
                           type="button"
                           className="icon-soft danger"
                           onClick={() => void rejectJoin(request.pubkey)}
                           aria-label={`Reject ${nameFor(request.pubkey, snapshot.users)}`}
                         >
                           <UserMinus size={15} />
-                        </button>
+                        </Button>
                       </div>
                     ))}
                   </div>
                 )}
 
                 <form className="admin-form" onSubmit={putUser}>
-                  <label htmlFor="admin-target">Member</label>
-                  <input
+                  <Label htmlFor="admin-target">Member</Label>
+                  <Input
                     id="admin-target"
                     value={targetInput}
                     onChange={(event) => setTargetInput(event.target.value)}
                     placeholder="npub or hex pubkey"
                     spellCheck={false}
                   />
-                  <input
+                  <Input
                     value={targetRoles}
                     onChange={(event) => setTargetRoles(event.target.value)}
                     placeholder={supportedRoles.length ? supportedRoles.map((role) => role.name).join(', ') : 'roles'}
                     aria-label="Roles"
                   />
                   <div className="admin-row">
-                    <button type="submit" className="secondary-action">
+                    <Button type="submit" className="secondary-action">
                       <UserPlus size={16} />
                       Add
-                    </button>
-                    <button type="button" className="secondary-action danger" onClick={() => void removeUser()}>
+                    </Button>
+                    <Button type="button" className="secondary-action danger" onClick={() => void removeUser()}>
                       <UserMinus size={16} />
                       Remove
-                    </button>
+                    </Button>
                   </div>
                 </form>
 
                 <form className="admin-form" onSubmit={createInvite}>
-                  <label htmlFor="invite-code">Invite</label>
+                  <Label htmlFor="invite-code">Invite</Label>
                   <div className="input-row">
-                    <input
+                    <Input
                       id="invite-code"
                       value={inviteCode}
                       onChange={(event) => setInviteCode(event.target.value)}
                       spellCheck={false}
                     />
-                    <button type="submit" aria-label="Create invite">
+                    <Button type="submit" aria-label="Create invite">
                       <Ticket size={16} />
-                    </button>
+                    </Button>
                   </div>
                 </form>
 
                 <form className="admin-form" onSubmit={editMetadata}>
-                  <label htmlFor="group-name">Metadata</label>
-                  <input
+                  <Label htmlFor="group-name">Details</Label>
+                  <Input
                     id="group-name"
                     value={metadataDraft.name}
                     onChange={(event) => setMetadataEdits((edits) => ({ ...edits, name: event.target.value }))}
                     placeholder="Group name"
                   />
-                  <input
+                  <Input
                     value={metadataDraft.about}
                     onChange={(event) => setMetadataEdits((edits) => ({ ...edits, about: event.target.value }))}
                     placeholder="About"
                     aria-label="Group about"
                   />
-                  <input
+                  <Input
                     value={metadataDraft.picture}
                     onChange={(event) => setMetadataEdits((edits) => ({ ...edits, picture: event.target.value }))}
                     placeholder="Picture URL"
@@ -1595,52 +1581,51 @@ function App() {
                   />
                   <div className="flag-grid">
                     {(['private', 'restricted', 'closed', 'hidden'] as const).map((flag) => (
-                      <label key={flag} className="flag-toggle">
-                        <input
-                          type="checkbox"
+                      <Label key={flag} className="flag-toggle">
+                        <Checkbox
                           checked={metadataDraft[flag]}
-                          onChange={(event) =>
-                            setMetadataEdits((edits) => ({ ...edits, [flag]: event.target.checked }))
+                          onCheckedChange={(checked) =>
+                            setMetadataEdits((edits) => ({ ...edits, [flag]: checked === true }))
                           }
                         />
                         {flag}
-                      </label>
+                      </Label>
                     ))}
                   </div>
-                  <button type="submit" className="secondary-action admin-wide">
+                  <Button type="submit" className="secondary-action admin-wide">
                     <Edit3 size={16} />
-                    Save metadata
-                  </button>
+                    Save details
+                  </Button>
                 </form>
 
                 <div className="admin-form">
-                  <label htmlFor="delete-event">Moderation</label>
-                  <input
+                  <Label htmlFor="delete-event">Moderation</Label>
+                  <Input
                     id="delete-event"
                     value={eventIdInput}
                     onChange={(event) => setEventIdInput(event.target.value)}
-                    placeholder="event id to delete"
+                    placeholder="message id to delete"
                     spellCheck={false}
                   />
                   <div className="admin-row">
-                    <button type="button" className="secondary-action danger" onClick={() => void deleteEvent()}>
+                    <Button type="button" className="secondary-action danger" onClick={() => void deleteEvent()}>
                       <Trash2 size={16} />
-                      Delete event
-                    </button>
+                      Delete message
+                    </Button>
                   </div>
                   <div className="admin-row">
-                    <button type="button" className="secondary-action" onClick={() => void createGroup()}>
-                      Create group
-                    </button>
-                    <button type="button" className="secondary-action danger" onClick={() => void deleteGroup()}>
-                      Delete group
-                    </button>
+                    <Button type="button" className="secondary-action" onClick={() => void createGroup()}>
+                      Create chatroom
+                    </Button>
+                    <Button type="button" className="secondary-action danger" onClick={() => void deleteGroup()}>
+                      Delete chatroom
+                    </Button>
                   </div>
                 </div>
 
                 {snapshot.moderationEvents.length > 0 && (
                   <div className="admin-stack">
-                    <label>Recent actions</label>
+                    <Label>Recent actions</Label>
                     {snapshot.moderationEvents.slice(0, 3).map((event) => (
                       <span className="admin-log" key={event.id}>{moderationSummary(event)}</span>
                     ))}
@@ -1648,7 +1633,7 @@ function App() {
                 )}
               </>
             )}
-          </div>
+          </Card>
         </section>
 
         {showMesh && (
@@ -1657,22 +1642,28 @@ function App() {
               <span>Nearby mesh</span>
               <span className={`mesh-pill ${health}`}>{mesh.participants}</span>
             </div>
-            <div className="mesh-card">
+            <Card className="mesh-card" size="sm">
               <div>
                 <strong>{callStarted ? 'P2P live' : 'P2P ready'}</strong>
                 <p>{displayedMesh.connections} links · {displayedMesh.estimatedUploadMbps} Mbps uplink</p>
               </div>
-              <button
+              <Button
                 type="button"
                 className="primary-action"
                 disabled={callPeers.length === 0}
                 onClick={toggleCall}
                 aria-label={callStarted ? 'Leave call' : 'Start call'}
               >
-                {callStarted ? <Mic size={18} /> : <Video size={18} />}
-                {callStarted ? 'Leave' : 'Start'}
-              </button>
-            </div>
+                {mediaState === 'requesting' ? (
+                  <LoaderCircle size={18} className="spin-icon" />
+                ) : callStarted ? (
+                  <Mic size={18} />
+                ) : (
+                  <Video size={18} />
+                )}
+                {mediaState === 'requesting' ? 'Starting' : callStarted ? 'Leave' : 'Start'}
+              </Button>
+            </Card>
             <div className="nearby-list">
               {nearby.slice(0, 3).map((peer) => (
                 <span key={peer.pubkey}>{nameFor(peer.pubkey, snapshot.users)}</span>
@@ -1688,7 +1679,7 @@ function App() {
             <span>{mapCapacityLabel(activeCount)}</span>
           </div>
           {visiblePeople.map((user) => (
-            <button
+            <Button
               type="button"
               key={user.pubkey}
               className={`person ${user.pubkey === selfPubkey ? 'active' : ''}`}
@@ -1714,7 +1705,7 @@ function App() {
                 <strong>{user.pubkey === selfPubkey ? 'You' : user.name}</strong>
                 <small>{user.role}</small>
               </span>
-            </button>
+            </Button>
           ))}
         </section>
           </>
@@ -1741,24 +1732,24 @@ function App() {
               <section
                 ref={callStageRef}
                 className={`call-stage ${callExpanded ? 'expanded' : ''}`}
-                aria-label={relay.mode === 'mock' ? 'Mock WebRTC call' : 'WebRTC call'}
+                aria-label={relay.mode === 'mock' ? 'Mock call' : 'Call'}
               >
                 <div className="call-stage-bar">
                   <div>
-                    <strong>{relay.mode === 'mock' ? 'Mock WebRTC mesh' : 'WebRTC mesh'}</strong>
-                    <span>{displayedMesh.participants} participants · Nostr-signaled proximity call</span>
+                    <strong>{relay.mode === 'mock' ? 'Mock call' : 'Call'}</strong>
+                    <span>{displayedMesh.participants} participants · proximity call</span>
                   </div>
-                  <button
+                  <Button
                     type="button"
                     className="icon-button"
                     onClick={toggleCallFullscreen}
                     aria-label={callExpanded ? 'Exit fullscreen call' : 'Fullscreen call'}
                   >
                     {callExpanded ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
-                  </button>
+                  </Button>
                 </div>
                 <div className="media-controls" aria-label="Media controls">
-                  <button
+                  <Button
                     type="button"
                     className={cameraEnabled ? '' : 'off'}
                     onClick={toggleCamera}
@@ -1766,8 +1757,8 @@ function App() {
                   >
                     {cameraEnabled ? <Camera size={18} /> : <CameraOff size={18} />}
                     <span>Camera</span>
-                  </button>
-                  <button
+                  </Button>
+                  <Button
                     type="button"
                     className={micEnabled ? '' : 'off'}
                     onClick={toggleMic}
@@ -1775,8 +1766,8 @@ function App() {
                   >
                     {micEnabled ? <Mic size={18} /> : <MicOff size={18} />}
                     <span>Mic</span>
-                  </button>
-                  <button
+                  </Button>
+                  <Button
                     type="button"
                     className={screenStream ? 'active' : ''}
                     onClick={toggleScreenShare}
@@ -1791,7 +1782,7 @@ function App() {
                   >
                     <Monitor size={18} />
                     <span>Share</span>
-                  </button>
+                  </Button>
                 </div>
                 <div className="stream-grid">
                   <StreamTile
@@ -1847,7 +1838,7 @@ function App() {
                 const sender = snapshot.users.find((user) => user.pubkey === event.pubkey)
 
                 return (
-                  <article key={event.id} className="message">
+                  <Card key={event.id} className="message" size="sm">
                     <div className="message-meta">
                       <AvatarChip pubkey={event.pubkey} user={sender} small />
                       <strong>{nameFor(event.pubkey, snapshot.users)}</strong>
@@ -1856,35 +1847,35 @@ function App() {
                         minute: '2-digit',
                       })}</time>
                       {canManageGroup && (
-                        <button
+                        <Button
                           type="button"
                           className="message-delete"
                           onClick={() => void deleteEvent(event.id)}
                           aria-label={`Delete message from ${nameFor(event.pubkey, snapshot.users)}`}
                         >
                           <Trash2 size={14} />
-                        </button>
+                        </Button>
                       )}
                     </div>
                     <MessageContent event={event} users={snapshot.users} />
-                  </article>
+                  </Card>
                 )
               })}
               <div ref={messagesEndRef} />
             </div>
 
             <form className="composer" onSubmit={sendMessage}>
-              <label htmlFor="message">Message</label>
+              <Label htmlFor="message">Message</Label>
               <div className="input-row">
-                <input
+                <Input
                   id="message"
                   value={message}
                   onChange={(event) => setMessage(event.target.value)}
                   placeholder="Write to the room"
                 />
-                <button type="submit" aria-label="Send message">
+                <Button type="submit" aria-label="Send message">
                   <Send size={18} />
-                </button>
+                </Button>
               </div>
             </form>
           </aside>
@@ -1900,29 +1891,29 @@ function App() {
             </div>
             <span>{relayGroupCountLabel} chats</span>
           </div>
-          <label className="relay-search directory-search">
+          <Label className="relay-search directory-search">
             <Search size={15} />
-            <input
+            <Input
               type="search"
               value={relaySearch}
               onChange={(event) => setRelaySearch(event.target.value)}
               placeholder="Search groups"
               aria-label="Search relay groups"
             />
-          </label>
+          </Label>
           <div className="relay-chat-grid">
             {relayGroups.length === 0 ? (
-              <div className="empty-state">Waiting for NIP-29 group metadata from this relay.</div>
+              <div className="empty-state">Waiting for chatrooms from this relay.</div>
             ) : filteredRelayGroups.length === 0 ? (
               <div className="empty-state">No groups match that search.</div>
             ) : (
               filteredRelayGroups.map((groupEvent) => {
                 const groupId = tagValue(groupEvent, 'd') ?? snapshot.group.id
                 const name = tagValue(groupEvent, 'name') ?? groupId
-                const about = tagValue(groupEvent, 'about') ?? 'NIP-29 group'
+                const about = tagValue(groupEvent, 'about') ?? 'Chatroom'
 
                 return (
-                  <button
+                  <Button
                     type="button"
                     key={`${groupEvent.pubkey}:${groupId}`}
                     className={`relay-chat-card ${hasSelectedGroup && groupId === snapshot.group.id ? 'current' : ''}`}
@@ -1933,7 +1924,7 @@ function App() {
                       <strong>{name}</strong>
                       <small>{about}</small>
                     </span>
-                  </button>
+                  </Button>
                 )
               })
             )}
@@ -1942,18 +1933,18 @@ function App() {
       )}
 
       {appView === 'dm' && (
-        <section className="world-panel dm-main-panel" aria-label="Gift wrapped direct messages">
+        <section className="world-panel dm-main-panel" aria-label="Direct messages">
           {activeDmPubkey ? (
             <>
               <div className="directory-header">
                 <div>
-                  <p className="eyebrow">nip-17</p>
+                  <p className="eyebrow">dm</p>
                   <h2>{activeDmPeer?.name ?? nameFor(activeDmPubkey, snapshot.users)}</h2>
                 </div>
-                <button type="button" className="dm-back" onClick={() => setActiveDmPubkey(null)}>
+                <Button type="button" className="dm-back" onClick={() => setActiveDmPubkey(null)}>
                   <ChevronLeft size={17} />
                   Threads
-                </button>
+                </Button>
               </div>
               <div className="messages dm-messages" role="log" aria-label="Direct messages">
                 {activeDmMessages.map((dm) => {
@@ -1961,7 +1952,7 @@ function App() {
                   const sender = snapshot.users.find((user) => user.pubkey === dm.senderPubkey)
 
                   return (
-                    <article key={dm.id} className={`message dm-message ${outgoing ? 'outgoing' : 'incoming'}`}>
+                    <Card key={dm.id} className={`message dm-message ${outgoing ? 'outgoing' : 'incoming'}`} size="sm">
                       <div className="message-meta">
                         <AvatarChip pubkey={dm.senderPubkey} user={sender} small />
                         <strong>{outgoing ? 'You' : nameFor(dm.senderPubkey, snapshot.users)}</strong>
@@ -1971,23 +1962,23 @@ function App() {
                         })}</time>
                       </div>
                       <p>{dm.content}</p>
-                    </article>
+                    </Card>
                   )
                 })}
                 <div ref={dmMessagesEndRef} />
               </div>
               <form className="composer" onSubmit={sendDirectMessage}>
-                <label htmlFor="dm-message">Direct message</label>
+                <Label htmlFor="dm-message">Direct message</Label>
                 <div className="input-row">
-                  <input
+                  <Input
                     id="dm-message"
                     value={dmMessage}
                     onChange={(event) => setDmMessage(event.target.value)}
-                    placeholder="Send a NIP-17 DM"
+                    placeholder="Send a direct message"
                   />
-                  <button type="submit" aria-label="Send direct message">
+                  <Button type="submit" aria-label="Send direct message">
                     <Send size={18} />
-                  </button>
+                  </Button>
                 </div>
               </form>
             </>
@@ -1995,19 +1986,19 @@ function App() {
             <>
               <div className="directory-header">
                 <div>
-                  <p className="eyebrow">nip-17</p>
-                  <h2>Gift Wrap Threads</h2>
+                  <p className="eyebrow">dm</p>
+                  <h2>Direct Messages</h2>
                 </div>
                 <span>{dmThreads.length} threads</span>
               </div>
               <div className="dm-overview-grid">
                 {dmThreads.length === 0 ? (
-                  <div className="empty-state">No gift-wrapped DMs have arrived yet.</div>
+                  <div className="empty-state">No direct messages have arrived yet.</div>
                 ) : (
                   dmThreads.map((thread) => {
                     const user = snapshot.users.find((candidate) => candidate.pubkey === thread.pubkey)
                     return (
-                      <button
+                      <Button
                         key={thread.pubkey}
                         type="button"
                         className="dm-overview-card"
@@ -2024,7 +2015,7 @@ function App() {
                           <strong>{nameFor(thread.pubkey, snapshot.users)}</strong>
                           <small>{thread.preview}</small>
                         </span>
-                      </button>
+                      </Button>
                     )
                   })
                 )}
@@ -2034,6 +2025,7 @@ function App() {
         </section>
       )}
     </main>
+    </TooltipProvider>
   )
 }
 

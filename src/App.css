@@ -40,7 +40,7 @@
   border: 1px solid var(--line);
   border-radius: 16px;
   background: #fff;
-  color: var(--muted);
+  color: var(--muted-foreground);
 }
 
 .rail-button.active {
@@ -120,7 +120,7 @@
 
 .eyebrow {
   margin: 0 0 4px;
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 11px;
   font-weight: 800;
   letter-spacing: 0;
@@ -145,7 +145,7 @@ h2 {
 
 .about {
   margin: -6px 0 0;
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 14px;
 }
 
@@ -230,7 +230,7 @@ h2 {
 }
 
 label {
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 12px;
   font-weight: 800;
   letter-spacing: 0;
@@ -238,6 +238,9 @@ label {
 }
 
 .input-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
   gap: 8px;
 }
 
@@ -287,7 +290,7 @@ input:focus {
 
 .secondary-action:disabled {
   cursor: wait;
-  color: var(--muted);
+  color: var(--muted-foreground);
 }
 
 .live-auth {
@@ -316,7 +319,7 @@ input:focus {
 }
 
 .auth-status span {
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 12px;
   line-height: 1.35;
 }
@@ -363,7 +366,7 @@ input:focus {
 }
 
 .connect-card span {
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-family: var(--mono);
   font-size: 11px;
   line-height: 1.35;
@@ -405,7 +408,7 @@ input:focus {
 }
 
 .signer-pill span {
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 11px;
 }
 
@@ -463,7 +466,7 @@ input:focus {
 .auth-pending {
   border: 1px dashed var(--line);
   border-radius: var(--radius);
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-family: var(--mono);
   font-size: 12px;
   padding: 10px;
@@ -503,7 +506,7 @@ input:focus {
 
 .admin-status {
   gap: 8px;
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 12px;
   font-weight: 800;
 }
@@ -600,7 +603,7 @@ input:focus {
   min-height: 28px;
   border-radius: 999px;
   background: var(--panel-soft);
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-family: var(--mono);
   font-size: 11px;
   overflow: hidden;
@@ -624,7 +627,7 @@ input:focus {
 .relay-search svg {
   position: absolute;
   left: 11px;
-  color: var(--muted);
+  color: var(--muted-foreground);
   pointer-events: none;
 }
 
@@ -638,11 +641,22 @@ input:focus {
 }
 
 .section-title {
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 12px;
   font-weight: 900;
   letter-spacing: 0;
   text-transform: uppercase;
+}
+
+.section-title span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.section-title span:last-child {
+  flex: 0 0 auto;
 }
 
 .mesh-pill {
@@ -682,7 +696,7 @@ input:focus {
 
 .mesh-card p {
   margin: 2px 0 0;
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 12px;
 }
 
@@ -780,7 +794,7 @@ input:focus {
 
 .person small {
   display: block;
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 12px;
 }
 
@@ -817,6 +831,35 @@ input:focus {
   background: #fff;
 }
 
+.avatar-chip [data-slot="avatar-fallback"] {
+  background: transparent;
+  color: transparent;
+}
+
+.rail-button svg {
+  width: 23px !important;
+  height: 23px !important;
+}
+
+.input-row button svg,
+.media-controls button svg,
+.icon-button svg {
+  width: 18px !important;
+  height: 18px !important;
+}
+
+.primary-action svg,
+.secondary-action svg {
+  width: 16px !important;
+  height: 16px !important;
+}
+
+.icon-soft svg,
+.message-delete svg {
+  width: 15px !important;
+  height: 15px !important;
+}
+
 .world-topbar,
 .world-bottombar {
   position: absolute;
@@ -849,7 +892,7 @@ input:focus {
 }
 
 .world-bottombar {
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-family: var(--mono);
   font-size: 12px;
 }
@@ -859,7 +902,7 @@ input:focus {
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 8px;
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-family: var(--mono);
   font-size: 12px;
 }
@@ -1079,7 +1122,7 @@ input:focus {
 .chat-header p {
   margin: 3px 0 0;
   overflow: hidden;
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-family: var(--mono);
   font-size: 11px;
   text-overflow: ellipsis;
@@ -1104,7 +1147,7 @@ input:focus {
   border: 0;
   border-radius: 6px;
   background: transparent;
-  color: var(--muted);
+  color: var(--muted-foreground);
 }
 
 .chat-switcher button {
@@ -1142,7 +1185,7 @@ input:focus {
 
 .message time {
   margin-left: auto;
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-family: var(--mono);
   font-size: 11px;
 }
@@ -1232,7 +1275,7 @@ input:focus {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 12px;
   font-weight: 800;
 }
@@ -1287,7 +1330,7 @@ input:focus {
 
 .dm-thread small {
   overflow: hidden;
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1304,7 +1347,7 @@ input:focus {
   place-items: center;
   border: 1px dashed var(--line);
   border-radius: var(--radius);
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 13px;
   line-height: 1.35;
   padding: 16px;
@@ -1330,7 +1373,7 @@ input:focus {
 .directory-header > span {
   border-radius: 999px;
   background: var(--panel-soft);
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-family: var(--mono);
   font-size: 12px;
   padding: 6px 10px;
@@ -1382,7 +1425,7 @@ input:focus {
 .relay-chat-card small,
 .dm-overview-card small {
   overflow: hidden;
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 12px;
   line-height: 1.35;
   text-overflow: ellipsis;
@@ -1396,7 +1439,7 @@ input:focus {
   place-items: center;
   border-radius: 12px;
   background: var(--panel-soft);
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 22px;
   font-weight: 900;
 }
@@ -1558,5 +1601,480 @@ input:focus {
 
   .stream-grid {
     grid-template-columns: 1fr;
+  }
+}
+
+.app-shell {
+  background:
+    radial-gradient(circle at 22% 0%, rgba(255, 255, 255, 0.055), transparent 34%),
+    linear-gradient(180deg, #0d0d0f 0%, #09090b 100%);
+  color: var(--ink);
+  font-family: var(--sans);
+}
+
+.side-panel,
+.world-panel,
+.app-rail {
+  border-color: rgba(255, 255, 255, 0.1);
+  background: rgba(14, 14, 16, 0.92);
+  box-shadow: none;
+}
+
+.side-panel,
+.app-rail {
+  border-radius: 18px;
+}
+
+.world-panel {
+  border-radius: 18px;
+}
+
+.map-panel {
+  background: #111113;
+}
+
+.app-rail {
+  background: rgba(10, 10, 12, 0.82);
+}
+
+h1,
+h2,
+.mesh-card strong,
+.person strong,
+.message strong,
+.world-topbar strong,
+.relay-chat-card strong,
+.dm-overview-card strong,
+.auth-status strong,
+.signer-pill strong,
+.join-request span {
+  color: #fafafa;
+  letter-spacing: 0;
+}
+
+h1 {
+  font-size: 30px;
+  font-weight: 750;
+  letter-spacing: -0.01em;
+}
+
+h2 {
+  font-size: 24px;
+  font-weight: 720;
+  letter-spacing: -0.01em;
+}
+
+.about,
+.eyebrow,
+label,
+.section-title,
+.status-grid span,
+.auth-status span,
+.connect-card span,
+.signer-pill span,
+.mesh-card p,
+.person small,
+.chat-header p,
+.message time,
+.message p,
+.relay-chat-card small,
+.dm-overview-card small,
+.dm-thread small,
+.empty-state,
+.directory-header > span,
+.world-bottombar,
+.topbar-meta {
+  color: #a1a1aa;
+}
+
+.eyebrow,
+label,
+.section-title {
+  font-weight: 700;
+}
+
+.relay-dot {
+  background: #a3e635;
+  box-shadow: 0 0 0 6px rgba(163, 230, 53, 0.12);
+}
+
+.relay-dot[data-status="connecting"] {
+  background: #facc15;
+  box-shadow: 0 0 0 6px rgba(250, 204, 21, 0.12);
+}
+
+.relay-dot[data-status="disconnected"],
+.relay-dot[data-status="error"] {
+  background: #fb7185;
+  box-shadow: 0 0 0 6px rgba(251, 113, 133, 0.12);
+}
+
+.rail-button,
+.secondary-action,
+.icon-soft,
+.message-delete,
+.dm-back,
+.chat-switcher button,
+.relay-nav-row {
+  border-color: rgba(255, 255, 255, 0.1);
+  background: #171717;
+  color: #e4e4e7;
+  box-shadow: none;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease,
+    transform 140ms ease;
+}
+
+.rail-button:hover,
+.secondary-action:hover,
+.icon-soft:hover,
+.message-delete:hover,
+.dm-back:hover,
+.chat-switcher button:hover,
+.relay-nav-row:hover,
+.person:hover,
+.person.active,
+.dm-thread:hover,
+.dm-thread:focus-visible,
+.dm-thread.active,
+.dm-overview-card:hover,
+.relay-chat-card:hover {
+  border-color: rgba(255, 255, 255, 0.18);
+  background: #202022;
+  color: #fafafa;
+}
+
+.rail-button.active,
+.rail-button.relay.active,
+.relay-nav-row.active,
+.chat-switcher button.active,
+.relay-chat-card.current {
+  border-color: rgba(250, 250, 250, 0.28);
+  background: #fafafa;
+  color: #09090b;
+  box-shadow: none;
+}
+
+.primary-action,
+.input-row button {
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: #fafafa;
+  color: #09090b;
+  box-shadow: none;
+  font-weight: 700;
+}
+
+.primary-action:hover,
+.input-row button:hover {
+  background: #e4e4e7;
+}
+
+.primary-action:disabled,
+.secondary-action:disabled {
+  border-color: rgba(255, 255, 255, 0.08);
+  background: #27272a;
+  color: #71717a;
+}
+
+.status-grid span,
+.auth-status,
+.connect-card,
+.admin-card,
+.mesh-card,
+.join-request,
+.admin-log,
+.video-dock,
+.message,
+.empty-state,
+.relay-chat-card,
+.dm-overview-card,
+.dm-thread,
+.chat-switcher,
+.flag-toggle,
+.call-note {
+  border-color: rgba(255, 255, 255, 0.1);
+  background: #171717;
+  box-shadow: none;
+}
+
+.admin-card,
+.message,
+.connect-card,
+.mesh-card {
+  border-radius: 14px;
+}
+
+.auth-status,
+.signer-pill {
+  border-color: rgba(255, 255, 255, 0.1);
+  background: rgba(23, 23, 23, 0.94);
+  box-shadow: none;
+}
+
+.app-shell[data-auth-state="reconnecting"] .auth-status,
+.signer-pill.reconnecting {
+  border-color: rgba(250, 204, 21, 0.32);
+  background: rgba(66, 54, 16, 0.92);
+}
+
+.app-shell[data-auth-state="disconnected"] .auth-status,
+.signer-pill.disconnected {
+  border-color: rgba(251, 113, 133, 0.32);
+  background: rgba(68, 28, 36, 0.92);
+}
+
+.auth-modal {
+  border-color: rgba(255, 255, 255, 0.1);
+  background: #111113;
+  color: #fafafa;
+  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.42);
+}
+
+.auth-modal-copy {
+  color: #a1a1aa;
+}
+
+.auth-pending {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border-color: rgba(255, 255, 255, 0.14);
+  background: #171717;
+  color: #a1a1aa;
+}
+
+.spin-icon {
+  animation: nestr-spin 0.9s linear infinite;
+}
+
+@keyframes nestr-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+input {
+  border-color: rgba(255, 255, 255, 0.12);
+  background: #111113;
+  color: #fafafa;
+  box-shadow: none;
+}
+
+input::placeholder {
+  color: #71717a;
+}
+
+input:focus {
+  border-color: rgba(250, 250, 250, 0.38);
+  outline: 3px solid rgba(250, 250, 250, 0.08);
+}
+
+.connect-card img {
+  border-color: rgba(255, 255, 255, 0.1);
+  background: #fafafa;
+}
+
+.connect-card a,
+.nostr-chip:hover {
+  color: #fafafa;
+}
+
+.flag-toggle {
+  color: #d4d4d8;
+}
+
+.flag-toggle [data-slot="checkbox"] {
+  border-color: rgba(255, 255, 255, 0.18);
+  background: #111113;
+}
+
+.flag-toggle [data-slot="checkbox"][data-state="checked"] {
+  background: #fafafa;
+  color: #09090b;
+}
+
+.secondary-action.danger,
+.icon-soft.danger,
+.message-delete {
+  color: #fb7185;
+}
+
+.mesh-pill {
+  color: #09090b;
+}
+
+.mesh-pill.crisp,
+.nearby-list span {
+  background: rgba(163, 230, 53, 0.16);
+  color: #bef264;
+}
+
+.mesh-pill.warm {
+  background: rgba(250, 204, 21, 0.16);
+  color: #fde68a;
+}
+
+.mesh-pill.thin,
+.mesh-pill.stage {
+  background: rgba(251, 113, 133, 0.16);
+  color: #fda4af;
+}
+
+.call-note,
+.video-dock {
+  background: #111113;
+  color: #e4e4e7;
+}
+
+.person,
+.dm-thread {
+  color: #fafafa;
+}
+
+.person:hover,
+.person.active {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+}
+
+.avatar-chip {
+  border-color: rgba(255, 255, 255, 0.76);
+  box-shadow: 0 10px 22px rgba(0, 0, 0, 0.24);
+}
+
+.avatar-chip.has-image {
+  background: #18181b;
+}
+
+.presence-dot {
+  border-color: #171717;
+  background: #52525b;
+}
+
+.presence-dot.online {
+  background: #a3e635;
+}
+
+.message {
+  padding: 12px;
+}
+
+.message p {
+  color: #d4d4d8;
+}
+
+.dm-message.outgoing {
+  border-color: rgba(250, 250, 250, 0.2);
+  background: #202022;
+}
+
+.nostr-chip {
+  border-color: rgba(255, 255, 255, 0.1);
+  background: #222224;
+  color: #e4e4e7;
+}
+
+.nostr-chip:hover {
+  border-color: rgba(255, 255, 255, 0.22);
+  background: #2a2a2d;
+}
+
+.relay-chat-hash {
+  background: #222224;
+  color: #a1a1aa;
+}
+
+.directory-header > span,
+.topbar-meta span,
+.world-bottombar span {
+  background: rgba(17, 17, 19, 0.78);
+  color: #d4d4d8;
+  box-shadow: none;
+}
+
+.world-topbar {
+  top: 14px;
+  bottom: auto;
+  left: 14px;
+  right: 14px;
+  min-height: 46px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 14px;
+  background: rgba(9, 9, 11, 0.72);
+  padding: 8px 10px;
+  backdrop-filter: blur(12px);
+}
+
+.world-bottombar {
+  right: 14px;
+  bottom: 14px;
+  left: 14px;
+}
+
+.office-canvas {
+  background:
+    radial-gradient(circle at 44% 5%, rgba(255, 255, 255, 0.92), transparent 42%),
+    linear-gradient(135deg, #e8ebef, #faf9f7);
+}
+
+.call-stage {
+  border-radius: 18px;
+  background: rgba(17, 17, 19, 0.96);
+  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.5);
+}
+
+.stream-tile {
+  border-color: rgba(255, 255, 255, 0.08);
+  background: #111113;
+  padding: 0;
+}
+
+.stream-label {
+  background: rgba(9, 9, 11, 0.72);
+}
+
+.media-controls button,
+.icon-button {
+  border-color: rgba(255, 255, 255, 0.12);
+  background: #27272a;
+  color: #fafafa;
+}
+
+.media-controls button:hover,
+.icon-button:hover {
+  background: #3f3f46;
+}
+
+.media-controls button.active {
+  border-color: rgba(163, 230, 53, 0.32);
+  background: rgba(163, 230, 53, 0.18);
+  color: #d9f99d;
+}
+
+.media-controls button.off {
+  border-color: rgba(251, 113, 133, 0.36);
+  background: rgba(251, 113, 133, 0.16);
+  color: #fecdd3;
+}
+
+@media (max-width: 760px) {
+  .side-panel,
+  .world-panel,
+  .app-rail {
+    border-radius: 14px;
+  }
+
+  .world-topbar {
+    top: 8px;
+    right: 8px;
+    left: 8px;
+  }
+
+  .world-bottombar {
+    right: 8px;
+    bottom: 8px;
+    left: 8px;
   }
 }

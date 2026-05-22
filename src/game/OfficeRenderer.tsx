@@ -586,7 +586,7 @@ function createAvatar(pubkey: string, labelText: string) {
   const hairMaterial = new THREE.MeshStandardMaterial({ color: new THREE.Color(style.hair), roughness: 0.84 })
   const shoeMaterial = new THREE.MeshStandardMaterial({ color: 0x2e333a, roughness: 0.82 })
 
-  const shadow = new THREE.Mesh(new THREE.CircleGeometry(0.48, 28), new THREE.MeshBasicMaterial({ color: 0x1d2528, opacity: 0.16, transparent: true }))
+  const shadow = new THREE.Mesh(new THREE.CircleGeometry(0.48, 28), new THREE.MeshBasicMaterial({ color: 0x1d2528, opacity: 0.1, transparent: true }))
   shadow.rotation.x = -Math.PI / 2
   shadow.position.y = 0.012
   group.add(shadow)
@@ -825,7 +825,7 @@ class ThreeOffice {
     })
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2))
     this.renderer.shadowMap.enabled = true
-    this.renderer.shadowMap.type = THREE.PCFShadowMap
+    this.renderer.shadowMap.type = THREE.VSMShadowMap
     this.renderer.outputColorSpace = THREE.SRGBColorSpace
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping
     this.renderer.toneMappingExposure = 1.05
@@ -899,15 +899,17 @@ class ThreeOffice {
   }
 
   private addLights() {
-    const hemisphere = new THREE.HemisphereLight(0xffffff, 0xbec6bf, 1.08)
+    const hemisphere = new THREE.HemisphereLight(0xffffff, 0xcfd6cf, 1.32)
     this.scene.add(hemisphere)
 
-    const sun = new THREE.DirectionalLight(0xfff1d7, 6.6)
-    sun.position.set(-31, 23, -22)
+    const sun = new THREE.DirectionalLight(0xfff2dd, 4.85)
+    sun.position.set(-36, 25, -24)
     sun.castShadow = true
-    sun.shadow.mapSize.set(4096, 4096)
-    sun.shadow.bias = -0.00018
-    sun.shadow.normalBias = 0.035
+    sun.shadow.mapSize.set(2048, 2048)
+    sun.shadow.bias = -0.00005
+    sun.shadow.normalBias = 0.07
+    sun.shadow.radius = 24
+    sun.shadow.blurSamples = 32
     sun.shadow.camera.near = 2
     sun.shadow.camera.far = 96
     sun.shadow.camera.left = -52
@@ -916,7 +918,7 @@ class ThreeOffice {
     sun.shadow.camera.bottom = -52
     this.scene.add(sun)
 
-    const fill = new THREE.DirectionalLight(0xe3ecff, 0.62)
+    const fill = new THREE.DirectionalLight(0xe3ecff, 0.92)
     fill.position.set(22, 18, 26)
     this.scene.add(fill)
   }
@@ -1148,8 +1150,8 @@ class ThreeOffice {
     roomGroup.rotation.y = room.rotation
     this.worldRoot.add(roomGroup)
 
-    const shadow = makeRoundedPlane(room.width, room.depth, 1.2, new THREE.MeshBasicMaterial({ color: 0x222222, opacity: 0.08, transparent: true }))
-    shadow.position.set(0.35, 0.006, 0.42)
+    const shadow = makeRoundedPlane(room.width, room.depth, 1.25, new THREE.MeshBasicMaterial({ color: 0x222222, opacity: 0.04, transparent: true }))
+    shadow.position.set(0.3, 0.006, 0.38)
     roomGroup.add(shadow)
 
     const pad = makeRoundedPlane(room.width, room.depth, 1.05, roomMaterials[room.tone])
