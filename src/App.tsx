@@ -25,6 +25,7 @@ import {
   UserPlus,
   Users,
   Video,
+  X,
 } from 'lucide-react'
 import './App.css'
 import { PhaserOffice } from './game/PhaserOffice'
@@ -214,6 +215,33 @@ interface StreamTileProps {
 
 type AuthState = 'mock' | 'idle' | 'connecting' | 'reconnecting' | 'connected' | 'disconnected'
 type AppView = 'relay' | 'group' | 'dm'
+type AuthPromptKind = 'relay' | 'dm' | 'write' | 'admin' | 'reconnect' | 'manual'
+
+interface AuthPrompt {
+  kind: AuthPromptKind
+  title: string
+  detail: string
+}
+
+function signerRequired(reason?: string) {
+  const value = String(reason ?? '').toLowerCase()
+  return (
+    value === 'live-signer-required' ||
+    value.includes('auth-required') ||
+    value.includes('signer required') ||
+    value.includes('nip-42') ||
+    value.includes('restricted')
+  )
+}
+
+function authPromptTitle(kind: AuthPromptKind) {
+  if (kind === 'dm') return 'Unlock direct messages'
+  if (kind === 'relay') return 'Relay needs auth'
+  if (kind === 'write') return 'Sign to write'
+  if (kind === 'admin') return 'Sign admin action'
+  if (kind === 'reconnect') return 'Signer disconnected'
+  return 'Sign in with Nostr'
+}
 
 function StreamTile({ label, sublabel, stream, muted = false }: StreamTileProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null)
@@ -275,12 +303,14 @@ function App() {
   const [metadataEdits, setMetadataEdits] = useState<Partial<Nip29MetadataDraft>>({})
   const [connectSession, setConnectSession] = useState<NostrConnectSession | null>(null)
   const [nostrConnectQr, setNostrConnectQr] = useState<string | null>(null)
+  const [authPrompt, setAuthPrompt] = useState<AuthPrompt | null>(null)
   const callStageRef = useRef<HTMLDivElement | null>(null)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
   const dmMessagesEndRef = useRef<HTMLDivElement | null>(null)
   const notifiedRef = useRef({ initialized: false, chat: new Set<string>(), dm: new Set<string>() })
   const autoAuthAttemptedRef = useRef(false)
   const authAttemptRef = useRef(0)
+  const lastRelayAuthPromptRef = useRef('')
   const activeSignerRef = useRef<NestrSigner | null>(null)
   const connectSessionRef = useRef<NostrConnectSession | null>(null)
   const remoteVideosRef = useRef<MockPeerVideo[]>([])
@@ -300,6 +330,9 @@ function App() {
   const relayGroups = snapshot.relayGroups.length > 0 || !hasSelectedGroup ? snapshot.relayGroups : [snapshot.group.metadata]
   const connectionStatus = snapshot.connectionStatus ?? relay.mode
   const connectionMessage = authDetail || snapshot.connectionMessage || authStatus
+  const showAuthPrompt = relay.mode === 'live' && Boolean(authPrompt) && authState !== 'connected'
+  const showSignerPill =
+    relay.mode === 'live' && ['connected', 'reconnecting', 'disconnected'].includes(authState)
   const currentUser = snapshot.users.find((user) => user.pubkey === selfPubkey)
   const isSignedIn = relay.mode === 'mock' || authState === 'connected'
   const showMesh = isSignedIn && nearby.length > 0
@@ -487,6 +520,7 @@ function App() {
       setCallExpanded(false)
       setAuthStatus(`${signer.label} connected as ${shortNpub(signer.pubkey)}`)
       setAuthDetail('signer online')
+      setAuthPrompt(null)
       clearConnectSession()
 
       const result = await relay.publishPosition(signer.pubkey, spawn.x, spawn.y, 0, 0)
@@ -504,6 +538,11 @@ function App() {
       setAuthState('disconnected')
       setAuthStatus('signer disconnected')
       setAuthDetail(detail)
+      setAuthPrompt({
+        kind: 'reconnect',
+        title: authPromptTitle('reconnect'),
+        detail,
+      })
       if (relay.mode === 'live') relay.clearSigner()
     },
     [relay],
@@ -526,13 +565,20 @@ function App() {
     [applySigner],
   )
 
-  const beginLogin = useCallback(async () => {
+  const beginLogin = useCallback(async (prompt?: AuthPrompt) => {
     if (relay.mode !== 'live') return
 
     const attempt = authAttemptRef.current + 1
     authAttemptRef.current = attempt
     activeSignerRef.current = null
     setActiveSigner(null)
+    setAuthPrompt(
+      prompt ?? {
+        kind: 'manual',
+        title: authPromptTitle('manual'),
+        detail: 'Choose NIP-07 or scan Nostr Connect to continue.',
+      },
+    )
     setAuthState('connecting')
     setAuthStatus(window.nostr ? 'asking NIP-07 signer' : 'waiting for Nostr Connect')
     setAuthDetail(window.nostr ? 'NIP-07 prompt open; QR also ready' : 'scan the QR with your signer')
@@ -600,7 +646,7 @@ function App() {
     })
   }, [clearConnectSession, completeAuthAttempt, launch, relay])
 
-  const beginAutoAuth = useCallback(async () => {
+  const beginAutoAuth = useCallback(async (interactiveFallback = false) => {
     if (relay.mode !== 'live') return
 
     const attempt = authAttemptRef.current + 1
@@ -629,7 +675,18 @@ function App() {
       }
     }
 
-    await beginLogin()
+    if (interactiveFallback) {
+      await beginLogin({
+        kind: 'manual',
+        title: authPromptTitle('manual'),
+        detail: 'No stored signer session was found. Connect a signer to continue.',
+      })
+      return
+    }
+
+    setAuthState('idle')
+    setAuthStatus('signer ready when needed')
+    setAuthDetail('waiting for an auth-gated action')
   }, [beginLogin, clearConnectSession, completeAuthAttempt, markSignerDisconnected, relay])
 
   useEffect(() => {
@@ -674,10 +731,47 @@ function App() {
     return () => window.clearTimeout(timer)
   }, [beginAutoAuth, relay])
 
+  useEffect(() => {
+    if (relay.mode !== 'live') return
+    if (authState === 'connected' || authState === 'connecting' || authState === 'reconnecting') return
+    const key = `${snapshot.connectionStatus ?? ''}:${snapshot.connectionMessage ?? ''}`
+    if (key === lastRelayAuthPromptRef.current || !signerRequired(snapshot.connectionMessage)) return
+
+    lastRelayAuthPromptRef.current = key
+    const timer = window.setTimeout(() => {
+      void beginLogin({
+        kind: 'relay',
+        title: authPromptTitle('relay'),
+        detail: `${relayHost} rejected a subscription until NIP-42 auth succeeds. The room query will retry after signing in.`,
+      })
+    }, 0)
+
+    return () => window.clearTimeout(timer)
+  }, [authState, beginLogin, relay.mode, relayHost, snapshot.connectionMessage, snapshot.connectionStatus])
+
+  useEffect(() => {
+    if (relay.mode !== 'live' || appView !== 'dm') return
+    if (authState === 'connected' || authState === 'connecting' || authState === 'reconnecting') return
+    const timer = window.setTimeout(() => {
+      void beginLogin({
+        kind: 'dm',
+        title: authPromptTitle('dm'),
+        detail: `NIP-17 gift wrap subscriptions need your signer so ${relayHost} can return your threads.`,
+      })
+    }, 0)
+
+    return () => window.clearTimeout(timer)
+  }, [appView, authState, beginLogin, relay.mode, relayHost])
+
   async function retrySigner() {
     if (relay.mode !== 'live') return
     setAuthDetail('retrying signer connection')
-    await beginAutoAuth()
+    setAuthPrompt({
+      kind: 'reconnect',
+      title: authPromptTitle('reconnect'),
+      detail: 'Retrying the stored signer session. If it stays offline, log out and connect again.',
+    })
+    await beginAutoAuth(true)
   }
 
   async function logoutSigner() {
@@ -694,9 +788,32 @@ function App() {
     setCallExpanded(false)
     setAuthState('idle')
     setAuthStatus('logged out')
-    setAuthDetail('new Nostr Connect QR ready')
-    await beginLogin()
+    setAuthDetail('waiting for an auth-gated action')
+    setAuthPrompt(null)
   }
+
+  function cancelAuthPrompt() {
+    authAttemptRef.current += 1
+    clearConnectSession()
+    if (authState === 'connecting') {
+      setAuthState('idle')
+      setAuthStatus('signer ready when needed')
+      setAuthDetail('waiting for an auth-gated action')
+    }
+    setAuthPrompt(null)
+  }
+
+  const requestAuth = useCallback(
+    (kind: AuthPromptKind, detail: string) => {
+      if (relay.mode !== 'live' || authState === 'connected') return
+      void beginLogin({
+        kind,
+        title: authPromptTitle(kind),
+        detail,
+      })
+    },
+    [authState, beginLogin, relay.mode],
+  )
 
   const handleMove = useCallback(
     (position: { x: number; y: number; vx: number; vy: number }) => {
@@ -719,11 +836,11 @@ function App() {
     event.preventDefault()
     const result = await relay.publishGroupMessage(selfPubkey, message)
     if (!result.ok) {
-      setAuthStatus(
-        result.reason === 'live-signer-required'
-          ? 'connect a signer to write to this live room'
-          : String(result.reason),
-      )
+      if (signerRequired(result.reason)) {
+        requestAuth('write', `Sign in to publish messages to ${metadataName}. The message can be sent after auth completes.`)
+      } else {
+        setAuthStatus(String(result.reason))
+      }
       return
     }
     setMessage('')
@@ -735,11 +852,11 @@ function App() {
 
     const result = await relay.publishDirectMessage(selfPubkey, activeDmPubkey, dmMessage)
     if (!result.ok) {
-      setAuthStatus(
-        result.reason === 'live-signer-required'
-          ? 'connect a signer to send encrypted NIP-17 DMs'
-          : String(result.reason),
-      )
+      if (signerRequired(result.reason)) {
+        requestAuth('dm', 'Sign in to send encrypted NIP-17 direct messages.')
+      } else {
+        setAuthStatus(String(result.reason))
+      }
       return
     }
 
@@ -763,6 +880,9 @@ function App() {
     try {
       const result = await action()
       setAdminStatus(result.ok ? `${label} published` : `${label} failed: ${result.reason}`)
+      if (!result.ok && signerRequired(result.reason)) {
+        requestAuth('admin', `Sign in to publish the ${label} NIP-29 admin event.`)
+      }
       return result.ok
     } catch (error) {
       setAdminStatus(`${label} failed: ${errorMessage(error)}`)
@@ -984,6 +1104,89 @@ function App() {
 
   return (
     <main className="app-shell" data-auth-state={authState} data-view={appView}>
+      {showSignerPill && (
+        <section className={`signer-pill ${authState}`} aria-label="Signer status">
+          <AvatarChip pubkey={selfPubkey} user={currentUser} small />
+          <div>
+            <strong>
+              {authState === 'connected'
+                ? `signed in ${shortNpub(selfPubkey)}`
+                : authState === 'reconnecting'
+                  ? 'reconnecting signer'
+                  : 'signer disconnected'}
+            </strong>
+            <span>{authDetail}</span>
+          </div>
+          {authState === 'disconnected' && (
+            <button type="button" className="icon-soft" onClick={() => void retrySigner()} aria-label="Retry signer">
+              <RefreshCcw size={15} />
+            </button>
+          )}
+          {authState === 'connected' && (
+            <button type="button" className="icon-soft" onClick={() => void logoutSigner()} aria-label="Logout signer">
+              <LogOut size={15} />
+            </button>
+          )}
+        </section>
+      )}
+
+      {showAuthPrompt && authPrompt && (
+        <div className="auth-modal-backdrop" role="presentation">
+          <section className="auth-modal" role="dialog" aria-modal="true" aria-label="Nostr sign in">
+            <div className="auth-modal-header">
+              <div>
+                <p className="eyebrow">nostr auth</p>
+                <h2>{authPrompt.title}</h2>
+              </div>
+              <button type="button" className="icon-soft" onClick={cancelAuthPrompt} aria-label="Close auth prompt">
+                <X size={15} />
+              </button>
+            </div>
+
+            <p className="auth-modal-copy">{authPrompt.detail}</p>
+
+            <div className="auth-status">
+              <AvatarChip pubkey={selfPubkey} user={currentUser} small />
+              <div>
+                <strong>{authStatus}</strong>
+                <span>{connectionMessage}</span>
+              </div>
+            </div>
+
+            {connectSession && nostrConnectQr && authState === 'connecting' && (
+              <div className="connect-card">
+                <img src={nostrConnectQr} alt="Nostr Connect QR" />
+                <span>Listening on {connectSession.relays.map(relayHostLabel).join(', ')}</span>
+                <a href={connectSession.uri}>Open Nostr Connect</a>
+              </div>
+            )}
+
+            {authState === 'connecting' && !nostrConnectQr && (
+              <div className="auth-pending">Opening relay listener for Nostr Connect...</div>
+            )}
+
+            <div className="auth-actions">
+              {authState === 'disconnected' ? (
+                <>
+                  <button type="button" className="secondary-action" onClick={() => void retrySigner()}>
+                    <RefreshCcw size={16} />
+                    Retry
+                  </button>
+                  <button type="button" className="secondary-action danger" onClick={() => void logoutSigner()}>
+                    <LogOut size={16} />
+                    Logout
+                  </button>
+                </>
+              ) : (
+                <button type="button" className="secondary-action admin-wide" onClick={cancelAuthPrompt}>
+                  Cancel
+                </button>
+              )}
+            </div>
+          </section>
+        </div>
+      )}
+
       <nav className="app-rail" aria-label="Primary navigation">
         <button
           type="button"
@@ -1025,38 +1228,6 @@ function App() {
               </div>
               <span className="relay-dot" data-status={connectionStatus} />
             </div>
-
-            {relay.mode === 'live' && (
-              <section className="signin live-auth" aria-label="Nostr auth">
-                <label>nostr auth</label>
-                <div className="auth-status">
-                  <AvatarChip pubkey={selfPubkey} user={currentUser} small />
-                  <div>
-                    <strong>{authStatus}</strong>
-                    <span>{connectionMessage}</span>
-                  </div>
-                </div>
-                {authState === 'disconnected' && (
-                  <div className="auth-actions">
-                    <button type="button" className="secondary-action" onClick={() => void retrySigner()}>
-                      <RefreshCcw size={16} />
-                      Retry
-                    </button>
-                    <button type="button" className="secondary-action danger" onClick={() => void logoutSigner()}>
-                      <LogOut size={16} />
-                      Logout
-                    </button>
-                  </div>
-                )}
-                {connectSession && nostrConnectQr && authState === 'connecting' && (
-                  <div className="connect-card">
-                    <img src={nostrConnectQr} alt="Nostr Connect QR" />
-                    <span>Listening on {connectSession.relays.map(relayHostLabel).join(', ')}</span>
-                    <a href={connectSession.uri}>Open Nostr Connect</a>
-                  </div>
-                )}
-              </section>
-            )}
 
             <section className="panel-section dm-thread-list" aria-label="Gift wrap threads">
               <div className="section-title">
@@ -1112,38 +1283,6 @@ function App() {
                 {relayGroups.length} chats
               </span>
             </div>
-
-            {relay.mode === 'live' && (
-              <section className="signin live-auth" aria-label="Nostr auth">
-                <label>nostr auth</label>
-                <div className="auth-status">
-                  <AvatarChip pubkey={selfPubkey} user={currentUser} small />
-                  <div>
-                    <strong>{authStatus}</strong>
-                    <span>{connectionMessage}</span>
-                  </div>
-                </div>
-                {authState === 'disconnected' && (
-                  <div className="auth-actions">
-                    <button type="button" className="secondary-action" onClick={() => void retrySigner()}>
-                      <RefreshCcw size={16} />
-                      Retry
-                    </button>
-                    <button type="button" className="secondary-action danger" onClick={() => void logoutSigner()}>
-                      <LogOut size={16} />
-                      Logout
-                    </button>
-                  </div>
-                )}
-                {connectSession && nostrConnectQr && authState === 'connecting' && (
-                  <div className="connect-card">
-                    <img src={nostrConnectQr} alt="Nostr Connect QR" />
-                    <span>Listening on {connectSession.relays.map(relayHostLabel).join(', ')}</span>
-                    <a href={connectSession.uri}>Open Nostr Connect</a>
-                  </div>
-                )}
-              </section>
-            )}
 
             <section className="panel-section relay-channel-list" aria-label="Relay group chats">
               <div className="section-title">
@@ -1222,7 +1361,7 @@ function App() {
           </button>
         </section>
 
-        {relay.mode === 'mock' ? (
+        {relay.mode === 'mock' && (
           <form className="signin" onSubmit={joinOffice}>
             <label htmlFor="npub">npub</label>
             <div className="input-row">
@@ -1237,36 +1376,6 @@ function App() {
               </button>
             </div>
           </form>
-        ) : (
-          <section className="signin live-auth" aria-label="Nostr auth">
-            <label>nostr auth</label>
-            <div className="auth-status">
-              <AvatarChip pubkey={selfPubkey} user={currentUser} small />
-              <div>
-                <strong>{authStatus}</strong>
-                <span>{connectionMessage}</span>
-              </div>
-            </div>
-            {authState === 'disconnected' && (
-              <div className="auth-actions">
-                <button type="button" className="secondary-action" onClick={() => void retrySigner()}>
-                  <RefreshCcw size={16} />
-                  Retry
-                </button>
-                <button type="button" className="secondary-action danger" onClick={() => void logoutSigner()}>
-                  <LogOut size={16} />
-                  Logout
-                </button>
-              </div>
-            )}
-            {connectSession && nostrConnectQr && authState === 'connecting' && (
-              <div className="connect-card">
-                <img src={nostrConnectQr} alt="Nostr Connect QR" />
-                <span>Listening on {connectSession.relays.map(relayHostLabel).join(', ')}</span>
-                <a href={connectSession.uri}>Open Nostr Connect</a>
-              </div>
-            )}
-          </section>
         )}
 
         <section className="panel-section admin-panel" aria-label="NIP-29 controls">

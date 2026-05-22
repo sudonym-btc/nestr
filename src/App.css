@@ -366,6 +366,115 @@ input:focus {
   text-align: center;
 }
 
+.signer-pill {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 30;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  max-width: min(380px, calc(100vw - 32px));
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(255, 253, 248, 0.96);
+  box-shadow: 0 16px 42px rgba(30, 23, 13, 0.16);
+  padding: 8px 9px;
+}
+
+.signer-pill > div {
+  min-width: 0;
+}
+
+.signer-pill strong,
+.signer-pill span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.signer-pill strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.signer-pill span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.signer-pill.reconnecting {
+  border-color: #e0bd6f;
+  background: #fff9e8;
+}
+
+.signer-pill.disconnected {
+  border-color: #efb5aa;
+  background: #fff6f3;
+}
+
+.auth-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  background: rgba(22, 26, 36, 0.36);
+  padding: 18px;
+}
+
+.auth-modal {
+  display: grid;
+  gap: 12px;
+  width: min(420px, 100%);
+  max-height: calc(100svh - 36px);
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fffdf8;
+  box-shadow: 0 28px 90px rgba(22, 26, 36, 0.28);
+  padding: 16px;
+}
+
+.auth-modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.auth-modal-header h2 {
+  font-size: 24px;
+}
+
+.auth-modal-copy {
+  margin: 0;
+  color: #4d524c;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.auth-pending {
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 10px;
+  text-align: center;
+}
+
+.auth-modal .connect-card img {
+  width: 190px;
+  height: 190px;
+}
+
+.auth-modal .auth-actions > .admin-wide {
+  grid-column: 1 / -1;
+}
+
 .admin-panel {
   gap: 9px;
 }
@@ -1276,6 +1385,23 @@ input:focus {
   .rail-divider {
     width: 1px;
     height: 32px;
+  }
+
+  .signer-pill {
+    top: auto;
+    right: 8px;
+    bottom: 8px;
+    left: 8px;
+    max-width: none;
+  }
+
+  .auth-modal-backdrop {
+    align-items: end;
+    padding: 8px;
+  }
+
+  .auth-modal {
+    max-height: calc(100svh - 16px);
   }
 
   .relay-directory-panel,

@@ -28,6 +28,12 @@ test('uses launch params to choose relay directory or group map', async ({ page 
   await expect(page.getByRole('heading', { name: 'groups.0xchat.com' }).first()).toBeVisible()
   await expect(page.getByRole('region', { name: 'Relay chats' })).toBeVisible()
   await expect(page.locator('canvas')).toHaveCount(0)
+  await expect(page.getByRole('dialog', { name: 'Nostr sign in' })).toHaveCount(0)
+  await expect(page.getByLabel('Nostr auth')).toHaveCount(0)
+
+  await page.getByRole('button', { name: 'Direct messages' }).click()
+  await expect(page.getByRole('dialog', { name: 'Nostr sign in' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Unlock direct messages' })).toBeVisible()
 
   await page.goto('/?c=0bdfff7a01de485de1343b83ec11b0d66d92e4d75e8c5851a05dab288be4f0aa&relay=groups.0xchat.com')
 
