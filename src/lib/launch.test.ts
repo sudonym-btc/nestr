@@ -11,10 +11,20 @@ describe('launch URL parsing', () => {
       mode: 'live',
       groupId: 'abc123',
       relayUrl: 'wss://groups.0xchat.com',
+      nostrConnectRelays: [],
     })
   })
 
   it('normalizes HTTP relay hints to WebSocket URLs', () => {
     expect(normalizeRelayUrl('https://relay.example/')).toBe('wss://relay.example')
+  })
+
+  it('keeps explicit Nostr Connect relays separate from the room relay', () => {
+    expect(parseLaunch('?c=abc123&relay=groups.0xchat.com&connectRelay=relay.nsec.app,https://relay.example/')).toEqual({
+      mode: 'live',
+      groupId: 'abc123',
+      relayUrl: 'wss://groups.0xchat.com',
+      nostrConnectRelays: ['wss://relay.nsec.app', 'wss://relay.example'],
+    })
   })
 })

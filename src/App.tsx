@@ -93,6 +93,14 @@ function randomInviteCode() {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
+function relayHostLabel(relayUrl: string) {
+  try {
+    return new URL(relayUrl).host
+  } catch {
+    return relayUrl
+  }
+}
+
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string) {
   return new Promise<T>((resolve, reject) => {
     const timer = window.setTimeout(() => reject(new Error(message)), timeoutMs)
@@ -523,9 +531,13 @@ function App() {
     setAuthDetail(window.nostr ? 'NIP-07 prompt open; QR also ready' : 'scan the QR with your signer')
     clearConnectSession()
 
-    const session = startNostrConnect(relay.relayUrl)
+    const session = startNostrConnect({
+      roomRelayUrl: relay.relayUrl,
+      nostrConnectRelays: launch.mode === 'live' ? launch.nostrConnectRelays : undefined,
+    })
     connectSessionRef.current = session
     setConnectSession(session)
+    setAuthDetail(`scan QR; listening on ${session.relays.map(relayHostLabel).join(', ')}`)
 
     try {
       const dataUrl = await QRCode.toDataURL(session.uri, {
@@ -557,7 +569,7 @@ function App() {
           setAuthDetail(`NIP-07 unavailable: ${errorMessage(error)}`)
         })
     }
-  }, [clearConnectSession, completeAuthAttempt, relay])
+  }, [clearConnectSession, completeAuthAttempt, launch, relay])
 
   const beginAutoAuth = useCallback(async () => {
     if (relay.mode !== 'live') return
@@ -1001,6 +1013,7 @@ function App() {
             {connectSession && nostrConnectQr && authState === 'connecting' && (
               <div className="connect-card">
                 <img src={nostrConnectQr} alt="Nostr Connect QR" />
+                <span>Listening on {connectSession.relays.map(relayHostLabel).join(', ')}</span>
                 <a href={connectSession.uri}>Open Nostr Connect</a>
               </div>
             )}

@@ -37,6 +37,7 @@ function randomHex(bytes = 16) {
 
 export const NESTR_NIP46_PERMISSIONS = [
   'get_public_key',
+  'ping',
   'nip44_encrypt',
   'nip44_decrypt',
   'sign_event:13',
@@ -53,6 +54,28 @@ export const NESTR_NIP46_PERMISSIONS = [
   'sign_event:25029',
   'sign_event:22242',
 ]
+
+export const DEFAULT_NOSTR_CONNECT_RELAYS = [
+  'wss://relay.nsec.app',
+  'wss://relay.damus.io',
+] as const
+
+function normalizeRelayUrl(value: string) {
+  const withScheme = value.includes('://') ? value : `wss://${value}`
+  const url = new URL(withScheme)
+  if (url.protocol === 'https:') url.protocol = 'wss:'
+  if (url.protocol === 'http:') url.protocol = 'ws:'
+  url.hash = ''
+  return url.toString().replace(/\/$/, '')
+}
+
+export function nostrConnectRelayHints(roomRelayUrl: string, explicitRelays: string[] = []) {
+  const source = explicitRelays.length > 0
+    ? explicitRelays
+    : [...DEFAULT_NOSTR_CONNECT_RELAYS, roomRelayUrl]
+
+  return Array.from(new Set(source.map(normalizeRelayUrl)))
+}
 
 export async function connectNip07Signer(): Promise<NestrSigner> {
   if (!window.nostr) {
@@ -79,6 +102,7 @@ export async function connectNip07Signer(): Promise<NestrSigner> {
 
 export interface NostrConnectSession {
   uri: string
+  relays: string[]
   waitForSigner: Promise<NostrConnectResult>
   abort: () => void
 }
@@ -89,6 +113,7 @@ export interface NostrConnectStoredSession {
   bunkerPointer: BunkerPointer
   userPubkey: string
   relayUrl: string
+  relayUrls?: string[]
   connectedAt: number
 }
 
@@ -121,16 +146,22 @@ function signerAdapter(signer: BunkerSigner, pubkey: string): NestrSigner {
   }
 }
 
-export function startNostrConnect(relayUrl: string): NostrConnectSession {
+export interface NostrConnectStartOptions {
+  roomRelayUrl: string
+  nostrConnectRelays?: string[]
+}
+
+export function startNostrConnect(options: NostrConnectStartOptions): NostrConnectSession {
   const clientSecretKey = generateSecretKey()
   const clientSecretHex = bytesToHex(clientSecretKey)
   const clientPubkey = getPublicKey(clientSecretKey)
   const controller = new AbortController()
   const connectionSecret = randomHex(16)
   const appMetadata = nostrConnectAppMetadata(window.location.origin)
+  const relays = nostrConnectRelayHints(options.roomRelayUrl, options.nostrConnectRelays)
   const uri = createNostrConnectURI({
     clientPubkey,
-    relays: [relayUrl],
+    relays,
     secret: connectionSecret,
     perms: NESTR_NIP46_PERMISSIONS,
     ...appMetadata,
@@ -153,7 +184,8 @@ export function startNostrConnect(relayUrl: string): NostrConnectSession {
         clientSecretKey: clientSecretHex,
         bunkerPointer: signer.bp,
         userPubkey: pubkey,
-        relayUrl,
+        relayUrl: relays[0],
+        relayUrls: relays,
         connectedAt: Date.now(),
       },
     }
@@ -161,6 +193,7 @@ export function startNostrConnect(relayUrl: string): NostrConnectSession {
 
   return {
     uri,
+    relays,
     waitForSigner,
     abort: () => controller.abort('cancelled'),
   }
