@@ -57,7 +57,6 @@ export const NESTR_NIP46_PERMISSIONS = [
 
 export const DEFAULT_NOSTR_CONNECT_RELAYS = [
   'wss://relay.nsec.app',
-  'wss://relay.damus.io',
 ] as const
 
 function normalizeRelayUrl(value: string) {
@@ -70,9 +69,8 @@ function normalizeRelayUrl(value: string) {
 }
 
 export function nostrConnectRelayHints(roomRelayUrl: string, explicitRelays: string[] = []) {
-  const source = explicitRelays.length > 0
-    ? explicitRelays
-    : [...DEFAULT_NOSTR_CONNECT_RELAYS, roomRelayUrl]
+  void roomRelayUrl
+  const source = explicitRelays.length > 0 ? explicitRelays : DEFAULT_NOSTR_CONNECT_RELAYS
 
   return Array.from(new Set(source.map(normalizeRelayUrl)))
 }

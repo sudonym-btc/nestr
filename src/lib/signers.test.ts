@@ -41,11 +41,11 @@ describe('Nostr Connect metadata', () => {
     )
   })
 
-  it('uses NIP-46 relay hints before the NIP-29 room relay by default', () => {
+  it('uses relay.nsec.app only for NIP-46 by default', () => {
     expect(nostrConnectRelayHints('wss://groups.0xchat.com')).toEqual([
-      ...DEFAULT_NOSTR_CONNECT_RELAYS,
-      'wss://groups.0xchat.com',
+      'wss://relay.nsec.app',
     ])
+    expect(DEFAULT_NOSTR_CONNECT_RELAYS).toEqual(['wss://relay.nsec.app'])
   })
 
   it('uses explicit NIP-46 relay hints without adding defaults', () => {
