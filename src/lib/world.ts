@@ -143,7 +143,3 @@ export function spawnForPubkey(map: OfficeMap, pubkey: string, index = 0) {
     y: tileY * map.tileSize + map.tileSize / 2,
   }
 }
-
-export function mapCapacityLabel(activeUsers: number) {
-  return `${activeUsers} in infinite`
-}

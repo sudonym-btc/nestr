@@ -1,5 +1,5 @@
 export const DEFAULT_GROUP_ID = 'product-floor'
-export const MOCK_RELAY_URL = 'wss://relay.nestr.local'
+export const MOCK_RELAY_URL = 'wss://relay.nestr.development'
 
 export const NIP29_KINDS = {
   groupMetadata: 39000,
@@ -29,6 +29,7 @@ export const OFFICE_KINDS = {
 export const DM_KINDS = {
   seal: 13,
   directMessage: 14,
+  fileMessage: 15,
   inboxRelays: 10050,
   giftWrap: 1059,
 } as const
@@ -64,8 +65,25 @@ export interface NestrDirectMessage {
   senderPubkey: string
   recipientPubkey: string
   content: string
+  attachments?: NestrAttachment[]
   createdAt: number
   protocol: 'nip17' | 'mock'
+}
+
+export interface NestrAttachment {
+  url: string
+  name: string
+  mimeType: string
+  size: number
+  sha256?: string
+  originalSha256?: string
+  dim?: string
+  alt?: string
+  encrypted?: boolean
+  encryptionAlgorithm?: 'aes-gcm'
+  decryptionKey?: string
+  decryptionNonce?: string
+  localUrl?: string
 }
 
 export function tagValue(event: Pick<NestrEvent, 'tags'>, name: string) {

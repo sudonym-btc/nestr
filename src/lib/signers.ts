@@ -56,6 +56,7 @@ export const NESTR_NIP46_PERMISSIONS = [
   'sign_event:9022',
   'sign_event:25029',
   'sign_event:22242',
+  'sign_event:24242',
 ]
 
 export const DEFAULT_NOSTR_CONNECT_RELAYS = [

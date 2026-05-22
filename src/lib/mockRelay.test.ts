@@ -25,6 +25,29 @@ describe('mock NIP-29 relay', () => {
     expect(latest?.tags).toContainEqual(['h', relay.snapshot().group.id])
   })
 
+  it('publishes room and direct-message attachments', () => {
+    const relay = createMockRelay()
+    const [sender, recipient] = relay.snapshot().users
+    const attachment = {
+      url: 'blob:mock-file',
+      name: 'mock.txt',
+      mimeType: 'text/plain',
+      size: 12,
+      sha256: 'a'.repeat(64),
+    }
+
+    const groupResult = relay.publishGroupMessage(sender.pubkey, 'file attached', [attachment])
+    const directResult = relay.publishDirectMessage(sender.pubkey, recipient.pubkey, '', [attachment])
+    const latestGroup = relay.snapshot().messages.at(-1)
+    const latestDm = relay.snapshot().directMessages.at(-1)
+
+    expect(groupResult.ok).toBe(true)
+    expect(latestGroup?.tags.some((tag) => tag[0] === 'imeta')).toBe(true)
+    expect(latestGroup?.content).toContain(attachment.url)
+    expect(directResult.ok).toBe(true)
+    expect(latestDm?.attachments?.[0]).toMatchObject(attachment)
+  })
+
   it('keeps office movement ephemeral while updating active positions', () => {
     const relay = createMockRelay()
     const user = relay.snapshot().users[0]

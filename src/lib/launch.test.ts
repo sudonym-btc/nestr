@@ -2,8 +2,25 @@ import { describe, expect, it } from 'vitest'
 import { normalizeRelayUrl, parseLaunch } from './launch'
 
 describe('launch URL parsing', () => {
-  it('uses mock mode without group and relay params', () => {
-    expect(parseLaunch('')).toEqual({ mode: 'mock' })
+  it('uses the relay picker without group and relay params', () => {
+    expect(parseLaunch('')).toEqual({ mode: 'landing' })
+  })
+
+  it('uses a persistent development relay for nestr development hosts', () => {
+    expect(parseLaunch('?relay=relay.nestr.development')).toEqual({
+      mode: 'mock',
+      groupId: undefined,
+      relayUrl: 'wss://relay.nestr.development',
+      authRequired: true,
+      initialView: 'relay',
+    })
+    expect(parseLaunch('?c=abc123&relay=openrelay.nestr.development')).toEqual({
+      mode: 'mock',
+      groupId: 'abc123',
+      relayUrl: 'wss://openrelay.nestr.development',
+      authRequired: false,
+      initialView: 'group',
+    })
   })
 
   it('switches to live NIP-29 mode from obelisk-style params', () => {

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { avatarFromPubkey } from '../lib/avatar'
@@ -17,6 +17,7 @@ type MoveHandler = (position: Pick<WorldPosition, 'x' | 'y' | 'vx' | 'vy'>) => v
 interface OfficeRendererProps {
   snapshot: OfficeSceneSnapshot
   onMove: MoveHandler
+  canPlaceSelf?: boolean
 }
 
 type OfficeTone = 'work' | 'lounge' | 'garden' | 'meeting'
@@ -104,6 +105,7 @@ const ARRIVAL_RADIUS = 0.24
 const ROOM_RANGE = 2
 const SELF_ECHO_HOLD_MS = 900
 const MODEL_ROOT = `${import.meta.env.BASE_URL}assets/office-pack/models/`
+const CAMERA_VIEW_HEIGHT = 23
 
 const assetCache = new Map<AssetKey, LoadedAsset>()
 const loader = new GLTFLoader()
@@ -136,6 +138,12 @@ const OFFICE_ASSETS = {
   waterCooler: asset('waterCooler', 'water-cooler.glb', [0.74, 0.74], 1.42, 'box', 0x9db4c4),
   whiteboard: asset('whiteboard', 'whiteboard.glb', [2.25, 0.18], 1.45, 'screen', 0xf2f4f3),
 } satisfies Record<AssetKey, AssetSpec>
+
+const ASSET_BASE_LIFT: Partial<Record<AssetKey, number>> = {
+  houseplant: 0.08,
+  plantWhitePot: 0.16,
+  pottedPlant: 0.1,
+}
 
 const roomMaterials: Record<OfficeTone, THREE.MeshStandardMaterial> = {
   work: new THREE.MeshStandardMaterial({ color: 0xe4e5e1, roughness: 0.88, metalness: 0.01 }),
@@ -360,10 +368,12 @@ function drawRoundedCanvasRect(
 
 function makeTextSprite(
   text: string,
-  options: { background?: string; color?: string; fontSize?: number; padding?: number } = {},
+  options: { background?: string; color?: string; fontSize?: number; padding?: number; chipColor?: string } = {},
 ) {
   const fontSize = options.fontSize ?? 30
   const padding = options.padding ?? 14
+  const chipSize = options.chipColor ? fontSize * 0.72 : 0
+  const chipGap = options.chipColor ? fontSize * 0.34 : 0
   const dpr = Math.min(window.devicePixelRatio || 1, 2)
   const canvas = document.createElement('canvas')
   const context = canvas.getContext('2d')
@@ -371,7 +381,7 @@ function makeTextSprite(
 
   context.font = `800 ${fontSize}px Inter, ui-sans-serif, system-ui, sans-serif`
   const metrics = context.measureText(text)
-  const width = Math.ceil(metrics.width + padding * 2)
+  const width = Math.ceil(metrics.width + chipSize + chipGap + padding * 2)
   const height = Math.ceil(fontSize + padding * 1.4)
   canvas.width = Math.ceil(width * dpr)
   canvas.height = Math.ceil(height * dpr)
@@ -381,8 +391,23 @@ function makeTextSprite(
   context.fillStyle = options.background ?? 'rgba(255, 255, 255, 0.92)'
   drawRoundedCanvasRect(context, 0, 0, width, height, 9)
   context.fill()
+
+  let textX = padding
+  if (options.chipColor) {
+    const centerY = height / 2
+    const radius = chipSize / 2
+    context.beginPath()
+    context.arc(padding + radius, centerY, radius, 0, Math.PI * 2)
+    context.fillStyle = options.chipColor
+    context.fill()
+    context.lineWidth = 2
+    context.strokeStyle = 'rgba(255, 255, 255, 0.86)'
+    context.stroke()
+    textX += chipSize + chipGap
+  }
+
   context.fillStyle = options.color ?? '#23262d'
-  context.fillText(text, padding, height / 2 + 1)
+  context.fillText(text, textX, height / 2 + 1)
 
   const texture = new THREE.CanvasTexture(canvas)
   texture.colorSpace = THREE.SRGBColorSpace
@@ -579,7 +604,7 @@ function addAsset(
 ) {
   const group = new THREE.Group()
   const object = makeAssetObject(key, options)
-  group.position.set(x, options.y ?? 0, z)
+  group.position.set(x, options.y ?? ASSET_BASE_LIFT[key] ?? 0, z)
   group.rotation.y = rotation
   group.add(object)
   parent.add(group)
@@ -635,8 +660,10 @@ function createAvatar(pubkey: string, labelText: string) {
     color: '#ffffff',
     fontSize: 24,
     padding: 12,
+    chipColor: style.body,
   })
   label.position.set(0, 1.78, 0)
+  label.visible = Boolean(labelText)
   group.add(label)
 
   return {
@@ -815,17 +842,20 @@ class ThreeOffice {
   private target?: THREE.Vector2
   private snapshot?: OfficeSceneSnapshot
   private onMove: MoveHandler
+  private canPlaceSelf: boolean
   private frame = 0
   private lastTime = performance.now()
   private lastEmit = 0
   private lastWorldKey = ''
   private assetVersion = 0
   private localEchoHoldUntil = 0
+  private followedSelfPubkey = ''
   private resizeObserver?: ResizeObserver
 
-  constructor(host: HTMLDivElement, onMove: MoveHandler) {
+  constructor(host: HTMLDivElement, onMove: MoveHandler, canPlaceSelf = true) {
     this.host = host
     this.onMove = onMove
+    this.canPlaceSelf = canPlaceSelf
     this.renderer = new THREE.WebGLRenderer({
       antialias: true,
       alpha: false,
@@ -864,6 +894,16 @@ class ThreeOffice {
 
   setMoveHandler(onMove: MoveHandler) {
     this.onMove = onMove
+  }
+
+  setCanPlaceSelf(canPlaceSelf: boolean) {
+    this.canPlaceSelf = canPlaceSelf
+    if (!canPlaceSelf) {
+      this.keys.clear()
+      this.target = undefined
+      this.followedSelfPubkey = ''
+    }
+    this.syncAvatars()
   }
 
   applySnapshot(snapshot: OfficeSceneSnapshot) {
@@ -936,6 +976,7 @@ class ThreeOffice {
   }
 
   private handleKeyDown = (event: KeyboardEvent) => {
+    if (!this.canPlaceSelf) return
     if (event.defaultPrevented || this.isTypingTarget(event.target)) return
     if (!this.isMovementKey(event.key)) return
     this.keys.add(event.key.toLowerCase())
@@ -947,14 +988,40 @@ class ThreeOffice {
   }
 
   private handlePointerDown = (event: PointerEvent) => {
+    if (!this.canPlaceSelf) return
     if (event.button !== 0) return
     const rect = this.renderer.domElement.getBoundingClientRect()
     this.pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1
     this.pointer.y = -(((event.clientY - rect.top) / rect.height) * 2 - 1)
     this.raycaster.setFromCamera(this.pointer, this.camera)
+
+    const avatarHit = this.raycaster
+      .intersectObjects(this.avatarRoot.children, true)
+      .map((hit) => this.pubkeyForObject(hit.object))
+      .find((pubkey) => pubkey && pubkey !== this.snapshot?.selfPubkey)
+
+    if (avatarHit) {
+      const node = this.avatars.get(avatarHit)
+      if (node) {
+        this.target = new THREE.Vector2(node.current.x, node.current.y)
+        event.preventDefault()
+        return
+      }
+    }
+
     const intersection = new THREE.Vector3()
     this.raycaster.ray.intersectPlane(this.groundPlane, intersection)
     this.target = new THREE.Vector2(intersection.x, intersection.z)
+  }
+
+  private pubkeyForObject(object: THREE.Object3D) {
+    let current: THREE.Object3D | null = object
+    while (current) {
+      const pubkey = current.userData.pubkey
+      if (typeof pubkey === 'string') return pubkey
+      current = current.parent
+    }
+    return null
   }
 
   private isTypingTarget(target: EventTarget | null) {
@@ -971,7 +1038,7 @@ class ThreeOffice {
     const width = Math.max(this.host.clientWidth, 1)
     const height = Math.max(this.host.clientHeight, 1)
     const aspect = width / height
-    const viewHeight = width < 620 ? 22 : 23
+    const viewHeight = width < 620 ? 22 : CAMERA_VIEW_HEIGHT
     this.camera.left = (-viewHeight * aspect) / 2
     this.camera.right = (viewHeight * aspect) / 2
     this.camera.top = viewHeight / 2
@@ -994,7 +1061,7 @@ class ThreeOffice {
   }
 
   private selfNode() {
-    if (!this.snapshot) return undefined
+    if (!this.snapshot || !this.canPlaceSelf) return undefined
     return this.avatars.get(this.snapshot.selfPubkey)
   }
 
@@ -1080,13 +1147,27 @@ class ThreeOffice {
   private updateCamera(delta: number) {
     const self = this.selfNode()
     if (self) {
-      this.cameraDesired.set(self.current.x, 0, self.current.y)
+      this.setCameraDesired(self.current.x, self.current.y)
     } else if (this.snapshot?.positions[0]) {
-      this.cameraDesired.set(worldToSceneX(this.snapshot.positions[0].x), 0, worldToSceneZ(this.snapshot.positions[0].y))
+      this.setCameraDesired(worldToSceneX(this.snapshot.positions[0].x), worldToSceneZ(this.snapshot.positions[0].y))
     }
 
     const follow = 1 - Math.exp(-delta / 190)
     this.cameraCenter.lerp(this.cameraDesired, follow)
+    this.applyCameraTransform()
+  }
+
+  private setCameraDesired(x: number, z: number) {
+    this.cameraDesired.set(x, 0, z)
+  }
+
+  private snapCameraTo(x: number, z: number) {
+    this.setCameraDesired(x, z)
+    this.cameraCenter.set(x, 0, z)
+    this.applyCameraTransform()
+  }
+
+  private applyCameraTransform() {
     this.floor.position.set(this.cameraCenter.x, -0.006, this.cameraCenter.z)
     this.camera.position.set(this.cameraCenter.x, 31, this.cameraCenter.z + 27)
     this.camera.lookAt(this.cameraCenter.x, 0, this.cameraCenter.z)
@@ -1169,7 +1250,11 @@ class ThreeOffice {
   private syncAvatars() {
     if (!this.snapshot) return
     const users = new Map(this.snapshot.users.map((user) => [user.pubkey, user]))
-    const active = new Set(this.snapshot.positions.map((position) => position.pubkey))
+    const positions = this.snapshot.positions.filter(
+      (position) => this.canPlaceSelf || position.pubkey !== this.snapshot?.selfPubkey,
+    )
+    const active = new Set(positions.map((position) => position.pubkey))
+    const labels = this.avatarLabels(users)
 
     this.avatars.forEach((node, pubkey) => {
       if (active.has(pubkey)) return
@@ -1177,17 +1262,20 @@ class ThreeOffice {
       this.avatars.delete(pubkey)
     })
 
-    this.snapshot.positions.forEach((position) => {
-      const label = this.labelFor(position, users.get(position.pubkey))
+    positions.forEach((position) => {
+      const label = labels.get(position.pubkey) ?? this.labelFor(position, users.get(position.pubkey))
+      const isSelf = this.canPlaceSelf && position.pubkey === this.snapshot?.selfPubkey
       let node = this.avatars.get(position.pubkey)
       if (!node) {
         node = createAvatar(position.pubkey, label)
+        node.group.userData.pubkey = position.pubkey
+        node.label.userData.pubkey = position.pubkey
         const x = worldToSceneX(position.x)
         const z = worldToSceneZ(position.y)
         node.current.set(x, z)
         node.target.set(x, z)
         node.group.position.set(x, 0, z)
-        if (position.pubkey === this.snapshot?.selfPubkey) {
+        if (isSelf) {
           const ring = new THREE.Mesh(new THREE.CircleGeometry(3.05, 56), ringMaterial)
           ring.rotation.x = -Math.PI / 2
           ring.position.y = 0.02
@@ -1195,7 +1283,11 @@ class ThreeOffice {
         }
         this.avatarRoot.add(node.group)
         this.avatars.set(position.pubkey, node)
-        if (position.pubkey === this.snapshot?.selfPubkey) this.cameraCenter.set(x, 0, z)
+      }
+
+      if (isSelf && this.followedSelfPubkey !== position.pubkey) {
+        this.followedSelfPubkey = position.pubkey
+        this.snapCameraTo(node.current.x, node.current.y)
       }
 
       if (node.labelText !== label) {
@@ -1205,13 +1297,20 @@ class ThreeOffice {
           color: '#ffffff',
           fontSize: 24,
           padding: 12,
+          chipColor: label ? avatarFromPubkey(position.pubkey).body : undefined,
         })
         node.label.position.set(0, 1.78, 0)
+        node.label.visible = Boolean(label)
+        node.label.userData.pubkey = position.pubkey
         node.group.add(node.label)
         node.labelText = label
       }
 
-      if (position.pubkey === this.snapshot?.selfPubkey && performance.now() < this.localEchoHoldUntil) {
+      if (
+        this.canPlaceSelf &&
+        position.pubkey === this.snapshot?.selfPubkey &&
+        performance.now() < this.localEchoHoldUntil
+      ) {
         node.target.copy(node.current)
         return
       }
@@ -1223,22 +1322,55 @@ class ThreeOffice {
     })
   }
 
+  private avatarLabels(users: Map<string, MockUser>) {
+    const labels = new Map<string, string>()
+    if (!this.snapshot) return labels
+
+    const positions = this.snapshot.positions.filter((position) => position.pubkey !== this.snapshot?.selfPubkey)
+    const clustered = new Set<string>()
+
+    positions.forEach((position) => {
+      if (clustered.has(position.pubkey)) return
+      const cluster = positions.filter(
+        (candidate) =>
+          !clustered.has(candidate.pubkey) &&
+          Math.hypot(candidate.x - position.x, candidate.y - position.y) < 34,
+      )
+
+      if (cluster.length <= 1) {
+        labels.set(position.pubkey, this.labelFor(position, users.get(position.pubkey)))
+        clustered.add(position.pubkey)
+        return
+      }
+
+      cluster.forEach((candidate, index) => {
+        clustered.add(candidate.pubkey)
+        labels.set(candidate.pubkey, index === 0 ? `${cluster.length} plebs` : '')
+      })
+    })
+
+    if (this.canPlaceSelf) labels.set(this.snapshot.selfPubkey, 'You')
+    return labels
+  }
+
   private labelFor(position: WorldPosition, user?: MockUser) {
-    if (position.pubkey === this.snapshot?.selfPubkey) return 'You'
+    if (this.canPlaceSelf && position.pubkey === this.snapshot?.selfPubkey) return 'You'
     return user?.name ?? 'npub'
   }
 }
 
-export function OfficeRenderer({ snapshot, onMove }: OfficeRendererProps) {
+export function OfficeRenderer({ snapshot, onMove, canPlaceSelf = true }: OfficeRendererProps) {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const rendererRef = useRef<ThreeOffice | null>(null)
   const initialSnapshotRef = useRef(snapshot)
   const initialMoveRef = useRef(onMove)
+  const initialCanPlaceSelfRef = useRef(canPlaceSelf)
+  const [size, setSize] = useState({ width: 0, height: 0 })
 
   useEffect(() => {
     const host = hostRef.current
     if (!host) return undefined
-    const office = new ThreeOffice(host, initialMoveRef.current)
+    const office = new ThreeOffice(host, initialMoveRef.current, initialCanPlaceSelfRef.current)
     rendererRef.current = office
     office.applySnapshot(initialSnapshotRef.current)
     return () => {
@@ -1252,8 +1384,113 @@ export function OfficeRenderer({ snapshot, onMove }: OfficeRendererProps) {
   }, [onMove])
 
   useEffect(() => {
+    rendererRef.current?.setCanPlaceSelf(canPlaceSelf)
+  }, [canPlaceSelf])
+
+  useEffect(() => {
     rendererRef.current?.applySnapshot(snapshot)
   }, [snapshot])
 
-  return <div ref={hostRef} className="office-canvas" data-testid="office-canvas" />
+  useEffect(() => {
+    const host = hostRef.current
+    if (!host) return undefined
+    const update = () => setSize({ width: host.clientWidth, height: host.clientHeight })
+    update()
+    const observer = new ResizeObserver(update)
+    observer.observe(host)
+    return () => observer.disconnect()
+  }, [])
+
+  return (
+    <div ref={hostRef} className="office-canvas" data-testid="office-canvas">
+      <EdgePresenceOverlay snapshot={snapshot} size={size} />
+    </div>
+  )
+}
+
+function EdgePresenceOverlay({
+  snapshot,
+  size,
+}: {
+  snapshot: OfficeSceneSnapshot
+  size: { width: number; height: number }
+}) {
+  const markers = useMemo(() => {
+    const self = snapshot.positions.find((position) => position.pubkey === snapshot.selfPubkey)
+    if (!self || size.width < 10 || size.height < 10) return []
+
+    const aspect = size.width / size.height
+    const viewHeight = size.width < 620 ? 22 : CAMERA_VIEW_HEIGHT
+    const viewWidth = viewHeight * aspect
+    const users = new Map(snapshot.users.map((user) => [user.pubkey, user]))
+    const raw = snapshot.positions
+      .filter((position) => position.pubkey !== snapshot.selfPubkey)
+      .map((position) => {
+        const dx = (position.x - self.x) * WORLD_SCALE
+        const dy = (position.y - self.y) * WORLD_SCALE
+        const visible = Math.abs(dx) < viewWidth / 2 - 1.8 && Math.abs(dy) < viewHeight / 2 - 1.8
+        if (visible) return null
+
+        const nx = dx / Math.max(viewWidth / 2, 1)
+        const ny = dy / Math.max(viewHeight / 2, 1)
+        const edgeScale = 0.86 / Math.max(Math.abs(nx), Math.abs(ny), 0.001)
+        const left = Math.max(7, Math.min(93, 50 + nx * edgeScale * 50))
+        const top = Math.max(8, Math.min(92, 50 + ny * edgeScale * 50))
+
+        return {
+          pubkeys: [position.pubkey],
+          label: users.get(position.pubkey)?.name ?? 'npub',
+          left,
+          top,
+          angle: Math.atan2(ny, nx),
+        }
+      })
+      .filter(Boolean) as Array<{
+      pubkeys: string[]
+      label: string
+      left: number
+      top: number
+      angle: number
+    }>
+
+    const groups: typeof raw = []
+    raw.forEach((marker) => {
+      const existing = groups.find((group) => Math.hypot(group.left - marker.left, group.top - marker.top) < 12)
+      if (!existing) {
+        groups.push(marker)
+        return
+      }
+      existing.pubkeys.push(...marker.pubkeys)
+      existing.left = (existing.left + marker.left) / 2
+      existing.top = (existing.top + marker.top) / 2
+      existing.angle = Math.atan2(
+        (Math.sin(existing.angle) + Math.sin(marker.angle)) / 2,
+        (Math.cos(existing.angle) + Math.cos(marker.angle)) / 2,
+      )
+      existing.label = `${existing.pubkeys.length} plebs`
+    })
+
+    return groups
+  }, [snapshot.positions, snapshot.selfPubkey, snapshot.users, size.height, size.width])
+
+  if (markers.length === 0) return null
+
+  return (
+    <div className="edge-presence-layer" aria-hidden="true">
+      {markers.map((marker) => (
+        <div
+          key={marker.pubkeys.join(':')}
+          className="edge-presence-chip"
+          style={{
+            left: `${marker.left}%`,
+            top: `${marker.top}%`,
+            ['--edge-angle' as string]: `${marker.angle}rad`,
+          }}
+        >
+          <span className="edge-presence-arrow" />
+          <span>{marker.label}</span>
+        </div>
+      ))}
+    </div>
+  )
 }

@@ -91,14 +91,14 @@ export function pendingJoinRequests(events: NestrEvent[], members: Set<string>) 
 }
 
 export function moderationSummary(event: NestrEvent) {
-  if (event.kind === NIP29_KINDS.putUser) return `put-user ${targetPubkey(event) ?? ''}`.trim()
-  if (event.kind === NIP29_KINDS.removeUser) return `remove-user ${targetPubkey(event) ?? ''}`.trim()
-  if (event.kind === NIP29_KINDS.editMetadata) return 'edit-metadata'
-  if (event.kind === NIP29_KINDS.deleteEvent) return `delete-event ${targetEventId(event) ?? ''}`.trim()
-  if (event.kind === NIP29_KINDS.createGroup) return 'create-group'
-  if (event.kind === NIP29_KINDS.deleteGroup) return 'delete-group'
-  if (event.kind === NIP29_KINDS.createInvite) return `create-invite ${tagValue(event, 'code') ?? ''}`.trim()
-  if (event.kind === NIP29_KINDS.leaveRequest) return `leave-request ${event.pubkey}`
-  if (event.kind === NIP29_KINDS.joinRequest) return `join-request ${event.pubkey}`
-  return `kind:${event.kind}`
+  if (event.kind === NIP29_KINDS.putUser) return `member updated ${targetPubkey(event)?.slice(0, 8) ?? ''}`.trim()
+  if (event.kind === NIP29_KINDS.removeUser) return `member removed ${targetPubkey(event)?.slice(0, 8) ?? ''}`.trim()
+  if (event.kind === NIP29_KINDS.editMetadata) return 'group edited'
+  if (event.kind === NIP29_KINDS.deleteEvent) return `message deleted ${targetEventId(event)?.slice(0, 8) ?? ''}`.trim()
+  if (event.kind === NIP29_KINDS.createGroup) return 'chatroom created'
+  if (event.kind === NIP29_KINDS.deleteGroup) return 'chatroom deleted'
+  if (event.kind === NIP29_KINDS.createInvite) return `invite created ${tagValue(event, 'code') ?? ''}`.trim()
+  if (event.kind === NIP29_KINDS.leaveRequest) return `leave requested ${event.pubkey.slice(0, 8)}`
+  if (event.kind === NIP29_KINDS.joinRequest) return `join requested ${event.pubkey.slice(0, 8)}`
+  return 'room action'
 }

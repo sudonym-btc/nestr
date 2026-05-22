@@ -1,5 +1,13 @@
+export interface LandingLaunch {
+  mode: 'landing'
+}
+
 export interface MockLaunch {
   mode: 'mock'
+  groupId?: string
+  relayUrl: string
+  authRequired: boolean
+  initialView: 'relay' | 'group'
 }
 
 export interface LiveLaunch {
@@ -10,7 +18,22 @@ export interface LiveLaunch {
   initialView: 'relay' | 'group'
 }
 
-export type LaunchConfig = MockLaunch | LiveLaunch
+export type LaunchConfig = LandingLaunch | MockLaunch | LiveLaunch
+
+export const DEVELOPMENT_RELAYS = [
+  {
+    host: 'relay.nestr.development',
+    label: 'Nestr development relay',
+    description: 'Local persistent relay for testing private rooms and signed actions.',
+    authRequired: true,
+  },
+  {
+    host: 'openrelay.nestr.development',
+    label: 'Nestr open relay',
+    description: 'Local persistent relay for open rooms and low-friction demos.',
+    authRequired: false,
+  },
+] as const
 
 export function normalizeRelayUrl(value: string) {
   const withScheme = value.includes('://') ? value : `wss://${value}`
@@ -19,6 +42,24 @@ export function normalizeRelayUrl(value: string) {
   if (url.protocol === 'http:') url.protocol = 'ws:'
   url.hash = ''
   return url.toString().replace(/\/$/, '')
+}
+
+export function relayHost(value: string) {
+  try {
+    return new URL(normalizeRelayUrl(value)).host
+  } catch {
+    return value
+  }
+}
+
+export function isDevelopmentRelay(value: string) {
+  const host = relayHost(value)
+  return DEVELOPMENT_RELAYS.some((relay) => relay.host === host)
+}
+
+export function developmentRelayInfo(value: string) {
+  const host = relayHost(value)
+  return DEVELOPMENT_RELAYS.find((relay) => relay.host === host)
 }
 
 function relayListParams(params: URLSearchParams, names: string[]) {
@@ -45,6 +86,17 @@ export function parseLaunch(search = globalThis.location?.search ?? ''): LaunchC
   ]).map(normalizeRelayUrl)
 
   if (relay) {
+    const developmentRelay = developmentRelayInfo(relay)
+    if (developmentRelay) {
+      return {
+        mode: 'mock',
+        groupId: groupId ?? undefined,
+        relayUrl: normalizeRelayUrl(relay),
+        authRequired: developmentRelay.authRequired,
+        initialView: groupId ? 'group' : 'relay',
+      }
+    }
+
     return {
       mode: 'live',
       groupId: groupId ?? undefined,
@@ -54,5 +106,5 @@ export function parseLaunch(search = globalThis.location?.search ?? ''): LaunchC
     }
   }
 
-  return { mode: 'mock' }
+  return { mode: 'landing' }
 }

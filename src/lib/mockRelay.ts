@@ -12,7 +12,9 @@ import {
   tagValue,
   type NestrDirectMessage,
   type NestrEvent,
+  type NestrAttachment,
 } from './nostr'
+import { attachmentLabel, attachmentTags, contentWithAttachmentUrls } from './attachments'
 import { npubForPubkey, resolvePubkey, seededSecret, shortNpub } from './avatar'
 import {
   groupMetadataDraft,
@@ -43,7 +45,18 @@ export interface MockUser {
   role: string
   pictureUrl?: string
   pictureCandidates?: string[]
+  blossomServers?: string[]
+  dmRelays?: string[]
+  readRelays?: string[]
+  writeRelays?: string[]
   secretKey?: Uint8Array
+}
+
+export interface MockRelayOptions {
+  relayUrl?: string
+  groupId?: string
+  persist?: boolean
+  authRequired?: boolean
 }
 
 export interface Nip29Group {
@@ -59,6 +72,9 @@ export interface RelaySnapshot {
   mode?: 'mock' | 'live'
   connectionStatus?: 'mock' | 'connecting' | 'connected' | 'authenticated' | 'disconnected' | 'error'
   connectionMessage?: string
+  connectionLog?: string[]
+  roomAccessStatus?: 'unknown' | 'open' | 'auth-required' | 'blocked' | 'closed'
+  roomAccessMessage?: string
   group: Nip29Group
   relayGroups: NestrEvent[]
   users: MockUser[]
@@ -74,6 +90,12 @@ export interface RelaySnapshot {
 }
 
 type RelayListener = (snapshot: RelaySnapshot, event?: NestrEvent) => void
+
+interface StoredMockRelayState {
+  events: NestrEvent[]
+  relayGroups: NestrEvent[]
+  deletedEventIds: string[]
+}
 
 function sign(template: Omit<NestrEvent, 'id' | 'sig'>, secretKey: Uint8Array): NestrEvent {
   return finalizeEvent(template, secretKey) as NestrEvent
@@ -101,6 +123,10 @@ function makeDemoUser(seed: string, name: string, role: string): MockUser {
     npub: npubForPubkey(pubkey),
     name,
     role,
+    blossomServers: ['https://blossom.primal.net', 'https://cdn.satellite.earth'],
+    dmRelays: [MOCK_RELAY_URL],
+    readRelays: [MOCK_RELAY_URL],
+    writeRelays: [MOCK_RELAY_URL],
     secretKey,
   }
 }
@@ -118,13 +144,17 @@ const demoUsers = [
 
 export class MockNip29Relay {
   readonly mode = 'mock' as const
-  readonly relayUrl = MOCK_RELAY_URL
+  readonly relayUrl: string
   readonly relayPubkey: string
 
   private readonly relaySecret = seededSecret('relay')
-  private readonly groupId = DEFAULT_GROUP_ID
+  private readonly persistState: boolean
+  private readonly authRequired: boolean
+  private readonly storageKey: string
+  private groupId = DEFAULT_GROUP_ID
   private readonly listeners = new Set<RelayListener>()
   private readonly events: NestrEvent[] = []
+  private readonly seededEventIds = new Set<string>()
   private readonly directMessages: NestrDirectMessage[] = []
   private readonly relayGroupEvents = new Map<string, NestrEvent>()
   private readonly users = new Map<string, MockUser>()
@@ -135,7 +165,12 @@ export class MockNip29Relay {
   private readonly deletedEventIds = new Set<string>()
   private group: Nip29Group
 
-  constructor() {
+  constructor(options: MockRelayOptions = {}) {
+    this.relayUrl = options.relayUrl ?? MOCK_RELAY_URL
+    this.groupId = options.groupId ?? DEFAULT_GROUP_ID
+    this.persistState = options.persist ?? false
+    this.authRequired = options.authRequired ?? false
+    this.storageKey = `nestr:mock-relay:${this.relayUrl}`
     this.relayPubkey = getPublicKey(this.relaySecret)
     demoUsers.forEach((user) => this.memberPubkeys.add(user.pubkey))
     this.adminRoles.set(demoUsers[0].pubkey, ['admin'])
@@ -145,11 +180,64 @@ export class MockNip29Relay {
     demoUsers.forEach((user, index) => this.addSeedUser(user, index))
     this.seedMessages()
     this.seedDirectMessages()
+    this.restorePersistedState()
+    this.group = this.createGroup(this.groupId)
+  }
+
+  private storage() {
+    if (!this.persistState || typeof globalThis.localStorage === 'undefined') return null
+    try {
+      return globalThis.localStorage
+    } catch {
+      return null
+    }
+  }
+
+  private restorePersistedState() {
+    const storage = this.storage()
+    if (!storage) return
+
+    try {
+      const raw = storage.getItem(this.storageKey)
+      if (!raw) return
+      const state = JSON.parse(raw) as Partial<StoredMockRelayState>
+
+      state.relayGroups?.forEach((event) => {
+        const groupId = tagValue(event, 'd') ?? tagValue(event, 'h')
+        if (groupId) this.relayGroupEvents.set(groupId, event)
+      })
+
+      const existingIds = new Set(this.events.map((event) => event.id))
+      state.events?.forEach((event) => {
+        if (!event?.id || existingIds.has(event.id)) return
+        this.ensureKnownUser(event.pubkey)
+        if (isNip29ModerationKind(event.kind)) this.applyModerationEvent(event)
+        this.events.push(event)
+        existingIds.add(event.id)
+      })
+
+      state.deletedEventIds?.forEach((eventId) => this.deletedEventIds.add(eventId))
+    } catch {
+      storage.removeItem(this.storageKey)
+    }
+  }
+
+  private persist() {
+    const storage = this.storage()
+    if (!storage) return
+
+    const state: StoredMockRelayState = {
+      events: this.events.filter((event) => !this.seededEventIds.has(event.id)),
+      relayGroups: Array.from(this.relayGroupEvents.values()),
+      deletedEventIds: Array.from(this.deletedEventIds),
+    }
+    storage.setItem(this.storageKey, JSON.stringify(state))
   }
 
   snapshot(): RelaySnapshot {
     const messages = this.events
       .filter((event) => event.kind === NIP29_KINDS.chatMessage)
+      .filter((event) => tagValue(event, 'h') === this.groupId)
       .filter((event) => !this.deletedEventIds.has(event.id))
       .sort((a, b) => a.created_at - b.created_at)
     const moderationEvents = this.events
@@ -160,7 +248,10 @@ export class MockNip29Relay {
     return {
       mode: this.mode,
       connectionStatus: 'mock',
-      connectionMessage: 'local mock relay',
+      connectionMessage: this.authRequired ? 'local development relay' : 'local open development relay',
+      connectionLog: [this.authRequired ? 'local development relay' : 'local open development relay'],
+      roomAccessStatus: 'open',
+      roomAccessMessage: 'local room open',
       group: this.group,
       relayGroups: Array.from(this.relayGroupEvents.values()),
       users: Array.from(this.users.values()),
@@ -185,6 +276,14 @@ export class MockNip29Relay {
     }
   }
 
+  selectGroup(groupId: string) {
+    if (!this.relayGroupEvents.has(groupId)) return false
+    this.groupId = groupId
+    this.group = this.createGroup(groupId)
+    this.emit()
+    return true
+  }
+
   joinWithNpub(value: string) {
     const pubkey = resolvePubkey(value)
     const existing = this.users.get(pubkey)
@@ -195,6 +294,10 @@ export class MockNip29Relay {
       npub: npubForPubkey(pubkey),
       name: shortNpub(pubkey),
       role: 'guest',
+      blossomServers: ['https://blossom.primal.net', 'https://cdn.satellite.earth'],
+      dmRelays: [this.relayUrl],
+      readRelays: [this.relayUrl],
+      writeRelays: [this.relayUrl],
     }
 
     this.users.set(pubkey, user)
@@ -207,17 +310,19 @@ export class MockNip29Relay {
     return user
   }
 
-  publishGroupMessage(pubkey: string, content: string) {
+  publishGroupMessage(pubkey: string, content: string, attachments: NestrAttachment[] = []) {
     const user = this.users.get(pubkey)
     const trimmed = content.trim()
-    if (!user || trimmed.length === 0) return { ok: false, reason: 'invalid-message' }
+    if (!user || (trimmed.length === 0 && attachments.length === 0)) {
+      return { ok: false, reason: 'invalid-message' }
+    }
 
     const template = {
       kind: NIP29_KINDS.chatMessage,
       pubkey,
       created_at: now(),
-      tags: [groupTag(this.groupId), ['client', 'nestr']],
-      content: trimmed,
+      tags: [groupTag(this.groupId), ...attachmentTags(attachments), ['client', 'nestr']],
+      content: contentWithAttachmentUrls(trimmed, attachments),
     }
 
     const event = user.secretKey
@@ -227,20 +332,29 @@ export class MockNip29Relay {
     return this.publish(event)
   }
 
-  publishDirectMessage(senderPubkey: string, recipientPubkey: string, content: string) {
+  publishDirectMessage(
+    senderPubkey: string,
+    recipientPubkey: string,
+    content: string,
+    attachments: NestrAttachment[] = [],
+  ) {
     this.ensureKnownUser(senderPubkey)
     this.ensureKnownUser(recipientPubkey)
     const trimmed = content.trim()
-    if (!trimmed) return { ok: false, reason: 'invalid-message' }
+    if (!trimmed && attachments.length === 0) return { ok: false, reason: 'invalid-message' }
 
     const createdAt = now()
-    const id = bytesToHex(sha256(encoder.encode(`dm:${senderPubkey}:${recipientPubkey}:${trimmed}:${createdAt}`)))
+    const attachmentDigest = attachmentLabel(attachments)
+    const id = bytesToHex(
+      sha256(encoder.encode(`dm:${senderPubkey}:${recipientPubkey}:${trimmed}:${attachmentDigest}:${createdAt}`)),
+    )
     this.directMessages.push({
       id,
       counterparty: recipientPubkey,
       senderPubkey,
       recipientPubkey,
-      content: trimmed,
+      content: trimmed || attachmentDigest,
+      attachments,
       createdAt,
       protocol: 'mock',
     })
@@ -255,7 +369,7 @@ export class MockNip29Relay {
           counterparty: senderPubkey,
           senderPubkey: recipientPubkey,
           recipientPubkey: senderPubkey,
-          content: `Got it: ${trimmed.slice(0, 90)}`,
+          content: `Got it: ${(trimmed || attachmentDigest).slice(0, 90)}`,
           createdAt: replyAt,
           protocol: 'mock',
         })
@@ -358,6 +472,7 @@ export class MockNip29Relay {
 
     this.events.push(event)
     this.relayGroupEvents.set(groupId, this.createGroupMetadata(groupId, content.trim()))
+    this.persist()
     this.emit(event)
     return { ok: true, event }
   }
@@ -409,6 +524,7 @@ export class MockNip29Relay {
 
     if (!isEphemeralKind(event.kind)) {
       this.events.push(event)
+      this.persist()
     }
 
     this.emit(event)
@@ -442,7 +558,12 @@ export class MockNip29Relay {
   }
 
   private addSeedUser(user: MockUser, index: number) {
-    this.users.set(user.pubkey, user)
+    this.users.set(user.pubkey, {
+      ...user,
+      dmRelays: [this.relayUrl],
+      readRelays: [this.relayUrl],
+      writeRelays: [this.relayUrl],
+    })
     const map = buildOfficeMap(this.groupId, demoUsers.length)
     const spawn = spawnForPubkey(map, user.pubkey, index)
     this.positions.set(user.pubkey, {
@@ -464,6 +585,10 @@ export class MockNip29Relay {
       npub: npubForPubkey(pubkey),
       name: shortNpub(pubkey),
       role: this.memberPubkeys.has(pubkey) ? 'member' : 'participant',
+      blossomServers: ['https://blossom.primal.net', 'https://cdn.satellite.earth'],
+      dmRelays: [this.relayUrl],
+      readRelays: [this.relayUrl],
+      writeRelays: [this.relayUrl],
     }
     this.users.set(pubkey, user)
     return user
@@ -582,8 +707,10 @@ export class MockNip29Relay {
     }
   }
 
-  private createGroup(): Nip29Group {
-    const metadata = this.createGroupMetadata(this.groupId, 'Nestr Design Office', 'A relay-native spatial room')
+  private createGroup(groupId = this.groupId): Nip29Group {
+    const metadata =
+      this.relayGroupEvents.get(groupId) ??
+      this.createGroupMetadata(groupId, 'Nestr Design Office', 'A relay-native spatial room')
 
     const admins = sign(
       {
@@ -591,7 +718,7 @@ export class MockNip29Relay {
         pubkey: this.relayPubkey,
         created_at: now(),
         tags: [
-          dTag(this.groupId),
+          dTag(groupId),
           ...Array.from(this.adminRoles.entries()).map(([pubkey, roles]) => ['p', pubkey, ...roles]),
         ],
         content: 'relay-generated admins',
@@ -604,7 +731,7 @@ export class MockNip29Relay {
         kind: NIP29_KINDS.groupMembers,
         pubkey: this.relayPubkey,
         created_at: now(),
-        tags: [dTag(this.groupId), ...Array.from(this.memberPubkeys).map((pubkey) => ['p', pubkey])],
+        tags: [dTag(groupId), ...Array.from(this.memberPubkeys).map((pubkey) => ['p', pubkey])],
         content: 'relay-generated members',
       },
       this.relaySecret,
@@ -616,7 +743,7 @@ export class MockNip29Relay {
         pubkey: this.relayPubkey,
         created_at: now(),
         tags: [
-          dTag(this.groupId),
+          dTag(groupId),
           ['role', 'admin', 'metadata, invites, moderation'],
           ['role', 'moderator', 'moderation'],
           ['role', 'builder', 'office map changes'],
@@ -626,7 +753,7 @@ export class MockNip29Relay {
       this.relaySecret,
     )
 
-    return { id: this.groupId, relay: this.relayUrl, metadata, admins, members, roles }
+    return { id: groupId, relay: this.relayUrl, metadata, admins, members, roles }
   }
 
   private createGroupMetadata(groupId: string, name = groupId, about = 'Created from Nestr'): NestrEvent {
@@ -707,6 +834,7 @@ export class MockNip29Relay {
       )
 
       this.events.push(event)
+      this.seededEventIds.add(event.id)
       this.recordActivity(user.pubkey, event.created_at * 1000)
     })
   }
@@ -739,6 +867,6 @@ export class MockNip29Relay {
   }
 }
 
-export function createMockRelay() {
-  return new MockNip29Relay()
+export function createMockRelay(options?: MockRelayOptions) {
+  return new MockNip29Relay(options)
 }

@@ -53,4 +53,31 @@ describe('nip17 direct messages', () => {
     expect(unwrapped?.counterparty).toBe(bob.pubkey)
     expect(unwrapped?.recipientPubkey).toBe(bob.pubkey)
   })
+
+  it('wraps encrypted file messages with kind 15 metadata', async () => {
+    const alice = localSigner(generateSecretKey(), 'alice')
+    const bob = localSigner(generateSecretKey(), 'bob')
+    const attachment = {
+      url: 'https://cdn.example/secret.bin',
+      name: 'secret.png',
+      mimeType: 'image/png',
+      size: 2048,
+      sha256: 'a'.repeat(64),
+      originalSha256: 'b'.repeat(64),
+      encrypted: true,
+      encryptionAlgorithm: 'aes-gcm' as const,
+      decryptionKey: 'c'.repeat(64),
+      decryptionNonce: 'd'.repeat(24),
+    }
+
+    const { message, wraps } = await createNip17DirectMessage(alice, bob.pubkey, '', 1_700_000_200, {
+      attachment,
+    })
+    const forBob = wraps.find((wrap) => wrap.tags.some((tag) => tag[0] === 'p' && tag[1] === bob.pubkey))
+    const unwrapped = await unwrapNip17DirectMessage(bob, forBob!)
+
+    expect(message.attachments?.[0]).toMatchObject(attachment)
+    expect(unwrapped?.content).toBe('secret.png')
+    expect(unwrapped?.attachments?.[0]).toMatchObject(attachment)
+  })
 })

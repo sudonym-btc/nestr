@@ -17,6 +17,10 @@ import {
   MicOff,
   Minimize2,
   Monitor,
+  Download,
+  File as FileIcon,
+  Image,
+  Paperclip,
   Radio,
   RefreshCcw,
   Search,
@@ -47,10 +51,15 @@ import { Label } from '@/components/ui/label'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { OfficeRenderer } from './game/OfficeRenderer'
 import { avatarCss, npubForPubkey, resolvePubkey, seededPubkey, shortNpub } from './lib/avatar'
-import { parseLaunch } from './lib/launch'
+import { DEVELOPMENT_RELAYS, parseLaunch, type LiveLaunch, type MockLaunch } from './lib/launch'
 import { createLiveRelay } from './lib/liveRelay'
 import { createMockRelay, type MockUser, type RelaySnapshot } from './lib/mockRelay'
-import { hasTag, tagValue, type NestrEvent, type NestrSigner } from './lib/nostr'
+import { NIP29_KINDS, OFFICE_KINDS, hasTag, tagValue, type NestrAttachment, type NestrEvent, type NestrSigner } from './lib/nostr'
+import {
+  attachmentsFromEvent,
+  contentWithoutAttachmentUrls,
+} from './lib/attachments'
+import { decryptAttachmentBlob, prepareFileAttachment } from './lib/blossomUpload'
 import {
   groupMetadataDraft,
   memberPubkeys,
@@ -73,8 +82,9 @@ import {
   readStoredNostrConnectSession,
   writeStoredNostrConnectSession,
 } from './lib/secureSession'
-import { estimateWebRtcMesh, meshHealth, nearbyPeers } from './lib/videoMesh'
-import { buildOfficeMap, mapCapacityLabel, spawnForPubkey } from './lib/world'
+import { BLOSSOM_FALLBACK_SERVERS } from './lib/profileImages'
+import { estimateWebRtcMesh, nearbyPeers } from './lib/videoMesh'
+import { buildOfficeMap, spawnForPubkey } from './lib/world'
 
 function nameFor(pubkey: string, users: MockUser[]) {
   return users.find((user) => user.pubkey === pubkey)?.name ?? shortNpub(pubkey)
@@ -89,6 +99,23 @@ function groupTagLabel(snapshot: RelaySnapshot) {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
+}
+
+function messageDate(seconds: number) {
+  const date = new Date(seconds * 1000)
+  const options: Intl.DateTimeFormatOptions = {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  }
+
+  if (date.getFullYear() !== new Date().getFullYear()) options.year = 'numeric'
+  return date.toLocaleString([], options)
+}
+
+function messageDateTime(seconds: number) {
+  return new Date(seconds * 1000).toISOString()
 }
 
 function rolesForPubkey(snapshot: RelaySnapshot, pubkey: string) {
@@ -124,11 +151,24 @@ function relayHostLabel(relayUrl: string) {
   }
 }
 
+function trimRelayProtocol(relayUrl: string) {
+  return relayUrl.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').replace(/\/$/, '')
+}
+
 function relayGroupSearchText(groupEvent: NestrEvent, fallbackGroupId: string) {
   const groupId = tagValue(groupEvent, 'd') ?? fallbackGroupId
   const name = tagValue(groupEvent, 'name') ?? ''
   const about = tagValue(groupEvent, 'about') ?? ''
   return `${groupId} ${name} ${about}`.toLowerCase()
+}
+
+function isOfficeCallSignalKind(kind: number) {
+  return (
+    kind === OFFICE_KINDS.callOffer ||
+    kind === OFFICE_KINDS.callAnswer ||
+    kind === OFFICE_KINDS.iceCandidate ||
+    kind === OFFICE_KINDS.callHangup
+  )
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string) {
@@ -218,24 +258,192 @@ function NostrEntityChip({ entity, users }: NostrEntityChipProps) {
   )
 }
 
+function formatBytes(size: number) {
+  if (!Number.isFinite(size) || size <= 0) return 'file'
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+  return `${(size / 1024 / 1024).toFixed(1)} MB`
+}
+
+function relativePing(lastPingAt: number | null, nowMs: number, mode: 'mock' | 'live', authState: AuthState) {
+  if (mode === 'mock') return 'local'
+  if (authState === 'reconnecting') return 'reconnecting'
+  if (authState === 'disconnected') return lastPingAt ? `last ping ${Math.max(1, Math.round((nowMs - lastPingAt) / 1000))}s ago` : 'offline'
+  if (!lastPingAt) return 'not pinged yet'
+  return `last ping ${Math.max(0, Math.round((nowMs - lastPingAt) / 1000))}s ago`
+}
+
+function attachmentPreviewKind(attachment: NestrAttachment) {
+  if (attachment.mimeType.startsWith('image/')) return 'image'
+  if (attachment.mimeType.startsWith('video/')) return 'video'
+  if (attachment.mimeType.startsWith('audio/')) return 'audio'
+  return 'file'
+}
+
+function AttachmentCard({ attachment }: { attachment: NestrAttachment }) {
+  const [objectUrl, setObjectUrl] = useState<string | null>(null)
+  const [status, setStatus] = useState<'idle' | 'loading' | 'error'>('idle')
+  const previewKind = attachmentPreviewKind(attachment)
+  const needsObjectUrl = attachment.encrypted || attachment.url.startsWith('blob:') || attachment.url.startsWith('data:')
+  const previewUrl = objectUrl ?? (!needsObjectUrl ? attachment.url : null)
+
+  useEffect(() => {
+    let cancelled = false
+    let createdUrl: string | null = null
+
+    if (previewKind === 'file' && !attachment.encrypted) return undefined
+    if (!needsObjectUrl && !attachment.encrypted) return undefined
+
+    decryptAttachmentBlob(attachment)
+      .then((blob) => {
+        if (cancelled) return
+        createdUrl = URL.createObjectURL(blob)
+        setObjectUrl(createdUrl)
+        setStatus('idle')
+      })
+      .catch(() => {
+        if (!cancelled) setStatus('error')
+      })
+
+    return () => {
+      cancelled = true
+      if (createdUrl) URL.revokeObjectURL(createdUrl)
+    }
+  }, [attachment, needsObjectUrl, previewKind])
+
+  async function downloadAttachment() {
+    try {
+      setStatus('loading')
+      const blob = await decryptAttachmentBlob(attachment)
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = attachment.name
+      link.rel = 'noreferrer'
+      document.body.append(link)
+      link.click()
+      link.remove()
+      window.setTimeout(() => URL.revokeObjectURL(url), 1200)
+      setStatus('idle')
+    } catch {
+      window.open(attachment.url, '_blank', 'noopener,noreferrer')
+      setStatus('error')
+    }
+  }
+
+  return (
+    <Card className={`attachment-card ${previewKind}`} size="sm">
+      <div className="attachment-preview">
+        {previewKind === 'image' && previewUrl ? (
+          <img src={previewUrl} alt={attachment.alt || attachment.name} />
+        ) : previewKind === 'video' && previewUrl ? (
+          <video src={previewUrl} controls playsInline />
+        ) : previewKind === 'audio' && previewUrl ? (
+          <audio src={previewUrl} controls />
+        ) : previewKind === 'image' ? (
+          <Image size={18} />
+        ) : (
+          <FileIcon size={18} />
+        )}
+      </div>
+      <div className="attachment-info">
+        <strong>{attachment.name}</strong>
+        <span>
+          {attachment.encrypted ? 'encrypted · ' : ''}
+          {attachment.mimeType} · {formatBytes(attachment.size)}
+        </span>
+      </div>
+      <Button
+        type="button"
+        className="icon-soft attachment-download"
+        onClick={() => void downloadAttachment()}
+        aria-label={`Download ${attachment.name}`}
+        title={status === 'loading' ? 'Preparing file' : `Download ${attachment.name}`}
+      >
+        {status === 'loading' ? <LoaderCircle size={15} className="spin-icon" /> : <Download size={15} />}
+      </Button>
+    </Card>
+  )
+}
+
+function AttachmentGrid({ attachments }: { attachments: NestrAttachment[] }) {
+  if (attachments.length === 0) return null
+
+  return (
+    <div className="attachment-grid">
+      {attachments.map((attachment) => (
+        <AttachmentCard key={`${attachment.url}:${attachment.name}`} attachment={attachment} />
+      ))}
+    </div>
+  )
+}
+
+function SelectedFiles({ files, onRemove }: { files: File[]; onRemove: (index: number) => void }) {
+  if (files.length === 0) return null
+
+  return (
+    <div className="selected-files" aria-label="Selected files">
+      {files.map((file, index) => (
+        <span className="selected-file" key={`${file.name}:${file.size}:${index}`}>
+          <FileIcon size={13} />
+          <span>{file.name}</span>
+          <Button type="button" className="icon-soft" onClick={() => onRemove(index)} aria-label={`Remove ${file.name}`}>
+            <X size={12} />
+          </Button>
+        </span>
+      ))}
+    </div>
+  )
+}
+
 interface MessageContentProps {
   event: NestrEvent
   users: MockUser[]
 }
 
 function MessageContent({ event, users }: MessageContentProps) {
-  const parts = parseNostrReferences(event.content, event.tags)
+  const attachments = attachmentsFromEvent(event)
+  const text = contentWithoutAttachmentUrls(event.content, attachments)
+  const parts = parseNostrReferences(text, event.tags)
 
   return (
-    <p>
-      {parts.map((part, index) =>
-        part.type === 'text' ? (
-          <span key={`${index}-text`}>{part.text}</span>
-        ) : (
-          <NostrEntityChip key={`${index}-${part.code}`} entity={part} users={users} />
-        ),
+    <>
+      {text && (
+        <p>
+          {parts.map((part, index) =>
+            part.type === 'text' ? (
+              <span key={`${index}-text`}>{part.text}</span>
+            ) : (
+              <NostrEntityChip key={`${index}-${part.code}`} entity={part} users={users} />
+            ),
+          )}
+        </p>
       )}
-    </p>
+      <AttachmentGrid attachments={attachments} />
+    </>
+  )
+}
+
+function DirectMessageContent({ message, users }: { message: { content: string; attachments?: NestrAttachment[] }; users: MockUser[] }) {
+  const attachments = message.attachments ?? []
+  const text = contentWithoutAttachmentUrls(message.content, attachments)
+  const parts = parseNostrReferences(text, [])
+
+  return (
+    <>
+      {text && (
+        <p>
+          {parts.map((part, index) =>
+            part.type === 'text' ? (
+              <span key={`${index}-text`}>{part.text}</span>
+            ) : (
+              <NostrEntityChip key={`${index}-${part.code}`} entity={part} users={users} />
+            ),
+          )}
+        </p>
+      )}
+      <AttachmentGrid attachments={attachments} />
+    </>
   )
 }
 
@@ -251,6 +459,7 @@ interface StreamTileProps {
 type AuthState = 'mock' | 'idle' | 'connecting' | 'reconnecting' | 'connected' | 'disconnected'
 type AppView = 'relay' | 'group' | 'dm'
 type AuthPromptKind = 'relay' | 'dm' | 'write' | 'admin' | 'reconnect' | 'manual'
+type AdminDialog = 'join' | 'member' | 'invite' | 'details' | 'moderation' | 'joins' | null
 
 interface AuthPrompt {
   kind: AuthPromptKind
@@ -278,6 +487,16 @@ function authPromptTitle(kind: AuthPromptKind) {
   return 'Sign in with Nostr'
 }
 
+function relayBlockedKind(reason?: string) {
+  const match = String(reason ?? '').match(/kind\s+(\d+)\s+not allowed/i)
+  return match ? Number(match[1]) : null
+}
+
+function unsupportedActionMessage(kind: number, label: string) {
+  if (kind === NIP29_KINDS.createInvite) return 'Invite codes are not supported by this relay.'
+  return `${label} is not supported by this relay.`
+}
+
 function StreamTile({ label, sublabel, stream, muted = false, micMuted = false, status = 'remote' }: StreamTileProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null)
 
@@ -301,22 +520,31 @@ function StreamTile({ label, sublabel, stream, muted = false, micMuted = false, 
   )
 }
 
-function App() {
-  const launch = useMemo(() => parseLaunch(), [])
+function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   const relay = useMemo(
-    () => (launch.mode === 'live' ? createLiveRelay(launch.groupId, launch.relayUrl) : createMockRelay()),
+    () =>
+      launch.mode === 'live'
+        ? createLiveRelay(launch.groupId, launch.relayUrl)
+        : createMockRelay({
+            relayUrl: launch.relayUrl,
+            groupId: launch.groupId,
+            persist: true,
+            authRequired: launch.authRequired,
+          }),
     [launch],
   )
   const [snapshot, setSnapshot] = useState(() => relay.snapshot())
   const [selfPubkey, setSelfPubkey] = useState(() => snapshot.users[0]?.pubkey ?? seededPubkey('live-viewer'))
   const [npubInput, setNpubInput] = useState<string>(() => npubForPubkey(snapshot.users[0]?.pubkey ?? selfPubkey))
   const [message, setMessage] = useState('')
+  const [messageFiles, setMessageFiles] = useState<File[]>([])
   const [relaySearch, setRelaySearch] = useState('')
   const [appView, setAppView] = useState<AppView>(() =>
-    launch.mode === 'live' ? launch.initialView : 'group',
+    launch.initialView,
   )
   const [activeDmPubkey, setActiveDmPubkey] = useState<string | null>(null)
   const [dmMessage, setDmMessage] = useState('')
+  const [dmFiles, setDmFiles] = useState<File[]>([])
   const [callStarted, setCallStarted] = useState(false)
   const [mediaState, setMediaState] = useState<'idle' | 'requesting' | 'live' | 'blocked'>('idle')
   const [localStream, setLocalStream] = useState<MediaStream | null>(null)
@@ -327,10 +555,10 @@ function App() {
   const [callExpanded, setCallExpanded] = useState(false)
   const [authState, setAuthState] = useState<AuthState>(() => (launch.mode === 'live' ? 'idle' : 'mock'))
   const [authStatus, setAuthStatus] = useState(() =>
-    launch.mode === 'live' ? 'opening live chatroom' : 'local mock relay',
+    launch.mode === 'live' ? 'opening live chatroom' : 'local development relay',
   )
   const [authDetail, setAuthDetail] = useState(() =>
-    launch.mode === 'live' ? 'waiting for signer' : 'local mock relay',
+    launch.mode === 'live' ? 'waiting for signer' : 'local development relay',
   )
   const [activeSigner, setActiveSigner] = useState<NestrSigner | null>(null)
   const [adminStatus, setAdminStatus] = useState('Chatroom controls ready')
@@ -346,7 +574,14 @@ function App() {
   const [connectSession, setConnectSession] = useState<NostrConnectSession | null>(null)
   const [nostrConnectQr, setNostrConnectQr] = useState<string | null>(null)
   const [authPrompt, setAuthPrompt] = useState<AuthPrompt | null>(null)
+  const [showAccountDialog, setShowAccountDialog] = useState(false)
   const [showCreateGroupDialog, setShowCreateGroupDialog] = useState(false)
+  const [adminDialog, setAdminDialog] = useState<AdminDialog>(null)
+  const [signerPillDismissed, setSignerPillDismissed] = useState(false)
+  const [blockedAdminKinds, setBlockedAdminKinds] = useState<Set<number>>(() => new Set())
+  const [lastSignerPingAt, setLastSignerPingAt] = useState<number | null>(() => (launch.mode === 'live' ? null : Date.now()))
+  const [nowMs, setNowMs] = useState(() => Date.now())
+  const [uploadStatus, setUploadStatus] = useState('')
   const callStageRef = useRef<HTMLDivElement | null>(null)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
   const dmMessagesEndRef = useRef<HTMLDivElement | null>(null)
@@ -356,16 +591,22 @@ function App() {
   const lastRelayAuthPromptRef = useRef('')
   const activeSignerRef = useRef<NestrSigner | null>(null)
   const connectSessionRef = useRef<NostrConnectSession | null>(null)
+  const localStreamRef = useRef<MediaStream | null>(null)
   const remoteVideosRef = useRef<MockPeerVideo[]>([])
+  const livePeerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map())
+  const pendingIceCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map())
+  const callPeersRef = useRef<Array<{ pubkey: string; name: string }>>([])
+  const callStartedRef = useRef(false)
+  const autoCallKeyRef = useRef('')
+  const spawnPublishKeyRef = useRef('')
+  const toggleCallRef = useRef<() => Promise<void>>(async () => undefined)
+  const liveCallSignalRef = useRef<(event: NestrEvent) => void>(() => undefined)
 
   const activeCount = Math.max(snapshot.positions.length, snapshot.users.length)
   const officeMap = useMemo(
     () => buildOfficeMap(snapshot.group.id, activeCount),
     [snapshot.group.id, activeCount],
   )
-  const nearby = nearbyPeers(selfPubkey, snapshot.positions, 136)
-  const mesh = estimateWebRtcMesh(nearby.length + 1)
-  const health = meshHealth(mesh.participants)
   const metadataName = tagValue(snapshot.group.metadata, 'name') ?? 'Chatroom'
   const groupAbout = tagValue(snapshot.group.metadata, 'about') ?? ''
   const relayHost = relayHostLabel(snapshot.group.relay)
@@ -390,19 +631,90 @@ function App() {
       : `${filteredRelayGroups.length} / ${relayGroups.length}`
   const connectionStatus = snapshot.connectionStatus ?? relay.mode
   const connectionMessage = authDetail || snapshot.connectionMessage || authStatus
+  const roomAccessStatus = snapshot.roomAccessStatus ?? 'unknown'
+  const roomAccessMessage = snapshot.roomAccessMessage ?? 'room not checked yet'
+  const accountConnectionStatus =
+    relay.mode === 'mock'
+      ? 'mock'
+      : authState === 'connected'
+        ? 'connected'
+        : authState === 'reconnecting' || authState === 'connecting'
+          ? 'connecting'
+          : authState === 'disconnected'
+            ? 'disconnected'
+            : connectionStatus
+  const roomRelayLog = snapshot.connectionLog?.length ? snapshot.connectionLog.slice(0, 6) : [connectionMessage]
   const showAuthPrompt = relay.mode === 'live' && Boolean(authPrompt) && authState !== 'connected'
-  const showSignerPill =
-    relay.mode === 'live' && ['connected', 'reconnecting', 'disconnected'].includes(authState)
   const currentUser = snapshot.users.find((user) => user.pubkey === selfPubkey)
-  const isSignedIn = relay.mode === 'mock' || authState === 'connected'
-  const showMesh = isSignedIn && nearby.length > 0
+  const accountBlossomServers = currentUser?.blossomServers?.length
+    ? currentUser.blossomServers
+    : BLOSSOM_FALLBACK_SERVERS
+  const accountDmRelays = currentUser?.dmRelays?.length
+    ? currentUser.dmRelays
+    : [snapshot.group.relay]
+  const accountReadRelays = currentUser?.readRelays?.length
+    ? currentUser.readRelays
+    : [snapshot.group.relay]
+  const accountWriteRelays = currentUser?.writeRelays?.length
+    ? currentUser.writeRelays
+    : [snapshot.group.relay]
   const groupMemberPubkeys = useMemo(() => memberPubkeys(snapshot.group.members), [snapshot.group.members])
   const groupMemberSet = useMemo(() => new Set(groupMemberPubkeys), [groupMemberPubkeys])
   const currentRoles = rolesForPubkey(snapshot, selfPubkey)
-  const currentIsMember = groupMemberSet.has(selfPubkey)
+  const currentIsMember = groupMemberSet.has(selfPubkey) || currentRoles.length > 0
+  const groupIsPrivate = hasTag(snapshot.group.metadata, 'private')
+  const groupIsRestricted = hasTag(snapshot.group.metadata, 'restricted')
+  const groupIsClosed = hasTag(snapshot.group.metadata, 'closed')
+  const roomAccessPending = relay.mode === 'live' && roomAccessStatus === 'unknown'
+  const relayDeniedRead = roomAccessStatus === 'blocked' || roomAccessStatus === 'auth-required'
+  const canReadGroup = !roomAccessPending && !relayDeniedRead && (!groupIsPrivate || currentIsMember)
+  const canWriteGroupChat = canReadGroup && !roomAccessPending && (!groupIsRestricted || currentIsMember)
+  const canEnterOffice = canWriteGroupChat
+  const officeUsers = useMemo(
+    () => (canEnterOffice ? snapshot.users : snapshot.users.filter((user) => user.pubkey !== selfPubkey)),
+    [canEnterOffice, selfPubkey, snapshot.users],
+  )
+  const officePositions = useMemo(
+    () =>
+      canEnterOffice
+        ? snapshot.positions
+        : snapshot.positions.filter((position) => position.pubkey !== selfPubkey),
+    [canEnterOffice, selfPubkey, snapshot.positions],
+  )
+  const nearby = useMemo(
+    () => (canEnterOffice ? nearbyPeers(selfPubkey, officePositions, 136) : []),
+    [canEnterOffice, officePositions, selfPubkey],
+  )
+  const nearbyKey = nearby.map((peer) => peer.pubkey).sort().join('|')
+  const signerDisplayName =
+    currentUser?.name && currentUser.name !== 'You' ? currentUser.name : shortNpub(selfPubkey)
+  const showSignerPill =
+    relay.mode === 'live' &&
+    (authState === 'reconnecting' ||
+      authState === 'disconnected' ||
+      (authState === 'connected' && !signerPillDismissed))
+  const isSignedIn = relay.mode === 'mock' || authState === 'connected'
+  const canOpenAccountPanel =
+    relay.mode === 'mock' || authState === 'connected' || authState === 'disconnected' || authState === 'reconnecting'
+  const signerPingLabel = relativePing(lastSignerPingAt, nowMs, relay.mode, authState)
+  const showMesh = isSignedIn && nearby.length > 0
+  const nearbyCallLabel =
+    nearby.length === 1 ? nameFor(nearby[0].pubkey, snapshot.users) : `${nearby.length} plebs`
   const canManageGroup = currentRoles.length > 0 || currentUser?.role === 'admin' || currentUser?.role === 'moderator'
+  const canUseChatroomActions = relay.mode === 'mock' || authState === 'connected'
+  const canCreateRelayGroup = relay.mode === 'mock' || authState === 'connected'
+  const canCreateInvite = canManageGroup && !blockedAdminKinds.has(NIP29_KINDS.createInvite)
+
+  useEffect(() => {
+    document.title =
+      appView === 'group' && hasSelectedGroup
+        ? `Nestr - ${metadataName}`
+        : `Nestr - ${trimRelayProtocol(snapshot.group.relay)}`
+  }, [appView, hasSelectedGroup, metadataName, snapshot.group.relay])
   const supportedRoles = supportedRoleTags(snapshot.group.roles)
-  const visiblePeople = snapshot.users.filter((user) => groupMemberSet.has(user.pubkey) || user.pubkey === selfPubkey)
+  const visiblePeople = snapshot.users.filter(
+    (user) => groupMemberSet.has(user.pubkey) || (canEnterOffice && user.pubkey === selfPubkey),
+  )
   const isOnline = useCallback(
     (pubkey: string) => isOnlineFromActivity(pubkey, snapshot.presence, snapshot.positions),
     [snapshot.positions, snapshot.presence],
@@ -467,7 +779,22 @@ function App() {
   const canScreenShare = Boolean(navigator.mediaDevices?.getDisplayMedia)
 
   useEffect(() => {
-    const unsubscribe = relay.subscribe((next) => setSnapshot(next))
+    localStreamRef.current = localStream
+  }, [localStream])
+
+  useEffect(() => {
+    callStartedRef.current = callStarted
+  }, [callStarted])
+
+  useEffect(() => {
+    callPeersRef.current = callPeers
+  }, [callPeers])
+
+  useEffect(() => {
+    const unsubscribe = relay.subscribe((next, event) => {
+      setSnapshot(next)
+      if (event) liveCallSignalRef.current(event)
+    })
     return () => {
       unsubscribe()
       if (relay.mode === 'live') relay.close()
@@ -483,6 +810,12 @@ function App() {
 
     return () => window.clearInterval(timer)
   }, [frozenPeerPubkeys, officeMap, relay, selfPubkey])
+
+  useEffect(() => {
+    if (!showAccountDialog && authState !== 'connected' && authState !== 'disconnected') return undefined
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [authState, showAccountDialog])
 
   useEffect(() => {
     return () => {
@@ -575,27 +908,28 @@ function App() {
     async (signer: NestrSigner) => {
       if (relay.mode !== 'live') return
 
-      const spawn = spawnForPubkey(officeMap, signer.pubkey, snapshot.users.length)
       await relay.setSigner(signer)
       activeSignerRef.current = signer
       setActiveSigner(signer)
+      setSignerPillDismissed(false)
       setAuthState('connected')
       setSelfPubkey(signer.pubkey)
       setNpubInput(npubForPubkey(signer.pubkey))
       setCallStarted(false)
-      stopRemoteVideos()
+      livePeerConnectionsRef.current.forEach((connection) => connection.close())
+      livePeerConnectionsRef.current.clear()
+      pendingIceCandidatesRef.current.clear()
+      remoteVideosRef.current.forEach((video) => video.stop())
+      remoteVideosRef.current = []
+      setRemoteVideos([])
       setCallExpanded(false)
-      setAuthStatus(`${signer.label} connected as ${shortNpub(signer.pubkey)}`)
+      setAuthStatus(`Account connected as ${shortNpub(signer.pubkey)}`)
       setAuthDetail('signer online')
+      setLastSignerPingAt(Date.now())
       setAuthPrompt(null)
       clearConnectSession()
-
-      const result = await relay.publishPosition(signer.pubkey, spawn.x, spawn.y, 0, 0)
-      if (!result.ok && result.reason !== 'throttled' && result.reason !== 'group-required') {
-        setAuthDetail(`position publish failed: ${result.reason}`)
-      }
     },
-    [clearConnectSession, officeMap, relay, snapshot.users.length],
+    [clearConnectSession, relay],
   )
 
   const markSignerDisconnected = useCallback(
@@ -761,6 +1095,14 @@ function App() {
   }, [activeSigner])
 
   useEffect(() => {
+    if (relay.mode !== 'live') return undefined
+
+    if (authState !== 'connected') return undefined
+    const timer = window.setTimeout(() => setSignerPillDismissed(true), 3200)
+    return () => window.clearTimeout(timer)
+  }, [authState, relay.mode, selfPubkey])
+
+  useEffect(() => {
     return () => {
       connectSessionRef.current?.abort()
       void activeSignerRef.current?.close?.()
@@ -773,11 +1115,13 @@ function App() {
     const pingSigner = async () => {
       try {
         await withTimeout(activeSigner.ping?.() ?? Promise.resolve(), 8_000, 'signer ping timed out')
+        setLastSignerPingAt(Date.now())
       } catch (error) {
         markSignerDisconnected(errorMessage(error))
       }
     }
 
+    void pingSigner()
     const timer = window.setInterval(() => {
       void pingSigner()
     }, 20_000)
@@ -857,7 +1201,9 @@ function App() {
     setAuthState('idle')
     setAuthStatus('logged out')
     setAuthDetail('waiting for an auth-gated action')
+    setLastSignerPingAt(null)
     setAuthPrompt(null)
+    setShowAccountDialog(false)
   }
 
   function cancelAuthPrompt() {
@@ -885,10 +1231,37 @@ function App() {
 
   const handleMove = useCallback(
     (position: { x: number; y: number; vx: number; vy: number }) => {
-      relay.publishPosition(selfPubkey, position.x, position.y, position.vx, position.vy)
+      if (!canEnterOffice) return
+      void relay.publishPosition(selfPubkey, position.x, position.y, position.vx, position.vy)
     },
-    [relay, selfPubkey],
+    [canEnterOffice, relay, selfPubkey],
   )
+
+  useEffect(() => {
+    if (relay.mode !== 'live' || authState !== 'connected' || !hasSelectedGroup || !canEnterOffice) return
+    if (snapshot.positions.some((position) => position.pubkey === selfPubkey)) return
+
+    const spawnKey = `${snapshot.group.id}:${selfPubkey}`
+    if (spawnPublishKeyRef.current === spawnKey) return
+    spawnPublishKeyRef.current = spawnKey
+
+    const spawn = spawnForPubkey(officeMap, selfPubkey, snapshot.users.length)
+    void relay.publishPosition(selfPubkey, spawn.x, spawn.y, 0, 0).then((result) => {
+      if (!result.ok && result.reason !== 'throttled' && result.reason !== 'group-required') {
+        setAuthDetail(`position publish failed: ${result.reason}`)
+      }
+    })
+  }, [
+    authState,
+    canEnterOffice,
+    hasSelectedGroup,
+    officeMap,
+    relay,
+    selfPubkey,
+    snapshot.group.id,
+    snapshot.positions,
+    snapshot.users.length,
+  ])
 
   function joinOffice(event: FormEvent) {
     event.preventDefault()
@@ -901,9 +1274,55 @@ function App() {
     setCallExpanded(false)
   }
 
+  function removeMessageFile(index: number) {
+    setMessageFiles((files) => files.filter((_, candidateIndex) => candidateIndex !== index))
+  }
+
+  function removeDmFile(index: number) {
+    setDmFiles((files) => files.filter((_, candidateIndex) => candidateIndex !== index))
+  }
+
+  async function prepareOutgoingFiles(files: File[], encrypt: boolean) {
+    if (files.length === 0) return []
+    if (relay.mode === 'live' && authState !== 'connected') {
+      throw new Error('live-signer-required')
+    }
+
+    setUploadStatus(`Uploading ${files.length === 1 ? files[0].name : `${files.length} files`}...`)
+    const attachments = await Promise.all(
+      files.map((file) =>
+        prepareFileAttachment(file, {
+          signer: activeSigner,
+          servers: accountBlossomServers,
+          encrypt,
+          allowLocalFallback: relay.mode === 'mock',
+        }),
+      ),
+    )
+    setUploadStatus('')
+    return attachments
+  }
+
   async function sendMessage(event: FormEvent) {
     event.preventDefault()
-    const result = await relay.publishGroupMessage(selfPubkey, message)
+    if (!canWriteGroupChat) {
+      setAdminDialog('join')
+      return
+    }
+
+    let attachments: NestrAttachment[]
+    try {
+      attachments = await prepareOutgoingFiles(messageFiles, false)
+    } catch (error) {
+      if (signerRequired(errorMessage(error))) {
+        requestAuth('write', `Sign in to upload files and publish messages to ${metadataName}.`)
+      } else {
+        setUploadStatus(errorMessage(error))
+      }
+      return
+    }
+
+    const result = await relay.publishGroupMessage(selfPubkey, message, attachments)
     if (!result.ok) {
       if (signerRequired(result.reason)) {
         requestAuth('write', `Sign in to publish messages to ${metadataName}. The message can be sent after auth completes.`)
@@ -913,13 +1332,26 @@ function App() {
       return
     }
     setMessage('')
+    setMessageFiles([])
   }
 
   async function sendDirectMessage(event: FormEvent) {
     event.preventDefault()
     if (!activeDmPubkey) return
 
-    const result = await relay.publishDirectMessage(selfPubkey, activeDmPubkey, dmMessage)
+    let attachments: NestrAttachment[]
+    try {
+      attachments = await prepareOutgoingFiles(dmFiles, true)
+    } catch (error) {
+      if (signerRequired(errorMessage(error))) {
+        requestAuth('dm', 'Sign in to upload files and send encrypted direct messages.')
+      } else {
+        setUploadStatus(errorMessage(error))
+      }
+      return
+    }
+
+    const result = await relay.publishDirectMessage(selfPubkey, activeDmPubkey, dmMessage, attachments)
     if (!result.ok) {
       if (signerRequired(result.reason)) {
         requestAuth('dm', 'Sign in to send encrypted direct messages.')
@@ -930,9 +1362,16 @@ function App() {
     }
 
     setDmMessage('')
+    setDmFiles([])
   }
 
   function selectRelayGroup(groupId: string) {
+    if (relay.mode === 'mock') {
+      relay.selectGroup(groupId)
+      setAppView('group')
+      return
+    }
+
     if (hasSelectedGroup && groupId === snapshot.group.id) {
       setAppView('group')
       return
@@ -944,11 +1383,35 @@ function App() {
     window.location.href = url.toString()
   }
 
-  async function runNip29Action(label: string, action: () => Promise<{ ok: boolean; reason?: string }> | { ok: boolean; reason?: string }) {
+  function handleAccountClick() {
+    if (canOpenAccountPanel) {
+      setShowAccountDialog(true)
+      return
+    }
+
+    void beginLogin({
+      kind: 'manual',
+      title: authPromptTitle('manual'),
+      detail: 'Connect a signer to use chatrooms, direct messages, and admin actions.',
+    })
+  }
+
+  async function runNip29Action(
+    label: string,
+    action: () => Promise<{ ok: boolean; reason?: string }> | { ok: boolean; reason?: string },
+    moderationKind?: number,
+  ) {
     setAdminStatus(`${label}...`)
     try {
       const result = await action()
-      setAdminStatus(result.ok ? `${label} published` : `${label} failed: ${result.reason}`)
+      const blockedKind = relayBlockedKind(result.reason)
+      if (!result.ok && blockedKind) {
+        setBlockedAdminKinds((current) => new Set(current).add(blockedKind))
+        setAdminStatus(unsupportedActionMessage(blockedKind, label))
+        if (moderationKind === blockedKind) setAdminDialog(null)
+      } else {
+        setAdminStatus(result.ok ? `${label} published` : `${label} failed: ${result.reason}`)
+      }
       if (!result.ok && signerRequired(result.reason)) {
         requestAuth('admin', `Sign in to publish the ${label} chatroom admin action.`)
       }
@@ -970,7 +1433,12 @@ function App() {
 
   async function requestJoin(event: FormEvent) {
     event.preventDefault()
-    await runNip29Action('join request', () => relay.publishJoinRequest(selfPubkey, joinReason, joinCode))
+    const ok = await runNip29Action('join request', () => relay.publishJoinRequest(selfPubkey, joinReason, joinCode))
+    if (ok) {
+      setJoinReason('')
+      setJoinCode('')
+      setAdminDialog(null)
+    }
   }
 
   async function leaveGroup() {
@@ -990,16 +1458,26 @@ function App() {
     const target = targetPubkeyFromInput()
     if (!target) return
 
-    await runNip29Action('put-user', () =>
+    const ok = await runNip29Action('member update', () =>
       relay.publishPutUser(selfPubkey, target, roleList(targetRoles), 'updated from nestr'),
     )
+    if (ok) {
+      setTargetInput('')
+      setTargetRoles('')
+      setAdminDialog(null)
+    }
   }
 
   async function removeUser() {
     const target = targetPubkeyFromInput()
     if (!target) return
 
-    await runNip29Action('remove-user', () => relay.publishRemoveUser(selfPubkey, target, 'removed from nestr'))
+    const ok = await runNip29Action('remove member', () => relay.publishRemoveUser(selfPubkey, target, 'removed from nestr'))
+    if (ok) {
+      setTargetInput('')
+      setTargetRoles('')
+      setAdminDialog(null)
+    }
   }
 
   async function acceptJoin(pubkey: string) {
@@ -1012,10 +1490,13 @@ function App() {
 
   async function editMetadata(event: FormEvent) {
     event.preventDefault()
-    const ok = await runNip29Action('details', () =>
+    const ok = await runNip29Action('edit group', () =>
       relay.publishEditMetadata(selfPubkey, metadataDraft, 'metadata updated from nestr'),
     )
-    if (ok) setMetadataEdits({})
+    if (ok) {
+      setMetadataEdits({})
+      setAdminDialog(null)
+    }
   }
 
   async function deleteEvent(eventId = eventIdInput) {
@@ -1025,22 +1506,25 @@ function App() {
       return
     }
 
-    const ok = await runNip29Action('delete-event', () =>
+    const ok = await runNip29Action('delete message', () =>
       relay.publishDeleteEvent(selfPubkey, trimmed, 'deleted from nestr'),
     )
-    if (ok) setEventIdInput('')
+    if (ok) {
+      setEventIdInput('')
+      setAdminDialog(null)
+    }
   }
 
   async function createInvite(event: FormEvent) {
     event.preventDefault()
-    const ok = await runNip29Action('create-invite', () =>
+    const ok = await runNip29Action('create invite', () =>
       relay.publishCreateInvite(selfPubkey, inviteCode, 'invite created from nestr'),
+      NIP29_KINDS.createInvite,
     )
-    if (ok) setInviteCode(randomInviteCode())
-  }
-
-  async function createGroup(targetGroupId = snapshot.group.id, name = 'chatroom created from nestr') {
-    await runNip29Action('create chatroom', () => relay.publishCreateGroup(selfPubkey, name, targetGroupId))
+    if (ok) {
+      setInviteCode(randomInviteCode())
+      setAdminDialog(null)
+    }
   }
 
   async function createRelayGroup(event: FormEvent) {
@@ -1054,11 +1538,177 @@ function App() {
       setNewGroupName('')
       setNewGroupId(randomGroupId())
       setShowCreateGroupDialog(false)
+      selectRelayGroup(groupId)
     }
   }
 
   async function deleteGroup() {
-    await runNip29Action('delete-group', () => relay.publishDeleteGroup(selfPubkey, 'group deleted from nestr'))
+    await runNip29Action('delete chatroom', () => relay.publishDeleteGroup(selfPubkey, 'group deleted from nestr'))
+  }
+
+  function targetForCallEvent(event: NestrEvent) {
+    return event.tags.find((tag) => tag[0] === 'p' && tag[1])?.[1] ?? ''
+  }
+
+  function callSignalDescription(payload: unknown) {
+    if (!payload || typeof payload !== 'object') return null
+    const description = (payload as { description?: RTCSessionDescriptionInit }).description
+    if (!description?.type || !description.sdp) return null
+    return description
+  }
+
+  function callSignalCandidate(payload: unknown) {
+    if (!payload || typeof payload !== 'object') return null
+    const candidate = (payload as { candidate?: RTCIceCandidateInit }).candidate
+    return candidate?.candidate ? candidate : null
+  }
+
+  function parseCallSignalPayload(event: NestrEvent) {
+    try {
+      return JSON.parse(event.content) as unknown
+    } catch {
+      return null
+    }
+  }
+
+  async function publishLiveCallSignal(kind: number, targetPubkey: string, payload: unknown) {
+    if (relay.mode !== 'live') return
+    const result = await relay.publishCallSignal(selfPubkey, kind, targetPubkey, payload)
+    if (!result.ok && result.reason !== 'throttled') setAuthDetail(`call signal failed: ${result.reason}`)
+  }
+
+  function upsertRemoteStream(pubkey: string, name: string, stream: MediaStream) {
+    const existing = remoteVideosRef.current.find((video) => video.pubkey === pubkey)
+    if (existing?.stream === stream) return
+    const next = [
+      ...remoteVideosRef.current.filter((video) => video.pubkey !== pubkey),
+      {
+        pubkey,
+        name,
+        stream,
+        stop: () => stream.getTracks().forEach((track) => track.stop()),
+      },
+    ]
+    replaceRemoteVideos(next)
+  }
+
+  function livePeerConnection(peerPubkey: string, peerName: string, stream: MediaStream) {
+    const existing = livePeerConnectionsRef.current.get(peerPubkey)
+    if (existing) return existing
+
+    const connection = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+    })
+
+    stream.getTracks().forEach((track) => connection.addTrack(track, stream))
+    connection.onicecandidate = (event) => {
+      if (!event.candidate) return
+      void publishLiveCallSignal(OFFICE_KINDS.iceCandidate, peerPubkey, {
+        candidate: event.candidate.toJSON(),
+      })
+    }
+    connection.ontrack = (event) => {
+      const [remoteStream] = event.streams
+      upsertRemoteStream(peerPubkey, peerName, remoteStream ?? new MediaStream([event.track]))
+    }
+    connection.onconnectionstatechange = () => {
+      if (!['closed', 'failed', 'disconnected'].includes(connection.connectionState)) return
+      livePeerConnectionsRef.current.delete(peerPubkey)
+      setRemoteVideos((videos) => videos.filter((video) => video.pubkey !== peerPubkey))
+      remoteVideosRef.current = remoteVideosRef.current.filter((video) => video.pubkey !== peerPubkey)
+    }
+
+    livePeerConnectionsRef.current.set(peerPubkey, connection)
+    return connection
+  }
+
+  async function flushPendingIce(peerPubkey: string, connection: RTCPeerConnection) {
+    const pending = pendingIceCandidatesRef.current.get(peerPubkey) ?? []
+    pendingIceCandidatesRef.current.delete(peerPubkey)
+    for (const candidate of pending) {
+      await connection.addIceCandidate(candidate)
+    }
+  }
+
+  async function ensureLiveCallMedia() {
+    if (localStreamRef.current) return localStreamRef.current
+    setCallStarted(true)
+    setCameraEnabled(true)
+    setMicEnabled(true)
+    return requestLocalMedia(true, true)
+  }
+
+  async function startLivePeerConnections(stream: MediaStream | null) {
+    if (!stream) return
+    await Promise.all(
+      callPeersRef.current.map(async (peer) => {
+        if (peer.pubkey === selfPubkey) return
+        const connection = livePeerConnection(peer.pubkey, peer.name, stream)
+        if (selfPubkey > peer.pubkey || connection.signalingState !== 'stable') return
+
+        const offer = await connection.createOffer()
+        await connection.setLocalDescription(offer)
+        await publishLiveCallSignal(OFFICE_KINDS.callOffer, peer.pubkey, {
+          description: connection.localDescription,
+        })
+      }),
+    )
+  }
+
+  async function handleLiveCallSignal(event: NestrEvent) {
+    if (relay.mode !== 'live') return
+    if (!isOfficeCallSignalKind(event.kind)) return
+    if (event.pubkey === selfPubkey || targetForCallEvent(event) !== selfPubkey) return
+
+    const peerPubkey = event.pubkey
+    const peerName = nameFor(peerPubkey, snapshot.users)
+    const payload = parseCallSignalPayload(event)
+
+    if (event.kind === OFFICE_KINDS.callHangup) {
+      livePeerConnectionsRef.current.get(peerPubkey)?.close()
+      livePeerConnectionsRef.current.delete(peerPubkey)
+      setRemoteVideos((videos) => videos.filter((video) => video.pubkey !== peerPubkey))
+      remoteVideosRef.current = remoteVideosRef.current.filter((video) => video.pubkey !== peerPubkey)
+      return
+    }
+
+    if (event.kind === OFFICE_KINDS.iceCandidate) {
+      const candidate = callSignalCandidate(payload)
+      if (!candidate) return
+      const connection = livePeerConnectionsRef.current.get(peerPubkey)
+      if (connection?.remoteDescription) await connection.addIceCandidate(candidate)
+      else pendingIceCandidatesRef.current.set(peerPubkey, [
+        ...(pendingIceCandidatesRef.current.get(peerPubkey) ?? []),
+        candidate,
+      ])
+      return
+    }
+
+    const description = callSignalDescription(payload)
+    if (!description) return
+    const stream = await ensureLiveCallMedia()
+    if (!stream) return
+    const connection = livePeerConnection(peerPubkey, peerName, stream)
+
+    if (event.kind === OFFICE_KINDS.callOffer) {
+      await connection.setRemoteDescription(description)
+      await flushPendingIce(peerPubkey, connection)
+      const answer = await connection.createAnswer()
+      await connection.setLocalDescription(answer)
+      await publishLiveCallSignal(OFFICE_KINDS.callAnswer, peerPubkey, {
+        description: connection.localDescription,
+      })
+      return
+    }
+
+    if (event.kind === OFFICE_KINDS.callAnswer && connection.signalingState === 'have-local-offer') {
+      await connection.setRemoteDescription(description)
+      await flushPendingIce(peerPubkey, connection)
+    }
+  }
+
+  liveCallSignalRef.current = (event: NestrEvent) => {
+    void handleLiveCallSignal(event)
   }
 
   function reconcileMockVideos(peerKey: string) {
@@ -1085,7 +1735,19 @@ function App() {
     setRemoteVideos(videos)
   }
 
+  function stopLivePeerConnections(notifyPeers = false) {
+    if (notifyPeers && relay.mode === 'live') {
+      callPeersRef.current.forEach((peer) => {
+        void publishLiveCallSignal(OFFICE_KINDS.callHangup, peer.pubkey, { reason: 'hangup' })
+      })
+    }
+    livePeerConnectionsRef.current.forEach((connection) => connection.close())
+    livePeerConnectionsRef.current.clear()
+    pendingIceCandidatesRef.current.clear()
+  }
+
   function stopRemoteVideos() {
+    stopLivePeerConnections()
     remoteVideosRef.current.forEach((video) => video.stop())
     remoteVideosRef.current = []
     setRemoteVideos([])
@@ -1102,7 +1764,7 @@ function App() {
 
     if (!nextCamera && !nextMic) {
       setMediaState('idle')
-      return
+      return null
     }
 
     setMediaState('requesting')
@@ -1130,17 +1792,21 @@ function App() {
       })
       setLocalStream(stream)
       setMediaState('live')
+      return stream
     } catch {
       setMediaState('blocked')
+      return null
     }
   }
 
   async function toggleCall() {
     if (callStarted) {
+      stopLivePeerConnections(true)
       localStream?.getTracks().forEach((track) => track.stop())
       stopScreenShare()
       stopRemoteVideos()
       setLocalStream(null)
+      localStreamRef.current = null
       setCallStarted(false)
       setCallExpanded(false)
       setMediaState('idle')
@@ -1150,9 +1816,13 @@ function App() {
     setMediaState('requesting')
     setCameraEnabled(true)
     setMicEnabled(true)
-    replaceRemoteVideos(reconcileMockVideos(callPeerKey))
     setCallStarted(true)
-    await requestLocalMedia(true, true)
+    const stream = await requestLocalMedia(true, true)
+    if (relay.mode === 'mock') {
+      replaceRemoteVideos(reconcileMockVideos(callPeerKey))
+      return
+    }
+    await startLivePeerConnections(stream)
   }
 
   async function toggleCamera() {
@@ -1216,6 +1886,22 @@ function App() {
     }
   }
 
+  useEffect(() => {
+    toggleCallRef.current = toggleCall
+  })
+
+  useEffect(() => {
+    if (!showMesh || callStarted || mediaState === 'requesting') return undefined
+    if (!nearbyKey || autoCallKeyRef.current === nearbyKey) return undefined
+
+    const timer = window.setTimeout(() => {
+      autoCallKeyRef.current = nearbyKey
+      void toggleCallRef.current()
+    }, 240)
+
+    return () => window.clearTimeout(timer)
+  }, [callStarted, mediaState, nearbyKey, showMesh])
+
   return (
     <TooltipProvider>
     <main className="app-shell" data-auth-state={authState} data-view={appView}>
@@ -1225,12 +1911,12 @@ function App() {
           <div>
             <strong>
               {authState === 'connected'
-                ? `signed in ${shortNpub(selfPubkey)}`
+                ? `signed in ${signerDisplayName}`
                 : authState === 'reconnecting'
                   ? 'reconnecting signer'
                   : 'signer disconnected'}
             </strong>
-            <span>{authDetail}</span>
+            <span>{authState === 'connected' ? `${shortNpub(selfPubkey)} · ${authDetail}` : authDetail}</span>
           </div>
           {authState === 'disconnected' && (
             <Button type="button" className="icon-soft" onClick={() => void retrySigner()} aria-label="Retry signer">
@@ -1306,6 +1992,121 @@ function App() {
         </Dialog>
       )}
 
+      <Dialog open={showAccountDialog} onOpenChange={setShowAccountDialog}>
+        <DialogContent className="auth-modal account-modal">
+          <DialogHeader className="auth-modal-header">
+            <div>
+              <p className="eyebrow">{relayHost}</p>
+              <DialogTitle>Account</DialogTitle>
+            </div>
+          </DialogHeader>
+
+          <section className="account-profile-card" aria-label="Profile">
+            <AvatarChip pubkey={selfPubkey} user={currentUser} />
+            <div>
+              <strong>{signerDisplayName}</strong>
+              <code>{npubForPubkey(selfPubkey)}</code>
+            </div>
+          </section>
+
+          <section className={`account-signer-card ${authState}`} aria-label="Signer connection">
+            <span className="relay-dot" data-status={accountConnectionStatus} />
+            <div>
+              <strong>
+                {relay.mode === 'mock'
+                  ? 'Local account'
+                  : authState === 'connected'
+                    ? 'Account connected'
+                    : authState === 'reconnecting'
+                      ? 'Account reconnecting'
+                      : authState === 'disconnected'
+                        ? 'Account disconnected'
+                        : 'Account not connected'}
+              </strong>
+              <span>{signerPingLabel}</span>
+            </div>
+          </section>
+
+          <div className="account-grid">
+            <section className="account-info-card">
+              <div className="section-title">
+                <span>Room relay</span>
+                <span>{connectionStatus}</span>
+              </div>
+              <code>{snapshot.group.relay}</code>
+              <code>
+                room: {roomAccessStatus === 'open' ? roomAccessMessage : `${roomAccessStatus} · ${roomAccessMessage}`}
+              </code>
+            </section>
+
+            <section className="account-info-card wide relay-messages">
+              <div className="section-title">
+                <span>Room relay messages</span>
+                <span>{roomRelayLog.length}</span>
+              </div>
+              {roomRelayLog.map((message) => (
+                <code key={message}>{message}</code>
+              ))}
+            </section>
+
+            <section className="account-info-card">
+              <div className="section-title">
+                <span>DM relays</span>
+                <span>{accountDmRelays.length}</span>
+              </div>
+              {accountDmRelays.map((relayUrl) => (
+                <code key={relayUrl}>{relayUrl}</code>
+              ))}
+            </section>
+
+            <section className="account-info-card">
+              <div className="section-title">
+                <span>Read relays</span>
+                <span>{accountReadRelays.length}</span>
+              </div>
+              {accountReadRelays.map((relayUrl) => (
+                <code key={relayUrl}>{relayUrl}</code>
+              ))}
+            </section>
+
+            <section className="account-info-card">
+              <div className="section-title">
+                <span>Write relays</span>
+                <span>{accountWriteRelays.length}</span>
+              </div>
+              {accountWriteRelays.map((relayUrl) => (
+                <code key={relayUrl}>{relayUrl}</code>
+              ))}
+            </section>
+
+            <section className="account-info-card wide">
+              <div className="section-title">
+                <span>File servers</span>
+                <span>{accountBlossomServers.length}</span>
+              </div>
+              {accountBlossomServers.map((server) => (
+                <code key={server}>{server}</code>
+              ))}
+            </section>
+          </div>
+
+          <div className="auth-actions">
+            {relay.mode === 'live' && authState === 'disconnected' && (
+              <Button type="button" className="secondary-action" onClick={() => void retrySigner()}>
+                <RefreshCcw size={16} />
+                Retry
+              </Button>
+            )}
+            {relay.mode === 'live' && (authState === 'connected' || authState === 'disconnected') && (
+              <Button type="button" className="secondary-action danger" onClick={() => void logoutSigner()}>
+                <LogOut size={16} />
+                Logout
+              </Button>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={showCreateGroupDialog} onOpenChange={setShowCreateGroupDialog}>
         <DialogContent className="auth-modal create-chatroom-modal">
           <DialogHeader className="auth-modal-header">
@@ -1345,6 +2146,240 @@ function App() {
         </DialogContent>
       </Dialog>
 
+      <Dialog open={adminDialog !== null} onOpenChange={(open) => !open && setAdminDialog(null)}>
+        <DialogContent className="auth-modal admin-action-modal">
+          {adminDialog === 'join' && (
+            <>
+              <DialogHeader className="auth-modal-header">
+                <div>
+                  <p className="eyebrow">{metadataName}</p>
+                  <DialogTitle>Join chatroom</DialogTitle>
+                </div>
+              </DialogHeader>
+              <DialogDescription className="auth-modal-copy">
+                {groupIsClosed
+                  ? 'This chatroom is closed. Requests usually need an invite code from a moderator.'
+                  : 'Send a request to the room moderators. Leave the invite code blank unless someone gave you one.'}
+              </DialogDescription>
+              <form className="admin-form" onSubmit={requestJoin}>
+                <Input
+                  value={joinReason}
+                  onChange={(event) => setJoinReason(event.target.value)}
+                  placeholder="Reason"
+                  aria-label="Join reason"
+                />
+                <Input
+                  value={joinCode}
+                  onChange={(event) => setJoinCode(event.target.value)}
+                  placeholder={groupIsClosed ? 'Invite code' : 'Invite code (optional)'}
+                  aria-label="Invite code"
+                />
+                <span className="form-hint">
+                  {groupIsClosed
+                    ? 'Closed chatrooms ignore normal requests unless the relay recognizes this code.'
+                    : 'An invite code is a preapproval token created by a room admin. Most requests do not need one.'}
+                </span>
+                <Button type="submit" className="primary-action">
+                  <DoorOpen size={16} />
+                  Request
+                </Button>
+              </form>
+            </>
+          )}
+
+          {adminDialog === 'member' && (
+            <>
+              <DialogHeader className="auth-modal-header">
+                <div>
+                  <p className="eyebrow">{metadataName}</p>
+                  <DialogTitle>Add member</DialogTitle>
+                </div>
+              </DialogHeader>
+              <DialogDescription className="auth-modal-copy">
+                Add or update a person in this chatroom.
+              </DialogDescription>
+              <form className="admin-form" onSubmit={putUser}>
+                <Input
+                  value={targetInput}
+                  onChange={(event) => setTargetInput(event.target.value)}
+                  placeholder="npub or hex pubkey"
+                  aria-label="Member pubkey"
+                  spellCheck={false}
+                />
+                <Input
+                  value={targetRoles}
+                  onChange={(event) => setTargetRoles(event.target.value)}
+                  placeholder={supportedRoles.length ? supportedRoles.map((role) => role.name).join(', ') : 'roles'}
+                  aria-label="Roles"
+                />
+                <div className="admin-row">
+                  <Button type="submit" className="primary-action">
+                    <UserPlus size={16} />
+                    Add
+                  </Button>
+                  <Button type="button" className="secondary-action danger" onClick={() => void removeUser()}>
+                    <UserMinus size={16} />
+                    Remove
+                  </Button>
+                </div>
+              </form>
+            </>
+          )}
+
+          {adminDialog === 'invite' && (
+            <>
+              <DialogHeader className="auth-modal-header">
+                <div>
+                  <p className="eyebrow">{metadataName}</p>
+                  <DialogTitle>Create invite</DialogTitle>
+                </div>
+              </DialogHeader>
+              <DialogDescription className="auth-modal-copy">
+                Create an invite code that can be shared outside the room.
+              </DialogDescription>
+              <form className="admin-form" onSubmit={createInvite}>
+                <Input
+                  value={inviteCode}
+                  onChange={(event) => setInviteCode(event.target.value)}
+                  aria-label="Invite code"
+                  spellCheck={false}
+                />
+                <Button type="submit" className="primary-action">
+                  <Ticket size={16} />
+                  Create invite
+                </Button>
+              </form>
+            </>
+          )}
+
+          {adminDialog === 'details' && (
+            <>
+              <DialogHeader className="auth-modal-header">
+                <div>
+                  <p className="eyebrow">{metadataName}</p>
+                  <DialogTitle>Edit group</DialogTitle>
+                </div>
+              </DialogHeader>
+              <DialogDescription className="auth-modal-copy">
+                Update this chatroom's name, description, picture, and visibility.
+              </DialogDescription>
+              <form className="admin-form" onSubmit={editMetadata}>
+                <Input
+                  value={metadataDraft.name}
+                  onChange={(event) => setMetadataEdits((edits) => ({ ...edits, name: event.target.value }))}
+                  placeholder="Group name"
+                  aria-label="Group name"
+                />
+                <Input
+                  value={metadataDraft.about}
+                  onChange={(event) => setMetadataEdits((edits) => ({ ...edits, about: event.target.value }))}
+                  placeholder="About"
+                  aria-label="Group about"
+                />
+                <Input
+                  value={metadataDraft.picture}
+                  onChange={(event) => setMetadataEdits((edits) => ({ ...edits, picture: event.target.value }))}
+                  placeholder="Picture URL"
+                  aria-label="Group picture URL"
+                />
+                <div className="flag-grid">
+                  {(['private', 'restricted', 'closed', 'hidden'] as const).map((flag) => (
+                    <Label key={flag} className="flag-toggle">
+                      <Checkbox
+                        checked={metadataDraft[flag]}
+                        onCheckedChange={(checked) =>
+                          setMetadataEdits((edits) => ({ ...edits, [flag]: checked === true }))
+                        }
+                      />
+                      {flag}
+                    </Label>
+                  ))}
+                </div>
+                <Button type="submit" className="primary-action">
+                  <Edit3 size={16} />
+                  Save
+                </Button>
+              </form>
+            </>
+          )}
+
+          {adminDialog === 'moderation' && (
+            <>
+              <DialogHeader className="auth-modal-header">
+                <div>
+                  <p className="eyebrow">{metadataName}</p>
+                  <DialogTitle>Moderate chat</DialogTitle>
+                </div>
+              </DialogHeader>
+              <DialogDescription className="auth-modal-copy">
+                Remove a message by its event id.
+              </DialogDescription>
+              <div className="admin-form">
+                <Input
+                  value={eventIdInput}
+                  onChange={(event) => setEventIdInput(event.target.value)}
+                  placeholder="message id to delete"
+                  aria-label="Message id"
+                  spellCheck={false}
+                />
+                <Button type="button" className="secondary-action danger" onClick={() => void deleteEvent()}>
+                  <Trash2 size={16} />
+                  Delete message
+                </Button>
+              </div>
+            </>
+          )}
+
+          {adminDialog === 'joins' && (
+            <>
+              <DialogHeader className="auth-modal-header">
+                <div>
+                  <p className="eyebrow">{metadataName}</p>
+                  <DialogTitle>Review joins</DialogTitle>
+                </div>
+              </DialogHeader>
+              <DialogDescription className="auth-modal-copy">
+                Accept or reject people waiting to enter this chatroom.
+              </DialogDescription>
+              <div className="admin-stack">
+                {snapshot.joinRequests.length === 0 ? (
+                  <span className="admin-log">No pending joins.</span>
+                ) : (
+                  snapshot.joinRequests.map((request) => (
+                    <div className="join-request" key={request.id}>
+                      <AvatarChip
+                        pubkey={request.pubkey}
+                        user={snapshot.users.find((user) => user.pubkey === request.pubkey)}
+                        small
+                      />
+                      <span>{nameFor(request.pubkey, snapshot.users)}</span>
+                      <Button
+                        type="button"
+                        className="icon-soft"
+                        onClick={() => void acceptJoin(request.pubkey)}
+                        aria-label={`Accept ${nameFor(request.pubkey, snapshot.users)}`}
+                      >
+                        <Check size={15} />
+                      </Button>
+                      <Button
+                        type="button"
+                        className="icon-soft danger"
+                        onClick={() => void rejectJoin(request.pubkey)}
+                        aria-label={`Reject ${nameFor(request.pubkey, snapshot.users)}`}
+                      >
+                        <UserMinus size={15} />
+                      </Button>
+                    </div>
+                  ))
+                )}
+              </div>
+            </>
+          )}
+
+          <span className="admin-log">{adminStatus}</span>
+        </DialogContent>
+      </Dialog>
+
       <nav className="app-rail" aria-label="Primary navigation">
         <Button
           type="button"
@@ -1369,6 +2404,16 @@ function App() {
           title={relayHost}
         >
           <Radio size={22} />
+        </Button>
+        <div className="rail-spacer" />
+        <Button
+          type="button"
+          className={`rail-button account ${canOpenAccountPanel ? 'signed-in' : ''}`}
+          onClick={handleAccountClick}
+          aria-label={canOpenAccountPanel ? 'Account' : 'Sign in'}
+          title={canOpenAccountPanel ? signerDisplayName : 'Sign in'}
+        >
+          {canOpenAccountPanel ? <AvatarChip pubkey={selfPubkey} user={currentUser} small /> : <LogIn size={22} />}
         </Button>
       </nav>
 
@@ -1511,234 +2556,81 @@ function App() {
           </form>
         )}
 
-        <section className="panel-section admin-panel" aria-label="Chatroom controls">
-          <Card className="admin-card" size="sm">
-            <div className="admin-status">
-              <ShieldCheck size={16} />
-              <span>{adminStatus}</span>
-            </div>
+        {canUseChatroomActions && (
+          <section className="panel-section admin-panel" aria-label="Chatroom controls">
+            <Card className="admin-card" size="sm">
+              <div className="admin-status">
+                <ShieldCheck size={16} />
+                <span>{adminStatus}</span>
+              </div>
 
-            {!currentIsMember ? (
-              <form className="admin-form" onSubmit={requestJoin}>
-                <Label htmlFor="join-reason">Join request</Label>
-                <Input
-                  id="join-reason"
-                  value={joinReason}
-                  onChange={(event) => setJoinReason(event.target.value)}
-                  placeholder="Reason"
-                />
-                <Input
-                  value={joinCode}
-                  onChange={(event) => setJoinCode(event.target.value)}
-                  placeholder="Invite code"
-                  aria-label="Invite code"
-                />
-                <Button type="submit" className="secondary-action">
-                  <DoorOpen size={16} />
-                  Request
-                </Button>
-              </form>
-            ) : (
-              <Button type="button" className="secondary-action admin-wide" onClick={() => void leaveGroup()}>
-                <DoorOpen size={16} />
-                Leave group
-              </Button>
-            )}
-
-            {canManageGroup && (
-              <>
-                {snapshot.joinRequests.length > 0 && (
-                  <div className="admin-stack">
-                    <Label>Pending joins</Label>
-                    {snapshot.joinRequests.slice(0, 4).map((request) => (
-                      <div className="join-request" key={request.id}>
-                        <AvatarChip
-                          pubkey={request.pubkey}
-                          user={snapshot.users.find((user) => user.pubkey === request.pubkey)}
-                          small
-                        />
-                        <span>{nameFor(request.pubkey, snapshot.users)}</span>
-                        <Button
-                          type="button"
-                          className="icon-soft"
-                          onClick={() => void acceptJoin(request.pubkey)}
-                          aria-label={`Accept ${nameFor(request.pubkey, snapshot.users)}`}
-                        >
-                          <Check size={15} />
-                        </Button>
-                        <Button
-                          type="button"
-                          className="icon-soft danger"
-                          onClick={() => void rejectJoin(request.pubkey)}
-                          aria-label={`Reject ${nameFor(request.pubkey, snapshot.users)}`}
-                        >
-                          <UserMinus size={15} />
-                        </Button>
-                      </div>
-                    ))}
-                  </div>
+              <div className="admin-action-grid">
+                {!currentIsMember ? (
+                  <Button type="button" className="secondary-action" onClick={() => setAdminDialog('join')}>
+                    <DoorOpen size={16} />
+                    Join
+                  </Button>
+                ) : (
+                  <Button type="button" className="secondary-action" onClick={() => void leaveGroup()}>
+                    <DoorOpen size={16} />
+                    Leave group
+                  </Button>
                 )}
 
-                <form className="admin-form" onSubmit={putUser}>
-                  <Label htmlFor="admin-target">Member</Label>
-                  <Input
-                    id="admin-target"
-                    value={targetInput}
-                    onChange={(event) => setTargetInput(event.target.value)}
-                    placeholder="npub or hex pubkey"
-                    spellCheck={false}
-                  />
-                  <Input
-                    value={targetRoles}
-                    onChange={(event) => setTargetRoles(event.target.value)}
-                    placeholder={supportedRoles.length ? supportedRoles.map((role) => role.name).join(', ') : 'roles'}
-                    aria-label="Roles"
-                  />
-                  <div className="admin-row">
-                    <Button type="submit" className="secondary-action">
+                {canManageGroup && (
+                  <>
+                    {snapshot.joinRequests.length > 0 && (
+                      <Button type="button" className="secondary-action" onClick={() => setAdminDialog('joins')}>
+                        <Check size={16} />
+                        Review joins
+                      </Button>
+                    )}
+                    <Button type="button" className="secondary-action" onClick={() => setAdminDialog('member')}>
                       <UserPlus size={16} />
-                      Add
+                      Add member
                     </Button>
-                    <Button type="button" className="secondary-action danger" onClick={() => void removeUser()}>
-                      <UserMinus size={16} />
-                      Remove
+                    {canCreateInvite && (
+                      <Button type="button" className="secondary-action" onClick={() => setAdminDialog('invite')}>
+                        <Ticket size={16} />
+                        Invite
+                      </Button>
+                    )}
+                    <Button type="button" className="secondary-action" onClick={() => setAdminDialog('details')}>
+                      <Edit3 size={16} />
+                      Edit group
                     </Button>
-                  </div>
-                </form>
-
-                <form className="admin-form" onSubmit={createInvite}>
-                  <Label htmlFor="invite-code">Invite</Label>
-                  <div className="input-row">
-                    <Input
-                      id="invite-code"
-                      value={inviteCode}
-                      onChange={(event) => setInviteCode(event.target.value)}
-                      spellCheck={false}
-                    />
-                    <Button type="submit" aria-label="Create invite">
-                      <Ticket size={16} />
-                    </Button>
-                  </div>
-                </form>
-
-                <form className="admin-form" onSubmit={editMetadata}>
-                  <Label htmlFor="group-name">Details</Label>
-                  <Input
-                    id="group-name"
-                    value={metadataDraft.name}
-                    onChange={(event) => setMetadataEdits((edits) => ({ ...edits, name: event.target.value }))}
-                    placeholder="Group name"
-                  />
-                  <Input
-                    value={metadataDraft.about}
-                    onChange={(event) => setMetadataEdits((edits) => ({ ...edits, about: event.target.value }))}
-                    placeholder="About"
-                    aria-label="Group about"
-                  />
-                  <Input
-                    value={metadataDraft.picture}
-                    onChange={(event) => setMetadataEdits((edits) => ({ ...edits, picture: event.target.value }))}
-                    placeholder="Picture URL"
-                    aria-label="Group picture URL"
-                  />
-                  <div className="flag-grid">
-                    {(['private', 'restricted', 'closed', 'hidden'] as const).map((flag) => (
-                      <Label key={flag} className="flag-toggle">
-                        <Checkbox
-                          checked={metadataDraft[flag]}
-                          onCheckedChange={(checked) =>
-                            setMetadataEdits((edits) => ({ ...edits, [flag]: checked === true }))
-                          }
-                        />
-                        {flag}
-                      </Label>
-                    ))}
-                  </div>
-                  <Button type="submit" className="secondary-action admin-wide">
-                    <Edit3 size={16} />
-                    Save details
-                  </Button>
-                </form>
-
-                <div className="admin-form">
-                  <Label htmlFor="delete-event">Moderation</Label>
-                  <Input
-                    id="delete-event"
-                    value={eventIdInput}
-                    onChange={(event) => setEventIdInput(event.target.value)}
-                    placeholder="message id to delete"
-                    spellCheck={false}
-                  />
-                  <div className="admin-row">
-                    <Button type="button" className="secondary-action danger" onClick={() => void deleteEvent()}>
+                    <Button type="button" className="secondary-action" onClick={() => setAdminDialog('moderation')}>
                       <Trash2 size={16} />
-                      Delete message
+                      Moderate
                     </Button>
-                  </div>
-                  <div className="admin-row">
-                    <Button type="button" className="secondary-action" onClick={() => void createGroup()}>
+                    <Button type="button" className="secondary-action" onClick={() => setShowCreateGroupDialog(true)}>
+                      <MessageCircle size={16} />
                       Create chatroom
                     </Button>
                     <Button type="button" className="secondary-action danger" onClick={() => void deleteGroup()}>
+                      <Trash2 size={16} />
                       Delete chatroom
                     </Button>
-                  </div>
-                </div>
-
-                {snapshot.moderationEvents.length > 0 && (
-                  <div className="admin-stack">
-                    <Label>Recent actions</Label>
-                    {snapshot.moderationEvents.slice(0, 3).map((event) => (
-                      <span className="admin-log" key={event.id}>{moderationSummary(event)}</span>
-                    ))}
-                  </div>
+                  </>
                 )}
-              </>
-            )}
-          </Card>
-        </section>
-
-        {showMesh && (
-          <section className="panel-section">
-            <div className="section-title">
-              <span>Nearby mesh</span>
-              <span className={`mesh-pill ${health}`}>{mesh.participants}</span>
-            </div>
-            <Card className="mesh-card" size="sm">
-              <div>
-                <strong>{callStarted ? 'P2P live' : 'P2P ready'}</strong>
-                <p>{displayedMesh.connections} links · {displayedMesh.estimatedUploadMbps} Mbps uplink</p>
               </div>
-              <Button
-                type="button"
-                className="primary-action"
-                disabled={callPeers.length === 0}
-                onClick={toggleCall}
-                aria-label={callStarted ? 'Leave call' : 'Start call'}
-              >
-                {mediaState === 'requesting' ? (
-                  <LoaderCircle size={18} className="spin-icon" />
-                ) : callStarted ? (
-                  <Mic size={18} />
-                ) : (
-                  <Video size={18} />
-                )}
-                {mediaState === 'requesting' ? 'Starting' : callStarted ? 'Leave' : 'Start'}
-              </Button>
+
+              {canManageGroup && snapshot.moderationEvents.length > 0 && (
+                <div className="admin-stack compact">
+                  <Label>Recent actions</Label>
+                  {snapshot.moderationEvents.slice(0, 3).map((event) => (
+                    <span className="admin-log" key={event.id}>{moderationSummary(event)}</span>
+                  ))}
+                </div>
+              )}
             </Card>
-            <div className="nearby-list">
-              {nearby.slice(0, 3).map((peer) => (
-                <span key={peer.pubkey}>{nameFor(peer.pubkey, snapshot.users)}</span>
-              ))}
-            </div>
-            {callStarted && <p className="call-note">{remoteVideos.length} mock peers streaming test video</p>}
           </section>
         )}
 
         <section className="panel-section people-list">
           <div className="section-title">
             <span>Members</span>
-            <span>{mapCapacityLabel(activeCount)}</span>
+            <span>{groupMemberPubkeys.length} members</span>
           </div>
           {visiblePeople.map((user) => (
             <Button
@@ -1774,22 +2666,87 @@ function App() {
         )}
       </aside>
 
-      {appView === 'group' && hasSelectedGroup && (
+      {appView === 'group' && hasSelectedGroup && !canReadGroup && (
+        <section className="world-panel access-panel" aria-label="Room access required">
+          <Card className="access-card">
+            <div className="access-icon">
+              <LockKeyhole size={24} />
+            </div>
+            <div>
+              <p className="eyebrow">{relayHost}</p>
+              <h2>{roomAccessPending ? 'Checking chatroom access' : 'You do not have read access to this group'}</h2>
+              <p>
+                {roomAccessPending
+                  ? 'Waiting for the relay to return the chatroom state.'
+                  : roomAccessStatus === 'auth-required'
+                  ? 'This relay wants you to sign in before it will return the room.'
+                  : groupIsPrivate
+                    ? 'This chatroom is private. Ask a moderator to add you or request access.'
+                    : roomAccessMessage}
+              </p>
+            </div>
+            {roomAccessPending ? null : canUseChatroomActions ? (
+              <Button type="button" className="primary-action" onClick={() => setAdminDialog('join')}>
+                <DoorOpen size={17} />
+                Request access
+              </Button>
+            ) : (
+              <Button
+                type="button"
+                className="primary-action"
+                onClick={() => requestAuth('relay', `Sign in to check access to ${metadataName}.`)}
+              >
+                <LogIn size={17} />
+                Sign in
+              </Button>
+            )}
+          </Card>
+        </section>
+      )}
+
+      {appView === 'group' && hasSelectedGroup && canReadGroup && (
         <>
           <section className="world-panel map-panel" aria-label="Spatial office">
             <OfficeRenderer
               snapshot={{
                 map: officeMap,
-                users: snapshot.users,
-                positions: snapshot.positions,
+                users: officeUsers,
+                positions: officePositions,
                 selfPubkey,
               }}
+              canPlaceSelf={canEnterOffice}
               onMove={handleMove}
             />
-            <div className="world-bottombar">
-              <span>{currentUser?.name ?? 'guest'}</span>
-              <span>{shortNpub(selfPubkey)}</span>
-            </div>
+            {!canEnterOffice && (
+              <Card className="call-invite-card read-only-office" size="sm">
+                <div>
+                  <strong>Join to enter the office</strong>
+                  <span>This chatroom is readable, but only members can appear on the map.</span>
+                </div>
+                <Button type="button" className="primary-action" onClick={() => setAdminDialog('join')}>
+                  <DoorOpen size={17} />
+                  Join
+                </Button>
+              </Card>
+            )}
+            {showMesh && !callStarted && (
+              <Card className="call-invite-card" size="sm">
+                <div>
+                  <strong>Join call with {nearbyCallLabel}</strong>
+                  <span>{displayedMesh.connections} links · auto-answer is on</span>
+                </div>
+                <Button
+                  type="button"
+                  className="primary-action"
+                  disabled={callPeers.length === 0 || mediaState === 'requesting'}
+                  onClick={toggleCall}
+                  aria-label={`Join call with ${nearbyCallLabel}`}
+                >
+                  {mediaState === 'requesting' ? <LoaderCircle size={17} className="spin-icon" /> : <Video size={17} />}
+                  {mediaState === 'requesting' ? 'Starting' : 'Join'}
+                </Button>
+              </Card>
+            )}
             {callStarted && (
               <section
                 ref={callStageRef}
@@ -1877,11 +2834,22 @@ function App() {
                     <StreamTile
                       key={video.pubkey}
                       label={video.name}
-                      sublabel="mock peer stream"
+                      sublabel={relay.mode === 'mock' ? 'mock peer stream' : 'peer camera'}
                       stream={video.stream}
                       micMuted={Number.parseInt(video.pubkey.slice(0, 2), 16) % 4 === 0}
                     />
                   ))}
+                  {relay.mode === 'live' &&
+                    remoteVideos.length === 0 &&
+                    callPeers.map((peer) => (
+                      <StreamTile
+                        key={`pending-${peer.pubkey}`}
+                        label={peer.name}
+                        sublabel="connecting peer"
+                        stream={null}
+                        micMuted
+                      />
+                    ))}
                 </div>
               </section>
             )}
@@ -1901,13 +2869,10 @@ function App() {
 
                 return (
                   <Card key={event.id} className="message" size="sm">
-                    <div className="message-meta">
-                      <AvatarChip pubkey={event.pubkey} user={sender} small />
-                      <strong>{nameFor(event.pubkey, snapshot.users)}</strong>
-                      <time>{new Date(event.created_at * 1000).toLocaleTimeString([], {
-                        hour: '2-digit',
-                        minute: '2-digit',
-                      })}</time>
+                      <div className="message-meta">
+                        <AvatarChip pubkey={event.pubkey} user={sender} small />
+                        <strong>{nameFor(event.pubkey, snapshot.users)}</strong>
+                      <time dateTime={messageDateTime(event.created_at)}>{messageDate(event.created_at)}</time>
                       {canManageGroup && (
                         <Button
                           type="button"
@@ -1928,17 +2893,45 @@ function App() {
 
             <form className="composer" onSubmit={sendMessage}>
               <Label htmlFor="message">Message</Label>
+              {!canWriteGroupChat && (
+                <span className="composer-lock">
+                  This chatroom is readable, but only members can write.
+                  <Button type="button" className="link-button" onClick={() => setAdminDialog('join')}>
+                    Join
+                  </Button>
+                </span>
+              )}
+              <SelectedFiles files={messageFiles} onRemove={removeMessageFile} />
               <div className="input-row">
                 <Input
                   id="message"
                   value={message}
                   onChange={(event) => setMessage(event.target.value)}
-                  placeholder="Write to the room"
+                  placeholder={canWriteGroupChat ? 'Write to the room' : 'Join this chatroom to write'}
+                  disabled={!canWriteGroupChat}
                 />
-                <Button type="submit" aria-label="Send message">
-                  <Send size={18} />
+                <Label
+                  className={`file-picker ${canWriteGroupChat ? '' : 'disabled'}`}
+                  aria-label="Attach files"
+                  aria-disabled={!canWriteGroupChat}
+                >
+                  <Paperclip size={17} />
+                  <input
+                    type="file"
+                    multiple
+                    disabled={!canWriteGroupChat}
+                    onChange={(event) => {
+                      const files = Array.from(event.currentTarget.files ?? [])
+                      setMessageFiles((current) => [...current, ...files])
+                      event.currentTarget.value = ''
+                    }}
+                  />
+                </Label>
+                <Button type="submit" aria-label="Send message" disabled={!canWriteGroupChat}>
+                  {uploadStatus ? <LoaderCircle size={18} className="spin-icon" /> : <Send size={18} />}
                 </Button>
               </div>
+              {uploadStatus && <span className="upload-status">{uploadStatus}</span>}
             </form>
           </aside>
         </>
@@ -1967,10 +2960,12 @@ function App() {
                 aria-label="Search relay groups"
               />
             </Label>
-            <Button type="button" className="primary-action" onClick={() => setShowCreateGroupDialog(true)}>
-              <MessageCircle size={16} />
-              Create
-            </Button>
+            {canCreateRelayGroup && (
+              <Button type="button" className="primary-action" onClick={() => setShowCreateGroupDialog(true)}>
+                <MessageCircle size={16} />
+                Create
+              </Button>
+            )}
           </div>
           <div className="relay-chat-grid">
             {relayGroups.length === 0 ? (
@@ -2027,12 +3022,9 @@ function App() {
                       <div className="message-meta">
                         <AvatarChip pubkey={dm.senderPubkey} user={sender} small />
                         <strong>{outgoing ? 'You' : nameFor(dm.senderPubkey, snapshot.users)}</strong>
-                        <time>{new Date(dm.createdAt * 1000).toLocaleTimeString([], {
-                          hour: '2-digit',
-                          minute: '2-digit',
-                        })}</time>
+                        <time dateTime={messageDateTime(dm.createdAt)}>{messageDate(dm.createdAt)}</time>
                       </div>
-                      <p>{dm.content}</p>
+                      <DirectMessageContent message={dm} users={snapshot.users} />
                     </Card>
                   )
                 })}
@@ -2040,6 +3032,7 @@ function App() {
               </div>
               <form className="composer" onSubmit={sendDirectMessage}>
                 <Label htmlFor="dm-message">Direct message</Label>
+                <SelectedFiles files={dmFiles} onRemove={removeDmFile} />
                 <div className="input-row">
                   <Input
                     id="dm-message"
@@ -2047,10 +3040,23 @@ function App() {
                     onChange={(event) => setDmMessage(event.target.value)}
                     placeholder="Send a direct message"
                   />
+                  <Label className="file-picker" aria-label="Attach files">
+                    <Paperclip size={17} />
+                    <input
+                      type="file"
+                      multiple
+                      onChange={(event) => {
+                        const files = Array.from(event.currentTarget.files ?? [])
+                        setDmFiles((current) => [...current, ...files])
+                        event.currentTarget.value = ''
+                      }}
+                    />
+                  </Label>
                   <Button type="submit" aria-label="Send direct message">
-                    <Send size={18} />
+                    {uploadStatus ? <LoaderCircle size={18} className="spin-icon" /> : <Send size={18} />}
                   </Button>
                 </div>
+                {uploadStatus && <span className="upload-status">{uploadStatus}</span>}
               </form>
             </>
           ) : (
@@ -2098,6 +3104,81 @@ function App() {
     </main>
     </TooltipProvider>
   )
+}
+
+function LandingApp() {
+  useEffect(() => {
+    document.title = 'Nestr'
+  }, [])
+
+  return (
+    <TooltipProvider>
+      <main className="app-shell landing-shell" data-view="landing">
+        <nav className="app-rail" aria-label="Primary navigation">
+          <Button type="button" className="rail-button active" aria-label="Relays">
+            <Radio size={22} />
+          </Button>
+          <div className="rail-spacer" />
+          <Button
+            type="button"
+            className="rail-button account"
+            onClick={() => {
+              window.location.href = '/?relay=relay.nestr.development'
+            }}
+            aria-label="Sign in"
+          >
+            <LogIn size={22} />
+          </Button>
+        </nav>
+
+        <section className="world-panel relay-directory-panel landing-panel" aria-label="Relay directory">
+          <div className="directory-header">
+            <div>
+              <p className="eyebrow">nestr</p>
+              <div className="relay-title-row">
+                <h2>Choose a relay</h2>
+              </div>
+            </div>
+            <span>{DEVELOPMENT_RELAYS.length + 1} relays</span>
+          </div>
+
+          <div className="relay-chat-grid landing-relay-grid">
+            {DEVELOPMENT_RELAYS.map((relay) => (
+              <a
+                key={relay.host}
+                className="relay-chat-card landing-relay-card"
+                href={`/?relay=${relay.host}`}
+              >
+                <span className="relay-chat-hash">
+                  <Radio size={21} />
+                </span>
+                <span>
+                  <strong>{relay.host}</strong>
+                  <small>{relay.description}</small>
+                </span>
+              </a>
+            ))}
+            <a className="relay-chat-card landing-relay-card" href="/?relay=groups.0xchat.com">
+              <span className="relay-chat-hash">
+                <Radio size={21} />
+              </span>
+              <span>
+                <strong>groups.0xchat.com</strong>
+                <small>Live public group relay for testing real chatroom subscriptions.</small>
+              </span>
+            </a>
+          </div>
+        </section>
+      </main>
+    </TooltipProvider>
+  )
+}
+
+function App() {
+  const launch = useMemo(() => parseLaunch(), [])
+
+  if (launch.mode === 'landing') return <LandingApp />
+  return <OfficeApp launch={launch} />
 }
 
 export default App

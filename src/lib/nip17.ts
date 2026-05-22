@@ -2,11 +2,13 @@ import { finalizeEvent, generateSecretKey, getEventHash } from 'nostr-tools/pure
 import { v2 as nip44 } from 'nostr-tools/nip44'
 import {
   DM_KINDS,
+  type NestrAttachment,
   type NestrDirectMessage,
   type NestrEvent,
   type NestrEventTemplate,
   type NestrSigner,
 } from './nostr'
+import { attachmentFromNip17File, attachmentLabel, nip17FileTags } from './attachments'
 
 const TWO_DAYS_SECONDS = 2 * 24 * 60 * 60
 
@@ -33,13 +35,28 @@ function assertNip44Signer(signer: NestrSigner) {
   }
 }
 
-function buildRumor(senderPubkey: string, recipientPubkey: string, content: string, createdAt: number): Rumor {
+interface Nip17CreateOptions {
+  attachment?: NestrAttachment
+}
+
+function buildRumor(
+  senderPubkey: string,
+  recipientPubkey: string,
+  content: string,
+  createdAt: number,
+  options: Nip17CreateOptions = {},
+): Rumor {
+  const attachment = options.attachment
+  const kind = attachment ? DM_KINDS.fileMessage : DM_KINDS.directMessage
+  const tags = attachment
+    ? [['p', recipientPubkey], ...nip17FileTags(attachment)]
+    : [['p', recipientPubkey]]
   const unsigned = {
-    kind: DM_KINDS.directMessage,
+    kind,
     pubkey: senderPubkey,
     created_at: createdAt,
-    tags: [['p', recipientPubkey]],
-    content,
+    tags,
+    content: attachment ? attachment.url : content,
   }
 
   return {
@@ -80,11 +97,13 @@ export async function createNip17DirectMessage(
   recipientPubkey: string,
   content: string,
   createdAt = nowSeconds(),
+  options: Nip17CreateOptions = {},
 ) {
   assertNip44Signer(signer)
-  const rumor = buildRumor(signer.pubkey, recipientPubkey, content, createdAt)
+  const rumor = buildRumor(signer.pubkey, recipientPubkey, content, createdAt, options)
   const recipients = Array.from(new Set([recipientPubkey, signer.pubkey]))
   const wraps: NestrEvent[] = []
+  const attachments = options.attachment ? [options.attachment] : []
 
   for (const recipient of recipients) {
     const seal = await createSeal(signer, rumor, recipient)
@@ -96,7 +115,8 @@ export async function createNip17DirectMessage(
     counterparty: recipientPubkey,
     senderPubkey: signer.pubkey,
     recipientPubkey,
-    content,
+    content: options.attachment ? content.trim() || attachmentLabel(attachments) : content,
+    attachments,
     createdAt,
     protocol: 'nip17',
   }
@@ -127,7 +147,7 @@ function parseRumor(value: string): Rumor | null {
   try {
     const parsed = JSON.parse(value)
     if (!isRecord(parsed)) return null
-    if (parsed.kind !== DM_KINDS.directMessage) return null
+    if (parsed.kind !== DM_KINDS.directMessage && parsed.kind !== DM_KINDS.fileMessage) return null
     if (typeof parsed.id !== 'string') return null
     if (typeof parsed.pubkey !== 'string') return null
     if (typeof parsed.content !== 'string') return null
@@ -160,6 +180,10 @@ export async function unwrapNip17DirectMessage(
     const recipientPubkey = taggedRecipients[0] ?? signer.pubkey
     const senderPubkey = rumor.pubkey
     const counterparty = senderPubkey === signer.pubkey ? recipientPubkey : senderPubkey
+    const attachment = rumor.kind === DM_KINDS.fileMessage
+      ? attachmentFromNip17File(rumor.content, rumor.tags)
+      : null
+    const attachments = attachment ? [attachment] : []
 
     if (senderPubkey !== signer.pubkey && !taggedRecipients.includes(signer.pubkey)) {
       return null
@@ -171,7 +195,8 @@ export async function unwrapNip17DirectMessage(
       counterparty,
       senderPubkey,
       recipientPubkey,
-      content: rumor.content,
+      content: attachment ? attachmentLabel(attachments) : rumor.content,
+      attachments,
       createdAt: rumor.created_at,
       protocol: 'nip17',
     }

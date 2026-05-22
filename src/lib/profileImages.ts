@@ -16,7 +16,7 @@ export interface BlossomPointer {
   authors: string[]
 }
 
-const BLOSSOM_FALLBACK_SERVERS = [
+export const BLOSSOM_FALLBACK_SERVERS = [
   'https://blossom.primal.net',
   'https://blossom.nostr.build',
   'https://cdn.satellite.earth',
