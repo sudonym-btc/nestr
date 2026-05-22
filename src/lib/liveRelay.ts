@@ -17,19 +17,17 @@ import {
   type NestrSigner,
 } from './nostr'
 import type { MockUser, Nip29Group, RelaySnapshot } from './mockRelay'
+import {
+  blossomServersFromTags,
+  buildProfilePictureCandidates,
+  profileNameFromContent,
+  profilePictureFromContent,
+} from './profileImages'
 import type { WorldPosition } from './world'
 
 const encoder = new TextEncoder()
 const GROUP_CHAT_KINDS = new Set([1, 9])
 const PROFILE_RELAYS = ['wss://purplepag.es', 'wss://relay.nostr.band', 'wss://relay.damus.io']
-
-interface ProfileMetadata {
-  name?: string
-  display_name?: string
-  displayName?: string
-  username?: string
-  nip05?: string
-}
 
 function now() {
   return Math.floor(Date.now() / 1000)
@@ -62,22 +60,6 @@ function userFromPubkey(pubkey: string, role = 'member'): MockUser {
   }
 }
 
-export function profileNameFromContent(content: string) {
-  try {
-    const profile = JSON.parse(content) as ProfileMetadata
-    const candidates = [
-      profile.display_name,
-      profile.displayName,
-      profile.name,
-      profile.username,
-      profile.nip05,
-    ]
-    return candidates.find((value) => typeof value === 'string' && value.trim().length > 0)?.trim() ?? null
-  } catch {
-    return null
-  }
-}
-
 export function roleLabelFromState(roles: string[], isMember: boolean, isSelf = false) {
   if (roles.length > 0) return `admin: ${roles.join(', ')}`
   if (isMember) return 'member'
@@ -101,6 +83,7 @@ export class LiveNip29Relay {
   private readonly positions = new Map<string, WorldPosition>()
   private readonly users = new Map<string, MockUser>()
   private readonly profiles = new Map<string, NestrEvent>()
+  private readonly blossomServers = new Map<string, string[]>()
   private readonly memberPubkeys = new Set<string>()
   private readonly adminRoles = new Map<string, string[]>()
   private readonly profileQueue = new Set<string>()
@@ -404,11 +387,19 @@ export class LiveNip29Relay {
 
   private upsertUser(pubkey: string) {
     const existing = this.users.get(pubkey) ?? userFromPubkey(pubkey, this.roleLabel(pubkey))
-    const profileName = profileNameFromContent(this.profiles.get(pubkey)?.content ?? '') ?? existing.name
+    const profile = this.profiles.get(pubkey)
+    const profileName = profileNameFromContent(profile?.content ?? '') ?? existing.name
+    const pictureCandidates = buildProfilePictureCandidates(
+      profilePictureFromContent(profile?.content ?? ''),
+      pubkey,
+      this.blossomServers.get(pubkey) ?? [],
+    )
     this.users.set(pubkey, {
       ...existing,
       name: this.signer?.pubkey === pubkey ? 'You' : profileName,
       role: this.roleLabel(pubkey),
+      pictureUrl: pictureCandidates[0],
+      pictureCandidates,
     })
   }
 
@@ -444,10 +435,13 @@ export class LiveNip29Relay {
     try {
       const events = (await this.profilePool.querySync(
         relays,
-        { kinds: [0], authors, limit: authors.length },
+        { kinds: [0, 10063], authors, limit: authors.length * 2 },
         { maxWait: 2600 },
       )) as NestrEvent[]
-      events.forEach((event) => this.receiveProfile(event))
+      events.forEach((event) => {
+        if (event.kind === 0) this.receiveProfile(event)
+        if (event.kind === 10063) this.receiveBlossomServers(event)
+      })
     } catch {
       // Profile metadata is best-effort; NIP-29 membership still comes from the group relay.
     }
@@ -458,6 +452,12 @@ export class LiveNip29Relay {
         void this.fetchQueuedProfiles()
       }, 240)
     }
+  }
+
+  private receiveBlossomServers(event: NestrEvent) {
+    this.blossomServers.set(event.pubkey, blossomServersFromTags(event.tags))
+    this.upsertUser(event.pubkey)
+    this.emit()
   }
 
   private previousTags() {

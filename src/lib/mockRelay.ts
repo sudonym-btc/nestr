@@ -27,6 +27,8 @@ export interface MockUser {
   npub: string
   name: string
   role: string
+  pictureUrl?: string
+  pictureCandidates?: string[]
   secretKey?: Uint8Array
 }
 

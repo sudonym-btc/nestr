@@ -15,6 +15,7 @@ export type MoveHandler = (position: Pick<WorldPosition, 'x' | 'y' | 'vx' | 'vy'
 interface AvatarNode {
   container: Phaser.GameObjects.Container
   label: Phaser.GameObjects.Text
+  pictureUrl?: string
   tween?: Phaser.Tweens.Tween
 }
 
@@ -46,6 +47,7 @@ export class OfficeScene extends Phaser.Scene {
   private avatars = new Map<string, AvatarNode>()
   private keys?: Record<string, Phaser.Input.Keyboard.Key>
   private target?: Phaser.Math.Vector2
+  private loadingProfileTextures = new Set<string>()
   private lastEmit = 0
   private lastViewportKey = ''
 
@@ -301,6 +303,17 @@ export class OfficeScene extends Phaser.Scene {
       const existing = this.avatars.get(position.pubkey)
 
       if (existing) {
+        if (existing.pictureUrl !== user.pictureUrl) {
+          existing.container.destroy()
+          this.avatars.delete(position.pubkey)
+          const node = this.createAvatar(position, user)
+          this.avatars.set(position.pubkey, node)
+          if (position.pubkey === this.snapshot?.selfPubkey) {
+            this.cameras.main.startFollow(node.container, true, 0.1, 0.1)
+          }
+          return
+        }
+
         if (position.pubkey === this.snapshot?.selfPubkey) {
           existing.tween?.stop()
           existing.container.setPosition(position.x, position.y)
@@ -343,18 +356,30 @@ export class OfficeScene extends Phaser.Scene {
   private createAvatar(position: WorldPosition, user: MockUser): AvatarNode {
     const avatar = avatarFromPubkey(position.pubkey)
     const isSelf = position.pubkey === this.snapshot?.selfPubkey
+    const profileTexture = user.pictureUrl ? this.ensureProfileTexture(position.pubkey, user.pictureUrl) : undefined
+    const hasProfileTexture = profileTexture ? this.textures.exists(profileTexture) : false
     const shadow = this.add.ellipse(0, 12, 26, 10, 0x000000, 0.15)
-    const body = this.add.circle(0, 2, 13, color(avatar.body), 1)
-    const trim = this.add.circle(0, 2, 8, color(avatar.trim), 0.9)
-    const head = this.add.circle(0, -13, 10, color(avatar.skin), 1)
-    const hair = this.add.rectangle(0, -22, 18, 7, color(avatar.hair), 1)
-    const badge = this.add
-      .text(0, 2, avatar.badge, {
-        fontFamily: 'ui-monospace, monospace',
-        fontSize: '7px',
-        color: avatar.body === '#2454d6' ? '#ffffff' : '#171922',
-      })
-      .setOrigin(0.5)
+    const body = this.add.circle(0, 5, 13, color(avatar.body), 1)
+    const trim = this.add.circle(0, 5, 8, color(avatar.trim), 0.9)
+    const profileParts: Phaser.GameObjects.GameObject[] = [body, trim]
+
+    if (hasProfileTexture && profileTexture) {
+      const portraitRing = this.add.circle(0, -12, 16, 0xffffff, 1)
+      const portrait = this.add.image(0, -12, profileTexture).setDisplaySize(27, 27)
+      profileParts.push(portraitRing, portrait)
+    } else {
+      const head = this.add.circle(0, -13, 10, color(avatar.skin), 1)
+      const hair = this.add.rectangle(0, -22, 18, 7, color(avatar.hair), 1)
+      const badge = this.add
+        .text(0, 5, avatar.badge, {
+          fontFamily: 'ui-monospace, monospace',
+          fontSize: '7px',
+          color: avatar.body === '#2454d6' ? '#ffffff' : '#171922',
+        })
+        .setOrigin(0.5)
+      profileParts.push(head, hair, badge)
+    }
+
     const label = this.add
       .text(0, -39, isSelf ? 'You' : user.name, {
         fontFamily: 'Inter, system-ui, sans-serif',
@@ -365,8 +390,25 @@ export class OfficeScene extends Phaser.Scene {
       })
       .setOrigin(0.5)
 
-    const container = this.add.container(position.x, position.y, [shadow, body, trim, head, hair, badge, label])
+    const container = this.add.container(position.x, position.y, [shadow, ...profileParts, label])
     container.setDepth(position.y)
-    return { container, label }
+    return { container, label, pictureUrl: hasProfileTexture ? user.pictureUrl : undefined }
+  }
+
+  private ensureProfileTexture(pubkey: string, pictureUrl: string) {
+    const key = `profile-${pubkey.slice(0, 12)}-${hashInt(pictureUrl)}`
+    if (this.textures.exists(key) || this.loadingProfileTextures.has(key)) return key
+
+    this.loadingProfileTextures.add(key)
+    this.load.image(key, pictureUrl)
+    this.load.once(`filecomplete-image-${key}`, () => {
+      this.loadingProfileTextures.delete(key)
+      this.syncAvatars()
+    })
+    this.load.once('loaderror', () => {
+      this.loadingProfileTextures.delete(key)
+    })
+    this.load.start()
+    return key
   }
 }

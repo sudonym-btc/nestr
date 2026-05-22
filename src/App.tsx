@@ -54,6 +54,37 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
 
+interface AvatarChipProps {
+  pubkey: string
+  user?: MockUser
+  small?: boolean
+}
+
+function AvatarChip({ pubkey, user, small = false }: AvatarChipProps) {
+  const candidates = user?.pictureCandidates?.length ? user.pictureCandidates : user?.pictureUrl ? [user.pictureUrl] : []
+  const candidatesKey = candidates.join('|')
+  const [failed, setFailed] = useState({ key: '', index: 0 })
+  const candidateIndex = failed.key === candidatesKey ? failed.index : 0
+  const src = candidateIndex < candidates.length ? candidates[candidateIndex] : undefined
+
+  return (
+    <span
+      className={`avatar-chip ${small ? 'small' : ''} ${src ? 'has-image' : ''}`}
+      style={avatarCss(pubkey)}
+    >
+      {src && (
+        <img
+          src={src}
+          alt=""
+          loading="lazy"
+          referrerPolicy="no-referrer"
+          onError={() => setFailed({ key: candidatesKey, index: candidateIndex + 1 })}
+        />
+      )}
+    </span>
+  )
+}
+
 interface StreamTileProps {
   label: string
   sublabel: string
@@ -518,7 +549,7 @@ function App() {
           <section className="signin live-auth" aria-label="Nostr auth">
             <label>nostr auth</label>
             <div className="auth-status">
-              <span className="avatar-chip small" style={avatarCss(selfPubkey)} />
+              <AvatarChip pubkey={selfPubkey} user={currentUser} small />
               <div>
                 <strong>{authStatus}</strong>
                 <span>{connectionMessage}</span>
@@ -604,7 +635,7 @@ function App() {
                 setCallExpanded(false)
               }}
             >
-              <span className="avatar-chip" style={avatarCss(user.pubkey)} />
+              <AvatarChip pubkey={user.pubkey} user={user} />
               <span>
                 <strong>{user.pubkey === selfPubkey ? 'You' : user.name}</strong>
                 <small>{user.role}</small>
@@ -716,19 +747,23 @@ function App() {
         </div>
 
         <div className="messages" role="log" aria-label="Messages">
-          {snapshot.messages.map((event) => (
-            <article key={event.id} className="message">
-              <div className="message-meta">
-                <span className="avatar-chip small" style={avatarCss(event.pubkey)} />
-                <strong>{nameFor(event.pubkey, snapshot.users)}</strong>
-                <time>{new Date(event.created_at * 1000).toLocaleTimeString([], {
-                  hour: '2-digit',
-                  minute: '2-digit',
-                })}</time>
-              </div>
-              <p>{event.content}</p>
-            </article>
-          ))}
+          {snapshot.messages.map((event) => {
+            const sender = snapshot.users.find((user) => user.pubkey === event.pubkey)
+
+            return (
+              <article key={event.id} className="message">
+                <div className="message-meta">
+                  <AvatarChip pubkey={event.pubkey} user={sender} small />
+                  <strong>{nameFor(event.pubkey, snapshot.users)}</strong>
+                  <time>{new Date(event.created_at * 1000).toLocaleTimeString([], {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                  })}</time>
+                </div>
+                <p>{event.content}</p>
+              </article>
+            )
+          })}
           <div ref={messagesEndRef} />
         </div>
 
