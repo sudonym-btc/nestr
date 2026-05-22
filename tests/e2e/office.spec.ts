@@ -1,4 +1,41 @@
-import { expect, test } from '@playwright/test'
+import { expect, test, type Page } from '@playwright/test'
+
+async function expectOfficeCanvasNonBlank(page: Page) {
+  const canvas = page.getByTestId('office-webgl-canvas')
+  await expect(canvas).toBeVisible()
+  await expect
+    .poll(
+      async () =>
+        canvas.evaluate((element) => {
+          if (!(element instanceof HTMLCanvasElement)) return false
+          const gl = element.getContext('webgl2') || element.getContext('webgl')
+          if (!gl) return false
+
+          const pixels = new Uint8Array(4)
+          const colors = new Set<string>()
+          let nonBlank = 0
+          for (let y = 1; y < 10; y += 2) {
+            for (let x = 1; x < 10; x += 2) {
+              gl.readPixels(
+                Math.floor((x / 10) * gl.drawingBufferWidth),
+                Math.floor((y / 10) * gl.drawingBufferHeight),
+                1,
+                1,
+                gl.RGBA,
+                gl.UNSIGNED_BYTE,
+                pixels,
+              )
+              colors.add(`${pixels[0]},${pixels[1]},${pixels[2]},${pixels[3]}`)
+              if (pixels[3] > 0 && pixels[0] + pixels[1] + pixels[2] > 30) nonBlank += 1
+            }
+          }
+
+          return nonBlank > 8 && colors.size > 6
+        }),
+      { timeout: 10_000 },
+    )
+    .toBe(true)
+}
 
 test('renders the NIP-29 office and sends global chat', async ({ page }) => {
   await page.goto('/')
@@ -6,6 +43,7 @@ test('renders the NIP-29 office and sends global chat', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Nestr Design Office' })).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Chat' })).toBeVisible()
   await expect(page.locator('canvas')).toBeVisible()
+  await expectOfficeCanvasNonBlank(page)
 
   await page.getByRole('textbox', { name: 'Message' }).fill('hello from playwright')
   await page.getByRole('button', { name: 'Send message' }).click()
@@ -18,6 +56,7 @@ test('renders the NIP-29 office and sends global chat', async ({ page }) => {
   await expect(page.getByRole('button', { name: 'Fullscreen call' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Disable camera' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Mute microphone' })).toBeVisible()
+  await expect(page.getByRole('button', { name: /screen share/i })).toBeVisible()
 
   await page.screenshot({ path: 'test-results/nestr-office.png', fullPage: true })
 })
@@ -39,6 +78,20 @@ test('uses launch params to choose relay directory or group map', async ({ page 
 
   await expect(page.getByLabel('Spatial office')).toBeVisible()
   await expect(page.locator('canvas')).toBeVisible()
+})
+
+test('filters relay group chats', async ({ page }) => {
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Relay relay.nestr.local' }).click()
+
+  const relayDirectory = page.getByRole('region', { name: 'Relay chats' })
+  const search = relayDirectory.getByRole('searchbox', { name: 'Search relay groups' })
+
+  await expect(relayDirectory.getByText('Nestr Design Office')).toBeVisible()
+  await search.fill('design')
+  await expect(relayDirectory.getByText('Nestr Design Office')).toBeVisible()
+  await search.fill('no matching group')
+  await expect(relayDirectory.getByText('No groups match that search.')).toBeVisible()
 })
 
 test('completes NIP-07 sign-in from an auth-gated live action', async ({ page }) => {

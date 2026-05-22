@@ -15,8 +15,10 @@ import {
   Mic,
   MicOff,
   Minimize2,
+  Monitor,
   Radio,
   RefreshCcw,
+  Search,
   Send,
   ShieldCheck,
   Ticket,
@@ -28,7 +30,7 @@ import {
   X,
 } from 'lucide-react'
 import './App.css'
-import { PhaserOffice } from './game/PhaserOffice'
+import { OfficeRenderer } from './game/OfficeRenderer'
 import { avatarCss, npubForPubkey, resolvePubkey, seededPubkey, shortNpub } from './lib/avatar'
 import { parseLaunch } from './lib/launch'
 import { createLiveRelay } from './lib/liveRelay'
@@ -99,6 +101,13 @@ function relayHostLabel(relayUrl: string) {
   } catch {
     return relayUrl
   }
+}
+
+function relayGroupSearchText(groupEvent: NestrEvent, fallbackGroupId: string) {
+  const groupId = tagValue(groupEvent, 'd') ?? fallbackGroupId
+  const name = tagValue(groupEvent, 'name') ?? ''
+  const about = tagValue(groupEvent, 'about') ?? ''
+  return `${groupId} ${name} ${about}`.toLowerCase()
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string) {
@@ -211,6 +220,8 @@ interface StreamTileProps {
   sublabel: string
   stream: MediaStream | null
   muted?: boolean
+  micMuted?: boolean
+  status?: 'local' | 'remote' | 'screen'
 }
 
 type AuthState = 'mock' | 'idle' | 'connecting' | 'reconnecting' | 'connected' | 'disconnected'
@@ -243,7 +254,7 @@ function authPromptTitle(kind: AuthPromptKind) {
   return 'Sign in with Nostr'
 }
 
-function StreamTile({ label, sublabel, stream, muted = false }: StreamTileProps) {
+function StreamTile({ label, sublabel, stream, muted = false, micMuted = false, status = 'remote' }: StreamTileProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null)
 
   useEffect(() => {
@@ -253,12 +264,15 @@ function StreamTile({ label, sublabel, stream, muted = false }: StreamTileProps)
   }, [stream])
 
   return (
-    <article className={`stream-tile ${stream ? '' : 'empty'}`}>
+    <article className={`stream-tile ${stream ? '' : 'empty'} ${status}`}>
       {stream ? <video ref={videoRef} autoPlay muted={muted} playsInline /> : <div className="stream-empty" />}
       <div className="stream-label">
         <strong>{label}</strong>
         <span>{sublabel}</span>
       </div>
+      <span className={`stream-mic ${micMuted ? 'muted' : ''}`} aria-label={micMuted ? `${label} muted` : `${label} unmuted`}>
+        {micMuted ? <MicOff size={14} /> : <Mic size={14} />}
+      </span>
     </article>
   )
 }
@@ -273,6 +287,7 @@ function App() {
   const [selfPubkey, setSelfPubkey] = useState(() => snapshot.users[0]?.pubkey ?? seededPubkey('live-viewer'))
   const [npubInput, setNpubInput] = useState<string>(() => npubForPubkey(snapshot.users[0]?.pubkey ?? selfPubkey))
   const [message, setMessage] = useState('')
+  const [relaySearch, setRelaySearch] = useState('')
   const [appView, setAppView] = useState<AppView>(() =>
     launch.mode === 'live' ? launch.initialView : 'group',
   )
@@ -281,6 +296,7 @@ function App() {
   const [callStarted, setCallStarted] = useState(false)
   const [mediaState, setMediaState] = useState<'idle' | 'requesting' | 'live' | 'blocked'>('idle')
   const [localStream, setLocalStream] = useState<MediaStream | null>(null)
+  const [screenStream, setScreenStream] = useState<MediaStream | null>(null)
   const [remoteVideos, setRemoteVideos] = useState<MockPeerVideo[]>([])
   const [cameraEnabled, setCameraEnabled] = useState(true)
   const [micEnabled, setMicEnabled] = useState(true)
@@ -327,7 +343,24 @@ function App() {
   const groupAbout = tagValue(snapshot.group.metadata, 'about') ?? ''
   const relayHost = relayHostLabel(snapshot.group.relay)
   const hasSelectedGroup = relay.mode === 'mock' || (launch.mode === 'live' && Boolean(launch.groupId))
-  const relayGroups = snapshot.relayGroups.length > 0 || !hasSelectedGroup ? snapshot.relayGroups : [snapshot.group.metadata]
+  const relayGroups = useMemo(
+    () => (snapshot.relayGroups.length > 0 || !hasSelectedGroup ? snapshot.relayGroups : [snapshot.group.metadata]),
+    [hasSelectedGroup, snapshot.group.metadata, snapshot.relayGroups],
+  )
+  const normalizedRelaySearch = relaySearch.trim().toLowerCase()
+  const filteredRelayGroups = useMemo(
+    () =>
+      normalizedRelaySearch
+        ? relayGroups.filter((groupEvent) =>
+            relayGroupSearchText(groupEvent, snapshot.group.id).includes(normalizedRelaySearch),
+          )
+        : relayGroups,
+    [normalizedRelaySearch, relayGroups, snapshot.group.id],
+  )
+  const relayGroupCountLabel =
+    filteredRelayGroups.length === relayGroups.length
+      ? String(relayGroups.length)
+      : `${filteredRelayGroups.length} / ${relayGroups.length}`
   const connectionStatus = snapshot.connectionStatus ?? relay.mode
   const connectionMessage = authDetail || snapshot.connectionMessage || authStatus
   const showAuthPrompt = relay.mode === 'live' && Boolean(authPrompt) && authState !== 'connected'
@@ -404,6 +437,7 @@ function App() {
   const callPeerKey = callPeers.map((peer) => `${peer.pubkey}:${peer.name}`).join('|')
   const displayedMesh = estimateWebRtcMesh((callStarted ? callPeers.length : nearby.length) + 1)
   const frozenPeerPubkeys = remoteVideos.map((video) => video.pubkey).join('|')
+  const canScreenShare = Boolean(navigator.mediaDevices?.getDisplayMedia)
 
   useEffect(() => {
     const unsubscribe = relay.subscribe((next) => setSnapshot(next))
@@ -428,6 +462,12 @@ function App() {
       localStream?.getTracks().forEach((track) => track.stop())
     }
   }, [localStream])
+
+  useEffect(() => {
+    return () => {
+      screenStream?.getTracks().forEach((track) => track.stop())
+    }
+  }, [screenStream])
 
   useEffect(() => {
     return () => remoteVideosRef.current.forEach((video) => video.stop())
@@ -784,6 +824,7 @@ function App() {
     await clearStoredNostrConnectSession()
     setSelfPubkey(seededPubkey('live-viewer'))
     setCallStarted(false)
+    stopScreenShare()
     stopRemoteVideos()
     setCallExpanded(false)
     setAuthState('idle')
@@ -828,6 +869,7 @@ function App() {
     setSelfPubkey(user.pubkey)
     setNpubInput(user.npub)
     setCallStarted(false)
+    stopScreenShare()
     stopRemoteVideos()
     setCallExpanded(false)
   }
@@ -910,6 +952,7 @@ function App() {
     )
     if (ok) {
       setCallStarted(false)
+      stopScreenShare()
       stopRemoteVideos()
       setCallExpanded(false)
     }
@@ -1007,6 +1050,11 @@ function App() {
     setRemoteVideos([])
   }
 
+  function stopScreenShare() {
+    screenStream?.getTracks().forEach((track) => track.stop())
+    setScreenStream(null)
+  }
+
   async function requestLocalMedia(nextCamera = cameraEnabled, nextMic = micEnabled) {
     localStream?.getTracks().forEach((track) => track.stop())
     setLocalStream(null)
@@ -1044,6 +1092,7 @@ function App() {
   async function toggleCall() {
     if (callStarted) {
       localStream?.getTracks().forEach((track) => track.stop())
+      stopScreenShare()
       stopRemoteVideos()
       setLocalStream(null)
       setCallStarted(false)
@@ -1082,6 +1131,25 @@ function App() {
       return
     }
     await requestLocalMedia(cameraEnabled, nextMic)
+  }
+
+  async function toggleScreenShare() {
+    if (screenStream) {
+      stopScreenShare()
+      return
+    }
+    if (!navigator.mediaDevices?.getDisplayMedia) return
+
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: false,
+      })
+      stream.getVideoTracks()[0]?.addEventListener('ended', () => setScreenStream(null), { once: true })
+      setScreenStream(stream)
+    } catch {
+      setScreenStream(null)
+    }
   }
 
   async function toggleCallFullscreen() {
@@ -1194,6 +1262,7 @@ function App() {
           onClick={() => {
             setAppView('dm')
             setCallStarted(false)
+            stopScreenShare()
             stopRemoteVideos()
             setCallExpanded(false)
           }}
@@ -1280,19 +1349,31 @@ function App() {
               </span>
               <span>
                 <MessageCircle size={15} />
-                {relayGroups.length} chats
+                {relayGroupCountLabel} chats
               </span>
             </div>
 
             <section className="panel-section relay-channel-list" aria-label="Relay group chats">
               <div className="section-title">
                 <span>Channels</span>
-                <span>{relayGroups.length}</span>
+                <span>{relayGroupCountLabel}</span>
               </div>
+              <label className="relay-search">
+                <Search size={15} />
+                <input
+                  type="search"
+                  value={relaySearch}
+                  onChange={(event) => setRelaySearch(event.target.value)}
+                  placeholder="Search groups"
+                  aria-label="Search relay groups"
+                />
+              </label>
               {relayGroups.length === 0 ? (
                 <div className="empty-state">Waiting for NIP-29 group metadata from this relay.</div>
+              ) : filteredRelayGroups.length === 0 ? (
+                <div className="empty-state">No groups match that search.</div>
               ) : (
-                relayGroups.map((groupEvent) => {
+                filteredRelayGroups.map((groupEvent) => {
                   const groupId = tagValue(groupEvent, 'd') ?? snapshot.group.id
                   const name = tagValue(groupEvent, 'name') ?? groupId
 
@@ -1617,6 +1698,7 @@ function App() {
                 setSelfPubkey(user.pubkey)
                 setNpubInput(user.npub)
                 setCallStarted(false)
+                stopScreenShare()
                 stopRemoteVideos()
                 setCallExpanded(false)
               }}
@@ -1641,8 +1723,8 @@ function App() {
 
       {appView === 'group' && hasSelectedGroup && (
         <>
-          <section className="world-panel" aria-label="Spatial office">
-            <PhaserOffice
+          <section className="world-panel map-panel" aria-label="Spatial office">
+            <OfficeRenderer
               snapshot={{
                 map: officeMap,
                 users: snapshot.users,
@@ -1694,6 +1776,22 @@ function App() {
                     {micEnabled ? <Mic size={18} /> : <MicOff size={18} />}
                     <span>Mic</span>
                   </button>
+                  <button
+                    type="button"
+                    className={screenStream ? 'active' : ''}
+                    onClick={toggleScreenShare}
+                    disabled={!canScreenShare}
+                    aria-label={
+                      !canScreenShare
+                        ? 'Screen share unavailable'
+                        : screenStream
+                          ? 'Stop screen share'
+                          : 'Start screen share'
+                    }
+                  >
+                    <Monitor size={18} />
+                    <span>Share</span>
+                  </button>
                 </div>
                 <div className="stream-grid">
                   <StreamTile
@@ -1702,20 +1800,33 @@ function App() {
                       !cameraEnabled
                         ? 'camera off'
                         : mediaState === 'live'
-                        ? 'local camera'
-                        : mediaState === 'blocked'
-                          ? 'camera blocked'
-                          : 'requesting camera'
+                          ? 'local camera'
+                          : mediaState === 'blocked'
+                            ? 'camera blocked'
+                            : 'requesting camera'
                     }
                     stream={cameraEnabled ? localStream : null}
                     muted
+                    micMuted={!micEnabled}
+                    status="local"
                   />
+                  {screenStream && (
+                    <StreamTile
+                      label={`${currentUser?.name ?? 'You'} screen`}
+                      sublabel="screen share"
+                      stream={screenStream}
+                      muted
+                      micMuted
+                      status="screen"
+                    />
+                  )}
                   {remoteVideos.map((video) => (
                     <StreamTile
                       key={video.pubkey}
                       label={video.name}
                       sublabel="mock peer stream"
                       stream={video.stream}
+                      micMuted={Number.parseInt(video.pubkey.slice(0, 2), 16) % 4 === 0}
                     />
                   ))}
                 </div>
@@ -1787,13 +1898,25 @@ function App() {
               <p className="eyebrow">relay</p>
               <h2>{relayHost}</h2>
             </div>
-            <span>{relayGroups.length} chats</span>
+            <span>{relayGroupCountLabel} chats</span>
           </div>
+          <label className="relay-search directory-search">
+            <Search size={15} />
+            <input
+              type="search"
+              value={relaySearch}
+              onChange={(event) => setRelaySearch(event.target.value)}
+              placeholder="Search groups"
+              aria-label="Search relay groups"
+            />
+          </label>
           <div className="relay-chat-grid">
             {relayGroups.length === 0 ? (
               <div className="empty-state">Waiting for NIP-29 group metadata from this relay.</div>
+            ) : filteredRelayGroups.length === 0 ? (
+              <div className="empty-state">No groups match that search.</div>
             ) : (
-              relayGroups.map((groupEvent) => {
+              filteredRelayGroups.map((groupEvent) => {
                 const groupId = tagValue(groupEvent, 'd') ?? snapshot.group.id
                 const name = tagValue(groupEvent, 'name') ?? groupId
                 const about = tagValue(groupEvent, 'about') ?? 'NIP-29 group'
