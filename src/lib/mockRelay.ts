@@ -244,8 +244,8 @@ export class MockNip29Relay {
         const angle = timestamp / (1800 + (driftSeed % 900)) + index
         const vx = Math.cos(angle) * 0.55
         const vy = Math.sin(angle * 0.8) * 0.5
-        const x = Math.max(56, Math.min(map.cols * map.tileSize - 56, current.x + vx * 16))
-        const y = Math.max(56, Math.min(map.rows * map.tileSize - 56, current.y + vy * 16))
+        const x = current.x + vx * 28
+        const y = current.y + vy * 28
 
         this.publishPosition(user.pubkey, x, y, vx, vy, timestamp)
       })

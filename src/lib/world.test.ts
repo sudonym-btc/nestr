@@ -7,10 +7,12 @@ describe('office map generation', () => {
     expect(buildOfficeMap('product-floor', 10)).toEqual(buildOfficeMap('product-floor', 10))
   })
 
-  it('scales the world as population grows', () => {
+  it('keeps one infinite world regardless of population', () => {
     const small = buildOfficeMap('product-floor', 10)
     const large = buildOfficeMap('product-floor', 1000)
-    expect(large.cols * large.rows).toBeGreaterThan(small.cols * small.rows)
+    expect(small.infinite).toBe(true)
+    expect(large.infinite).toBe(true)
+    expect(large.cols * large.rows).toBe(small.cols * small.rows)
   })
 
   it('places a pubkey inside the generated office bounds', () => {

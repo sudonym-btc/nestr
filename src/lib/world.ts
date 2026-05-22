@@ -25,6 +25,7 @@ export interface OfficeFurniture {
 export interface OfficeMap {
   groupId: string
   seed: string
+  infinite: boolean
   cols: number
   rows: number
   tileSize: number
@@ -42,10 +43,6 @@ export interface WorldPosition {
   updatedAt: number
 }
 
-function clamp(value: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, value))
-}
-
 function hashSeed(value: string) {
   return bytesToHex(sha256(encoder.encode(value)))
 }
@@ -55,11 +52,10 @@ function numberFromHex(hex: string, start: number) {
 }
 
 export function buildOfficeMap(groupId: string, activeUsers: number): OfficeMap {
+  void activeUsers
   const seed = hashSeed(`nostr-office-v1:${groupId}`)
-  const population = Math.max(activeUsers, 8)
-  const spread = Math.ceil(Math.sqrt(population))
-  const cols = clamp(24 + spread * 4, 30, 96)
-  const rows = clamp(16 + spread * 3, 22, 72)
+  const cols = 48
+  const rows = 36
   const tileSize = 32
 
   const zones: OfficeZone[] = [
@@ -130,7 +126,7 @@ export function buildOfficeMap(groupId: string, activeUsers: number): OfficeMap 
     }
   })
 
-  return { groupId, seed, cols, rows, tileSize, zones, furniture }
+  return { groupId, seed, infinite: true, cols, rows, tileSize, zones, furniture }
 }
 
 export function spawnForPubkey(map: OfficeMap, pubkey: string, index = 0) {
@@ -146,8 +142,5 @@ export function spawnForPubkey(map: OfficeMap, pubkey: string, index = 0) {
 }
 
 export function mapCapacityLabel(activeUsers: number) {
-  if (activeUsers <= 16) return 'room'
-  if (activeUsers <= 80) return 'floor'
-  if (activeUsers <= 260) return 'campus'
-  return 'city'
+  return `${activeUsers} in infinite`
 }

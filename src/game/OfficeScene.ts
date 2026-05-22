@@ -15,21 +15,39 @@ export type MoveHandler = (position: Pick<WorldPosition, 'x' | 'y' | 'vx' | 'vy'
 interface AvatarNode {
   container: Phaser.GameObjects.Container
   label: Phaser.GameObjects.Text
+  tween?: Phaser.Tweens.Tween
 }
 
 function color(hex: string) {
   return Phaser.Display.Color.HexStringToColor(hex).color
 }
 
+function hashInt(value: string) {
+  let hash = 2166136261
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+  return hash >>> 0
+}
+
+function toneColor(tone: number) {
+  if (tone === 0) return 0xdbe7f0
+  if (tone === 1) return 0xe6ddf3
+  if (tone === 2) return 0xd8ebd8
+  return 0xf2ddbd
+}
+
 export class OfficeScene extends Phaser.Scene {
   private snapshot?: OfficeSceneSnapshot
   private onMove?: MoveHandler
   private floor?: Phaser.GameObjects.Graphics
+  private roomLabels: Phaser.GameObjects.Text[] = []
   private avatars = new Map<string, AvatarNode>()
   private keys?: Record<string, Phaser.Input.Keyboard.Key>
   private target?: Phaser.Math.Vector2
   private lastEmit = 0
-  private lastMapSeed = ''
+  private lastViewportKey = ''
 
   constructor(onMove?: MoveHandler) {
     super('OfficeScene')
@@ -43,11 +61,13 @@ export class OfficeScene extends Phaser.Scene {
   applySnapshot(snapshot: OfficeSceneSnapshot) {
     this.snapshot = snapshot
     if (!this.sys?.isActive()) return
-    this.redrawMap()
+    this.redrawViewport(true)
     this.syncAvatars()
   }
 
   create() {
+    this.floor = this.add.graphics()
+    this.floor.setDepth(-10000)
     this.keys = this.input.keyboard?.addKeys('W,A,S,D,UP,DOWN,LEFT,RIGHT') as Record<
       string,
       Phaser.Input.Keyboard.Key
@@ -59,13 +79,14 @@ export class OfficeScene extends Phaser.Scene {
     })
 
     if (this.snapshot) {
-      this.redrawMap()
+      this.redrawViewport(true)
       this.syncAvatars()
     }
   }
 
   update(time: number, delta: number) {
     if (!this.snapshot) return
+    this.redrawViewport()
 
     const selfPosition = this.snapshot.positions.find(
       (position) => position.pubkey === this.snapshot?.selfPubkey,
@@ -103,9 +124,8 @@ export class OfficeScene extends Phaser.Scene {
 
     if (vx === 0 && vy === 0) return
 
-    const map = this.snapshot.map
-    const nextX = Phaser.Math.Clamp(selfPosition.x + vx * speed, 48, map.cols * map.tileSize - 48)
-    const nextY = Phaser.Math.Clamp(selfPosition.y + vy * speed, 48, map.rows * map.tileSize - 48)
+    const nextX = selfPosition.x + vx * speed
+    const nextY = selfPosition.y + vy * speed
 
     selfPosition.x = nextX
     selfPosition.y = nextY
@@ -121,98 +141,145 @@ export class OfficeScene extends Phaser.Scene {
     }
   }
 
-  private redrawMap() {
-    if (!this.snapshot || this.lastMapSeed === this.snapshot.map.seed) return
-    this.lastMapSeed = this.snapshot.map.seed
-    this.floor?.destroy()
-    this.floor = this.add.graphics()
-    this.floor.clear()
-
+  private redrawViewport(force = false) {
+    if (!this.snapshot || !this.floor) return
     const { map } = this.snapshot
-    const width = map.cols * map.tileSize
-    const height = map.rows * map.tileSize
+    const camera = this.cameras.main
     const tile = map.tileSize
+    const margin = 180
+    const left = camera.scrollX - margin
+    const top = camera.scrollY - margin
+    const right = camera.scrollX + camera.width + margin
+    const bottom = camera.scrollY + camera.height + margin
+    const key = [
+      Math.floor(left / 96),
+      Math.floor(top / 96),
+      Math.ceil(right / 96),
+      Math.ceil(bottom / 96),
+      map.seed.slice(0, 8),
+    ].join(':')
 
-    this.floor.fillStyle(0xf7ecd9, 1)
-    this.floor.fillRect(0, 0, width, height)
+    if (!force && key === this.lastViewportKey) return
+    this.lastViewportKey = key
+    this.floor.clear()
+    this.roomLabels.forEach((label) => label.destroy())
+    this.roomLabels = []
 
-    for (let y = 0; y < map.rows; y += 1) {
-      for (let x = 0; x < map.cols; x += 1) {
-        const shade = (x + y) % 2 === 0 ? 0xf7ecd9 : 0xf3e5cf
+    this.floor.fillStyle(0xf2e7d2, 1)
+    this.floor.fillRect(left, top, right - left, bottom - top)
+
+    const startTileX = Math.floor(left / tile) - 1
+    const endTileX = Math.ceil(right / tile) + 1
+    const startTileY = Math.floor(top / tile) - 1
+    const endTileY = Math.ceil(bottom / tile) + 1
+
+    for (let y = startTileY; y <= endTileY; y += 1) {
+      for (let x = startTileX; x <= endTileX; x += 1) {
+        const shade = (x + y) % 2 === 0 ? 0xf4e9d5 : 0xeadcc3
+        const worldX = x * tile
+        const worldY = y * tile
         this.floor.fillStyle(shade, 1)
-        this.floor.fillRect(x * tile, y * tile, tile, tile)
+        this.floor.fillRect(worldX, worldY, tile, tile)
+        this.floor.lineStyle(1, 0xffffff, 0.17)
+        this.floor.lineBetween(worldX, worldY, worldX + tile, worldY)
+        this.floor.lineStyle(1, 0xbda989, 0.08)
+        this.floor.lineBetween(worldX + tile, worldY, worldX + tile, worldY + tile)
       }
     }
 
-    map.zones.forEach((zone) => {
-      const zoneColor =
-        zone.tone === 'work'
-          ? 0xdfe8f6
-          : zone.tone === 'meeting'
-            ? 0xe8e1f6
-            : zone.tone === 'garden'
-              ? 0xdbeedd
-              : 0xf4dfc3
+    this.drawVisibleRooms(left, top, right, bottom)
+  }
 
-      this.floor!.fillStyle(zoneColor, 0.76)
-      this.floor!.fillRoundedRect(
-        zone.x * tile,
-        zone.y * tile,
-        zone.width * tile,
-        zone.height * tile,
-        10,
-      )
-      this.floor!.lineStyle(2, 0xffffff, 0.65)
-      this.floor!.strokeRoundedRect(
-        zone.x * tile + 3,
-        zone.y * tile + 3,
-        zone.width * tile - 6,
-        zone.height * tile - 6,
-        10,
-      )
-      this.add
-        .text(zone.x * tile + 16, zone.y * tile + 12, zone.label, {
-          fontFamily: 'Inter, system-ui, sans-serif',
-          fontSize: '14px',
-          color: '#6f726d',
-          backgroundColor: 'rgba(255,255,255,0.52)',
-          padding: { x: 8, y: 4 },
-        })
-        .setDepth(3)
-    })
+  private drawVisibleRooms(left: number, top: number, right: number, bottom: number) {
+    if (!this.snapshot || !this.floor) return
+    const chunk = 520
+    const startX = Math.floor(left / chunk) - 1
+    const endX = Math.ceil(right / chunk) + 1
+    const startY = Math.floor(top / chunk) - 1
+    const endY = Math.ceil(bottom / chunk) + 1
+    const labels = ['Product', 'Studio', 'Garden', 'Lounge', 'Focus', 'Ops']
 
-    map.furniture.forEach((item) => {
-      const x = item.x * tile
-      const y = item.y * tile
-      const itemWidth = item.width * tile - 7
-      const itemHeight = item.height * tile - 7
+    for (let cy = startY; cy <= endY; cy += 1) {
+      for (let cx = startX; cx <= endX; cx += 1) {
+        const seed = hashInt(`${this.snapshot.map.seed}:${cx}:${cy}`)
+        if (seed % 5 === 0 && !(cx === 0 && cy === 0)) continue
+        const tone = seed % 4
+        const roomWidth = 260 + (seed % 190)
+        const roomHeight = 150 + ((seed >> 4) % 120)
+        const roomX = cx * chunk + 50 + ((seed >> 8) % Math.max(24, chunk - roomWidth - 70))
+        const roomY = cy * chunk + 48 + ((seed >> 16) % Math.max(24, chunk - roomHeight - 72))
+        const label = labels[seed % labels.length]
 
-      if (item.kind === 'plant') {
-        this.floor!.fillStyle(0x23694f, 0.92)
-        this.floor!.fillCircle(x + tile / 2, y + tile / 2, 10)
-        this.floor!.fillStyle(0xf1c46b, 1)
-        this.floor!.fillRect(x + 12, y + 20, 16, 7)
-        return
+        this.drawRaisedRoom(roomX, roomY, roomWidth, roomHeight, toneColor(tone), label)
+        this.drawRoomFurniture(roomX, roomY, roomWidth, roomHeight, seed)
       }
+    }
+  }
 
-      const fill =
-        item.kind === 'desk'
-          ? 0xfaf8f1
-          : item.kind === 'sofa'
-            ? 0xe6a86f
-            : item.kind === 'screen'
-              ? 0x51647d
-              : 0xcfd7d5
+  private drawRaisedRoom(x: number, y: number, width: number, height: number, fill: number, label: string) {
+    if (!this.floor) return
+    this.floor.fillStyle(0x806d51, 0.13)
+    this.floor.fillRoundedRect(x + 10, y + 16, width, height, 12)
+    this.floor.fillStyle(fill, 0.8)
+    this.floor.fillRoundedRect(x, y, width, height, 12)
+    this.floor.lineStyle(2, 0xffffff, 0.68)
+    this.floor.strokeRoundedRect(x + 3, y + 3, width - 6, height - 6, 10)
+    this.floor.lineStyle(3, 0xbaa98c, 0.18)
+    this.floor.lineBetween(x + 10, y + height - 5, x + width - 10, y + height - 5)
 
-      this.floor!.fillStyle(0x000000, 0.08)
-      this.floor!.fillRoundedRect(x + 4, y + 7, itemWidth, itemHeight, 5)
-      this.floor!.fillStyle(fill, 1)
-      this.floor!.fillRoundedRect(x, y, itemWidth, itemHeight, 5)
-      this.floor!.lineStyle(1, 0xd2c5b4, 1)
-      this.floor!.strokeRoundedRect(x, y, itemWidth, itemHeight, 5)
-    })
+    const text = this.add
+      .text(x + 16, y + 14, label, {
+        fontFamily: 'Inter, system-ui, sans-serif',
+        fontSize: '13px',
+        color: '#687066',
+        backgroundColor: 'rgba(255,255,255,0.58)',
+        padding: { x: 8, y: 4 },
+      })
+      .setDepth(-9000)
+    this.roomLabels.push(text)
+  }
 
-    this.cameras.main.setBounds(0, 0, width, height)
+  private drawRoomFurniture(x: number, y: number, width: number, height: number, seed: number) {
+    const count = 4 + (seed % 5)
+    for (let index = 0; index < count; index += 1) {
+      const itemSeed = hashInt(`${seed}:${index}`)
+      const itemX = x + 44 + (itemSeed % Math.max(32, width - 120))
+      const itemY = y + 54 + ((itemSeed >> 8) % Math.max(28, height - 94))
+      const kind = itemSeed % 5
+      if (kind === 0) {
+        this.drawPlant(itemX, itemY)
+      } else if (kind === 1) {
+        this.drawCuboid(itemX, itemY, 92, 24, 0xe7a969, 0xc6844b)
+      } else if (kind === 2) {
+        this.drawCuboid(itemX, itemY, 54, 42, 0x66758a, 0x43546c)
+      } else {
+        this.drawCuboid(itemX, itemY, 58, 22, 0xfffcf4, 0xd4c9b7)
+      }
+    }
+  }
+
+  private drawCuboid(x: number, y: number, width: number, height: number, top: number, front: number) {
+    if (!this.floor) return
+    this.floor.fillStyle(0x000000, 0.1)
+    this.floor.fillRoundedRect(x + 6, y + 10, width, height + 10, 5)
+    this.floor.fillStyle(front, 1)
+    this.floor.fillRoundedRect(x, y + 12, width, height, 5)
+    this.floor.fillStyle(top, 1)
+    this.floor.fillRoundedRect(x, y, width, height, 5)
+    this.floor.lineStyle(1, 0xffffff, 0.6)
+    this.floor.lineBetween(x + 5, y + 4, x + width - 7, y + 4)
+    this.floor.lineStyle(1, 0x8f7e65, 0.2)
+    this.floor.strokeRoundedRect(x, y, width, height + 12, 5)
+  }
+
+  private drawPlant(x: number, y: number) {
+    if (!this.floor) return
+    this.floor.fillStyle(0x2b6b55, 0.95)
+    this.floor.fillCircle(x + 12, y + 8, 12)
+    this.floor.fillCircle(x + 26, y + 13, 11)
+    this.floor.fillCircle(x + 18, y + 24, 10)
+    this.floor.fillStyle(0xd7974d, 1)
+    this.floor.fillRoundedRect(x + 10, y + 25, 24, 12, 3)
   }
 
   private syncAvatars() {
@@ -234,8 +301,32 @@ export class OfficeScene extends Phaser.Scene {
       const existing = this.avatars.get(position.pubkey)
 
       if (existing) {
-        existing.container.setPosition(position.x, position.y)
-        existing.container.setDepth(position.y)
+        if (position.pubkey === this.snapshot?.selfPubkey) {
+          existing.tween?.stop()
+          existing.container.setPosition(position.x, position.y)
+          existing.container.setDepth(position.y)
+        } else {
+          const jump = Phaser.Math.Distance.Between(
+            existing.container.x,
+            existing.container.y,
+            position.x,
+            position.y,
+          )
+          existing.tween?.stop()
+          if (jump > 520) {
+            existing.container.setPosition(position.x, position.y)
+            existing.container.setDepth(position.y)
+          } else {
+            existing.tween = this.tweens.add({
+              targets: existing.container,
+              x: position.x,
+              y: position.y,
+              duration: 760,
+              ease: 'Sine.easeInOut',
+              onUpdate: () => existing.container.setDepth(existing.container.y),
+            })
+          }
+        }
         existing.label.setText(user.pubkey === this.snapshot?.selfPubkey ? 'You' : user.name)
         return
       }

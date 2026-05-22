@@ -6,10 +6,13 @@ Nestr is a small NIP-29 spatial-office prototype for Nostr users. Any relay-base
 
 - React + TypeScript app shell
 - Phaser-powered walkable office canvas
+- Infinite viewport-driven office generation with 2.5D rooms and furniture
 - Mock relay that simulates NIP-29 group metadata, members, roles, and global chat
 - Ephemeral `kind:25029` avatar movement events with client-side presence state
+- Tweened remote avatar movement
 - Deterministic avatars derived from each user's npub/pubkey
 - P2P WebRTC mesh pressure estimator for proximity calls
+- Mock WebRTC call grid with generated remote peer video streams and fullscreen mode
 - Vitest logic coverage and a Playwright smoke test with screenshot output
 
 ## Scripts

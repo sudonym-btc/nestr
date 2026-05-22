@@ -2,8 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } fro
 import {
   LockKeyhole,
   LogIn,
+  Maximize2,
   MessageCircle,
   Mic,
+  Minimize2,
   Radio,
   Send,
   Users,
@@ -14,6 +16,7 @@ import { PhaserOffice } from './game/PhaserOffice'
 import { avatarCss, npubForPubkey, shortNpub } from './lib/avatar'
 import { createMockRelay, type MockUser, type RelaySnapshot } from './lib/mockRelay'
 import { hasTag, tagValue } from './lib/nostr'
+import { createMockPeerVideo, type MockPeerVideo } from './lib/mockVideo'
 import { estimateWebRtcMesh, meshHealth, nearbyPeers } from './lib/videoMesh'
 import { buildOfficeMap, mapCapacityLabel } from './lib/world'
 
@@ -25,6 +28,33 @@ function groupTagLabel(snapshot: RelaySnapshot, tag: string) {
   return hasTag(snapshot.group.metadata, tag) ? tag : `open ${tag}`
 }
 
+interface StreamTileProps {
+  label: string
+  sublabel: string
+  stream: MediaStream | null
+  muted?: boolean
+}
+
+function StreamTile({ label, sublabel, stream, muted = false }: StreamTileProps) {
+  const videoRef = useRef<HTMLVideoElement | null>(null)
+
+  useEffect(() => {
+    if (videoRef.current) {
+      videoRef.current.srcObject = stream
+    }
+  }, [stream])
+
+  return (
+    <article className={`stream-tile ${stream ? '' : 'empty'}`}>
+      {stream ? <video ref={videoRef} autoPlay muted={muted} playsInline /> : <div className="stream-empty" />}
+      <div className="stream-label">
+        <strong>{label}</strong>
+        <span>{sublabel}</span>
+      </div>
+    </article>
+  )
+}
+
 function App() {
   const relay = useMemo(() => createMockRelay(), [])
   const [snapshot, setSnapshot] = useState(() => relay.snapshot())
@@ -34,7 +64,9 @@ function App() {
   const [callStarted, setCallStarted] = useState(false)
   const [mediaState, setMediaState] = useState<'idle' | 'requesting' | 'live' | 'blocked'>('idle')
   const [localStream, setLocalStream] = useState<MediaStream | null>(null)
-  const localVideoRef = useRef<HTMLVideoElement | null>(null)
+  const [remoteVideos, setRemoteVideos] = useState<MockPeerVideo[]>([])
+  const [callExpanded, setCallExpanded] = useState(false)
+  const callStageRef = useRef<HTMLDivElement | null>(null)
 
   const activeCount = Math.max(snapshot.positions.length, snapshot.users.length)
   const officeMap = useMemo(
@@ -47,28 +79,49 @@ function App() {
   const metadataName = tagValue(snapshot.group.metadata, 'name') ?? 'NIP-29 office'
   const groupAbout = tagValue(snapshot.group.metadata, 'about') ?? ''
   const currentUser = snapshot.users.find((user) => user.pubkey === selfPubkey)
+  const callPeers = useMemo(() => {
+    const nearbyPubkeys = nearby.map((peer) => peer.pubkey)
+    const fallbackPubkeys = snapshot.users
+      .filter((user) => user.pubkey !== selfPubkey)
+      .slice(0, 4)
+      .map((user) => user.pubkey)
+    const pubkeys = (nearbyPubkeys.length > 0 ? nearbyPubkeys : fallbackPubkeys).slice(0, 5)
+
+    return pubkeys.map((pubkey) => ({
+      pubkey,
+      name: nameFor(pubkey, snapshot.users),
+    }))
+  }, [nearby, selfPubkey, snapshot.users])
+  const displayedMesh = estimateWebRtcMesh((callStarted ? callPeers.length : nearby.length) + 1)
 
   useEffect(() => relay.subscribe((next) => setSnapshot(next)), [relay])
 
   useEffect(() => {
     const timer = window.setInterval(() => {
       relay.tickBots(selfPubkey, officeMap)
-    }, 900)
+    }, 560)
 
     return () => window.clearInterval(timer)
   }, [officeMap, relay, selfPubkey])
-
-  useEffect(() => {
-    if (localVideoRef.current) {
-      localVideoRef.current.srcObject = localStream
-    }
-  }, [localStream])
 
   useEffect(() => {
     return () => {
       localStream?.getTracks().forEach((track) => track.stop())
     }
   }, [localStream])
+
+  useEffect(() => {
+    return () => remoteVideos.forEach((video) => video.stop())
+  }, [remoteVideos])
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setCallExpanded(document.fullscreenElement === callStageRef.current)
+    }
+
+    document.addEventListener('fullscreenchange', handleFullscreenChange)
+    return () => document.removeEventListener('fullscreenchange', handleFullscreenChange)
+  }, [])
 
   const handleMove = useCallback(
     (position: { x: number; y: number; vx: number; vy: number }) => {
@@ -83,6 +136,9 @@ function App() {
     setSelfPubkey(user.pubkey)
     setNpubInput(user.npub)
     setCallStarted(false)
+    remoteVideos.forEach((video) => video.stop())
+    setRemoteVideos([])
+    setCallExpanded(false)
   }
 
   function sendMessage(event: FormEvent) {
@@ -94,13 +150,18 @@ function App() {
   async function toggleCall() {
     if (callStarted) {
       localStream?.getTracks().forEach((track) => track.stop())
+      remoteVideos.forEach((video) => video.stop())
       setLocalStream(null)
+      setRemoteVideos([])
       setCallStarted(false)
+      setCallExpanded(false)
       setMediaState('idle')
       return
     }
 
     setMediaState('requesting')
+    remoteVideos.forEach((video) => video.stop())
+    setRemoteVideos(callPeers.map((peer) => createMockPeerVideo(peer.pubkey, peer.name)))
     setCallStarted(true)
 
     try {
@@ -115,6 +176,24 @@ function App() {
       setMediaState('live')
     } catch {
       setMediaState('blocked')
+    }
+  }
+
+  async function toggleCallFullscreen() {
+    const element = callStageRef.current
+    if (!element) return
+
+    if (document.fullscreenElement) {
+      await document.exitFullscreen()
+      setCallExpanded(false)
+      return
+    }
+
+    setCallExpanded(true)
+    try {
+      await element.requestFullscreen()
+    } catch {
+      setCallExpanded(true)
     }
   }
 
@@ -173,12 +252,12 @@ function App() {
           <div className="mesh-card">
             <div>
               <strong>{callStarted ? 'P2P live' : nearby.length ? 'P2P ready' : 'Idle'}</strong>
-              <p>{mesh.connections} links · {mesh.estimatedUploadMbps} Mbps uplink</p>
+              <p>{displayedMesh.connections} links · {displayedMesh.estimatedUploadMbps} Mbps uplink</p>
             </div>
             <button
               type="button"
               className="primary-action"
-              disabled={nearby.length === 0}
+              disabled={callPeers.length === 0}
               onClick={toggleCall}
               aria-label={callStarted ? 'Leave call' : 'Start call'}
             >
@@ -192,15 +271,7 @@ function App() {
             ))}
             {nearby.length === 0 && <span>Open space</span>}
           </div>
-          {callStarted && (
-            <div className="video-dock" data-state={mediaState}>
-              <video ref={localVideoRef} autoPlay muted playsInline />
-              <div className="video-copy">
-                <strong>{mediaState === 'live' ? 'Local camera' : 'Media pending'}</strong>
-                <span>{mediaState === 'blocked' ? 'Permission blocked' : `${mesh.participants} peer mesh`}</span>
-              </div>
-            </div>
-          )}
+          {callStarted && <p className="call-note">{remoteVideos.length} mock peers streaming test video</p>}
         </section>
 
         <section className="panel-section people-list">
@@ -217,6 +288,9 @@ function App() {
                 setSelfPubkey(user.pubkey)
                 setNpubInput(user.npub)
                 setCallStarted(false)
+                remoteVideos.forEach((video) => video.stop())
+                setRemoteVideos([])
+                setCallExpanded(false)
               }}
             >
               <span className="avatar-chip" style={avatarCss(user.pubkey)} />
@@ -237,7 +311,7 @@ function App() {
           </div>
           <div className="topbar-meta">
             <span>{snapshot.group.relay}</span>
-            <span>{officeMap.cols}x{officeMap.rows}</span>
+            <span>{officeMap.infinite ? 'infinite' : `${officeMap.cols}x${officeMap.rows}`}</span>
           </div>
         </div>
         <PhaserOffice
@@ -253,6 +327,50 @@ function App() {
           <span>{currentUser?.name ?? 'guest'}</span>
           <span>{shortNpub(selfPubkey)}</span>
         </div>
+        {callStarted && (
+          <section
+            ref={callStageRef}
+            className={`call-stage ${callExpanded ? 'expanded' : ''}`}
+            aria-label="Mock WebRTC call"
+          >
+            <div className="call-stage-bar">
+              <div>
+                <strong>Mock WebRTC mesh</strong>
+                <span>{displayedMesh.participants} participants · Nostr-signaled proximity call</span>
+              </div>
+              <button
+                type="button"
+                className="icon-button"
+                onClick={toggleCallFullscreen}
+                aria-label={callExpanded ? 'Exit fullscreen call' : 'Fullscreen call'}
+              >
+                {callExpanded ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+              </button>
+            </div>
+            <div className="stream-grid">
+              <StreamTile
+                label={currentUser?.name ?? 'You'}
+                sublabel={
+                  mediaState === 'live'
+                    ? 'local camera'
+                    : mediaState === 'blocked'
+                      ? 'camera blocked'
+                      : 'requesting camera'
+                }
+                stream={localStream}
+                muted
+              />
+              {remoteVideos.map((video) => (
+                <StreamTile
+                  key={video.pubkey}
+                  label={video.name}
+                  sublabel="mock peer stream"
+                  stream={video.stream}
+                />
+              ))}
+            </div>
+          </section>
+        )}
       </section>
 
       <aside className="side-panel chat-panel" aria-label="Global NIP-29 chat">

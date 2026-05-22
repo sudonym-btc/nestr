@@ -30,8 +30,8 @@ export function PhaserOffice({ snapshot, onMove }: PhaserOfficeProps) {
         autoCenter: Phaser.Scale.CENTER_BOTH,
       },
       render: {
-        antialias: false,
-        pixelArt: true,
+        antialias: true,
+        pixelArt: false,
       },
     })
 

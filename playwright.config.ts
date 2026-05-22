@@ -5,6 +5,10 @@ export default defineConfig({
   timeout: 30_000,
   use: {
     baseURL: 'http://127.0.0.1:5173',
+    permissions: ['camera', 'microphone'],
+    launchOptions: {
+      args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream'],
+    },
     trace: 'on-first-retry',
   },
   webServer: {
