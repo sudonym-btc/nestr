@@ -273,22 +273,33 @@ function normalizeObject(object: THREE.Object3D, spec: AssetSpec, scaleMultiplie
 
 function roundedRectShape(width: number, depth: number, radius: number) {
   const shape = new THREE.Shape()
+  drawRoundedPath(shape, width, depth, radius)
+  return shape
+}
+
+function roundedRectPath(width: number, depth: number, radius: number) {
+  const path = new THREE.Path()
+  drawRoundedPath(path, width, depth, radius)
+  return path
+}
+
+function drawRoundedPath(path: THREE.Path, width: number, depth: number, radius: number) {
   const x = -width / 2
   const y = -depth / 2
   const right = width / 2
   const bottom = depth / 2
   const r = Math.min(radius, width / 2, depth / 2)
 
-  shape.moveTo(x + r, y)
-  shape.lineTo(right - r, y)
-  shape.quadraticCurveTo(right, y, right, y + r)
-  shape.lineTo(right, bottom - r)
-  shape.quadraticCurveTo(right, bottom, right - r, bottom)
-  shape.lineTo(x + r, bottom)
-  shape.quadraticCurveTo(x, bottom, x, bottom - r)
-  shape.lineTo(x, y + r)
-  shape.quadraticCurveTo(x, y, x + r, y)
-  return shape
+  path.moveTo(x + r, y)
+  path.lineTo(right - r, y)
+  path.quadraticCurveTo(right, y, right, y + r)
+  path.lineTo(right, bottom - r)
+  path.quadraticCurveTo(right, bottom, right - r, bottom)
+  path.lineTo(x + r, bottom)
+  path.quadraticCurveTo(x, bottom, x, bottom - r)
+  path.lineTo(x, y + r)
+  path.quadraticCurveTo(x, y, x + r, y)
+  path.closePath()
 }
 
 function makeRoundedPlane(width: number, depth: number, radius: number, material: THREE.Material) {
@@ -302,27 +313,25 @@ function makeRoundedPlane(width: number, depth: number, radius: number, material
 function makeRoomWall(width: number, depth: number) {
   const group = new THREE.Group()
   const height = 0.72
-  const thickness = 0.28
-  const gap = Math.min(2.4, width * 0.24)
-  const northLeft = new THREE.Mesh(new THREE.BoxGeometry((width - gap) / 2, height, thickness), wallMaterial)
-  const northRight = northLeft.clone()
-  const south = new THREE.Mesh(new THREE.BoxGeometry(width, height, thickness), wallMaterial)
-  const west = new THREE.Mesh(new THREE.BoxGeometry(thickness, height, depth), wallMaterial)
-  const east = west.clone()
-
-  northLeft.position.set(-(gap + width) / 4, height / 2, -depth / 2)
-  northRight.position.set((gap + width) / 4, height / 2, -depth / 2)
-  south.position.set(0, height / 2, depth / 2)
-  west.position.set(-width / 2, height / 2, 0)
-  east.position.set(width / 2, height / 2, 0)
-  ;[northLeft, northRight, south, west, east].forEach((mesh) => {
-    mesh.castShadow = true
-    mesh.receiveShadow = true
-    group.add(mesh)
+  const thickness = 0.34
+  const outer = roundedRectShape(width + thickness * 1.2, depth + thickness * 1.2, 1.16)
+  outer.holes.push(roundedRectPath(width - thickness * 1.18, depth - thickness * 1.18, 0.86))
+  const geometry = new THREE.ExtrudeGeometry(outer, {
+    depth: height,
+    bevelEnabled: false,
+    curveSegments: 24,
+    steps: 1,
   })
+  geometry.rotateX(-Math.PI / 2)
+  const ring = new THREE.Mesh(geometry, wallMaterial)
+  ring.castShadow = true
+  ring.receiveShadow = true
+  group.add(ring)
 
-  const glass = new THREE.Mesh(new THREE.BoxGeometry(gap, 1.1, thickness * 0.42), glassMaterial)
-  glass.position.set(0, 0.72, -depth / 2)
+  const glass = makeRoundedPlane(width - 0.86, depth - 0.86, 0.82, glassMaterial)
+  glass.position.y = 0.62
+  glass.scale.y = 0.94
+  glass.visible = false
   group.add(glass)
   return group
 }
@@ -899,17 +908,20 @@ class ThreeOffice {
   }
 
   private addLights() {
-    const hemisphere = new THREE.HemisphereLight(0xffffff, 0xcfd6cf, 1.32)
+    const ambient = new THREE.AmbientLight(0xffffff, 1.45)
+    this.scene.add(ambient)
+
+    const hemisphere = new THREE.HemisphereLight(0xffffff, 0xd9ddd6, 1.2)
     this.scene.add(hemisphere)
 
-    const sun = new THREE.DirectionalLight(0xfff2dd, 4.85)
-    sun.position.set(-36, 25, -24)
+    const sun = new THREE.DirectionalLight(0xffffff, 1.65)
+    sun.position.set(-4, 48, -4)
     sun.castShadow = true
     sun.shadow.mapSize.set(2048, 2048)
     sun.shadow.bias = -0.00005
-    sun.shadow.normalBias = 0.07
-    sun.shadow.radius = 24
-    sun.shadow.blurSamples = 32
+    sun.shadow.normalBias = 0.12
+    sun.shadow.radius = 32
+    sun.shadow.blurSamples = 40
     sun.shadow.camera.near = 2
     sun.shadow.camera.far = 96
     sun.shadow.camera.left = -52
@@ -918,8 +930,8 @@ class ThreeOffice {
     sun.shadow.camera.bottom = -52
     this.scene.add(sun)
 
-    const fill = new THREE.DirectionalLight(0xe3ecff, 0.92)
-    fill.position.set(22, 18, 26)
+    const fill = new THREE.DirectionalLight(0xe7edf7, 0.55)
+    fill.position.set(18, 36, 22)
     this.scene.add(fill)
   }
 
@@ -1089,7 +1101,7 @@ class ThreeOffice {
     this.lastWorldKey = key
     this.worldRoot.clear()
 
-    this.addSunlightBands()
+    this.addSoftFloorWash()
     const candidates: RoomPlan[] = []
     for (let chunkZ = centerZ - ROOM_RANGE; chunkZ <= centerZ + ROOM_RANGE; chunkZ += 1) {
       for (let chunkX = centerX - ROOM_RANGE; chunkX <= centerX + ROOM_RANGE; chunkX += 1) {
@@ -1116,32 +1128,17 @@ class ThreeOffice {
     rooms.forEach((room) => this.addRoom(room))
   }
 
-  private addSunlightBands() {
+  private addSoftFloorWash() {
     const lightMaterial = new THREE.MeshBasicMaterial({
       color: 0xffffff,
-      opacity: 0.18,
-      transparent: true,
-      depthWrite: false,
-    })
-    const shadeMaterial = new THREE.MeshBasicMaterial({
-      color: 0x9a9a94,
       opacity: 0.055,
       transparent: true,
       depthWrite: false,
     })
-    for (let index = -3; index <= 3; index += 1) {
-      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(9, 150), lightMaterial)
-      mesh.rotation.x = -Math.PI / 2
-      mesh.rotation.z = -0.72
-      mesh.position.set(this.cameraCenter.x + index * 27 + 7, 0.021, this.cameraCenter.z - 4)
-      this.worldRoot.add(mesh)
-
-      const shade = new THREE.Mesh(new THREE.PlaneGeometry(6, 150), shadeMaterial)
-      shade.rotation.x = -Math.PI / 2
-      shade.rotation.z = -0.72
-      shade.position.set(this.cameraCenter.x + index * 27 + 18, 0.022, this.cameraCenter.z - 2)
-      this.worldRoot.add(shade)
-    }
+    const mesh = new THREE.Mesh(new THREE.CircleGeometry(46, 72), lightMaterial)
+    mesh.rotation.x = -Math.PI / 2
+    mesh.position.set(this.cameraCenter.x, 0.021, this.cameraCenter.z)
+    this.worldRoot.add(mesh)
   }
 
   private addRoom(room: RoomPlan) {

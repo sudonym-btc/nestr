@@ -138,8 +138,8 @@ export class LiveNip29Relay {
       relay: relayUrl,
       metadata: placeholderEvent(39000, relayPubkey, [
         ['d', placeholderGroupId],
-        ['name', groupId ? 'Live NIP-29 Office' : 'Relay Directory'],
-        ['about', groupId ? `${groupId} on ${relayUrl}` : `NIP-29 groups on ${relayUrl}`],
+        ['name', groupId ? 'Live Chatroom' : 'Relay Directory'],
+        ['about', groupId ? `${groupId} on ${relayUrl}` : `Chatrooms on ${relayUrl}`],
         ['restricted'],
         ['office', '1'],
       ]),
@@ -344,8 +344,38 @@ export class LiveNip29Relay {
     return this.publishNip29Event(pubkey, NIP29_KINDS.deleteEvent, [['e', eventId]], content, false)
   }
 
-  async publishCreateGroup(pubkey: string, content = '') {
-    return this.publishNip29Event(pubkey, NIP29_KINDS.createGroup, [], content, false)
+  async publishCreateGroup(pubkey: string, content = '', targetGroupId = this.groupId) {
+    const groupId = targetGroupId.trim()
+    if (!groupId) return { ok: false, reason: 'chatroom-id-required' }
+    if (!this.signer || this.signer.pubkey !== pubkey || !this.relay) {
+      return { ok: false, reason: 'live-signer-required' }
+    }
+
+    let event: NestrEvent
+    try {
+      event = await this.signer.signEvent({
+        kind: NIP29_KINDS.createGroup,
+        created_at: now(),
+        tags: [groupTag(groupId), ['client', 'nestr']],
+        content: content.trim(),
+      })
+    } catch (error) {
+      this.connectionMessage = error instanceof Error ? error.message : String(error)
+      this.emit()
+      return { ok: false, reason: this.connectionMessage }
+    }
+
+    const result = await this.publishSigned(event, false)
+    if (result.ok) {
+      const label = content.trim() || groupId
+      this.relayGroups.set(groupId, placeholderEvent(39000, this.signer.pubkey, [
+        ['d', groupId],
+        ['name', label],
+        ['about', `Created on ${this.relayUrl}`],
+      ]))
+      this.emit()
+    }
+    return result
   }
 
   async publishDeleteGroup(pubkey: string, content = '') {
@@ -409,7 +439,7 @@ export class LiveNip29Relay {
       onevent: (event) => this.receive(event as NestrEvent),
       onclose: (reason) => {
         if (reason?.startsWith('auth-required') && this.signer) {
-          this.connectionMessage = 'relay requested NIP-42 auth'
+          this.connectionMessage = 'relay requested auth'
           this.emit()
           void this.authenticateAndRefetch()
           return
@@ -436,7 +466,7 @@ export class LiveNip29Relay {
         },
         onclose: (reason) => {
           if (reason?.startsWith('auth-required') && this.signer) {
-            this.connectionMessage = 'relay requested NIP-42 auth for DMs'
+            this.connectionMessage = 'relay requested auth for direct messages'
             this.emit()
             void this.authenticateAndRefetch().then(() => this.openDmSubscription())
           }
@@ -501,16 +531,16 @@ export class LiveNip29Relay {
     try {
       await this.relay.auth(relayAuthSigner(this.signer))
       this.connectionStatus = 'authenticated'
-      this.connectionMessage = `NIP-42 authenticated as ${shortNpub(this.signer.pubkey)}`
+      this.connectionMessage = `relay authenticated as ${shortNpub(this.signer.pubkey)}`
       this.openGroupSubscription()
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       if (message.includes('no challenge')) {
         this.connectionStatus = 'connected'
-        this.connectionMessage = 'signer connected; relay has not sent a NIP-42 challenge'
+        this.connectionMessage = 'signer connected; relay has not sent an auth challenge'
       } else {
         this.connectionStatus = 'connected'
-        this.connectionMessage = `NIP-42 auth failed: ${message}`
+        this.connectionMessage = `relay auth failed: ${message}`
       }
     }
 
@@ -850,7 +880,7 @@ export class LiveNip29Relay {
         if (event.kind === 10063) this.receiveBlossomServers(event)
       })
     } catch {
-      // Profile metadata is best-effort; NIP-29 membership still comes from the group relay.
+      // Profile details are best-effort; membership still comes from the group relay.
     }
 
     if (this.profileQueue.size > 0) {

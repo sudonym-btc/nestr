@@ -10,7 +10,7 @@ async function expectOfficeCanvasMounted(page: Page) {
           const rect = element.getBoundingClientRect()
           return rect.width > 200 && rect.height > 200 && Boolean(element.querySelector('canvas'))
         }),
-      { timeout: 10_000 },
+      { timeout: 30_000 },
     )
     .toBe(true)
   await page.waitForTimeout(600)

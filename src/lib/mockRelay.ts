@@ -126,6 +126,7 @@ export class MockNip29Relay {
   private readonly listeners = new Set<RelayListener>()
   private readonly events: NestrEvent[] = []
   private readonly directMessages: NestrDirectMessage[] = []
+  private readonly relayGroupEvents = new Map<string, NestrEvent>()
   private readonly users = new Map<string, MockUser>()
   private readonly positions = new Map<string, WorldPosition>()
   private readonly activityAt = new Map<string, number>()
@@ -140,6 +141,7 @@ export class MockNip29Relay {
     this.adminRoles.set(demoUsers[0].pubkey, ['admin'])
     this.adminRoles.set(demoUsers[1].pubkey, ['moderator'])
     this.group = this.createGroup()
+    this.relayGroupEvents.set(this.groupId, this.group.metadata)
     demoUsers.forEach((user, index) => this.addSeedUser(user, index))
     this.seedMessages()
     this.seedDirectMessages()
@@ -160,7 +162,7 @@ export class MockNip29Relay {
       connectionStatus: 'mock',
       connectionMessage: 'local mock relay',
       group: this.group,
-      relayGroups: [this.group.metadata],
+      relayGroups: Array.from(this.relayGroupEvents.values()),
       users: Array.from(this.users.values()),
       messages,
       directMessages: this.directMessages.slice().sort((a, b) => a.createdAt - b.createdAt),
@@ -340,8 +342,24 @@ export class MockNip29Relay {
     return this.publishAdminEvent(pubkey, NIP29_KINDS.deleteEvent, [['e', eventId]], content)
   }
 
-  publishCreateGroup(pubkey: string, content = '') {
-    return this.publishAdminEvent(pubkey, NIP29_KINDS.createGroup, [], content)
+  publishCreateGroup(pubkey: string, content = '', targetGroupId = this.groupId) {
+    const groupId = targetGroupId.trim()
+    if (!groupId) return { ok: false, reason: 'chatroom-id-required' }
+    if (!this.canModerate(pubkey, NIP29_KINDS.createGroup)) {
+      return { ok: false, reason: 'restricted: signer cannot create chatrooms' }
+    }
+
+    const event = this.signUserEvent(pubkey, NIP29_KINDS.createGroup, [
+      groupTag(groupId),
+      ['client', 'nestr'],
+    ], content.trim())
+
+    if (groupId === this.groupId) return this.publish(event)
+
+    this.events.push(event)
+    this.relayGroupEvents.set(groupId, this.createGroupMetadata(groupId, content.trim()))
+    this.emit(event)
+    return { ok: true, event }
   }
 
   publishDeleteGroup(pubkey: string, content = '') {
@@ -364,7 +382,7 @@ export class MockNip29Relay {
     }
 
     if (isNip29ModerationKind(event.kind) && !this.canModerate(event.pubkey, event.kind)) {
-      return { ok: false, reason: 'restricted: signer cannot perform this NIP-29 action' }
+      return { ok: false, reason: 'restricted: signer cannot perform this chatroom action' }
     }
 
     if (event.kind === OFFICE_KINDS.avatarPosition) {
@@ -555,6 +573,7 @@ export class MockNip29Relay {
           this.relaySecret,
         ),
       }
+      this.relayGroupEvents.set(this.groupId, this.group.metadata)
     }
 
     if (event.kind === NIP29_KINDS.deleteEvent) {
@@ -564,32 +583,7 @@ export class MockNip29Relay {
   }
 
   private createGroup(): Nip29Group {
-    const metadata = sign(
-      {
-        kind: NIP29_KINDS.groupMetadata,
-        pubkey: this.relayPubkey,
-        created_at: now(),
-        tags: [
-          ...metadataTags(
-            this.groupId,
-            {
-              name: 'Nestr Design Office',
-              about: 'A relay-native spatial room',
-              picture: 'https://placehold.co/128x128/f4f1e9/171922?text=N',
-              private: false,
-              restricted: true,
-              closed: false,
-              hidden: false,
-            },
-            'd',
-          ),
-          ['office', '1'],
-          ['office-map', 'nostr-office-v1'],
-        ],
-        content: '',
-      },
-      this.relaySecret,
-    )
+    const metadata = this.createGroupMetadata(this.groupId, 'Nestr Design Office', 'A relay-native spatial room')
 
     const admins = sign(
       {
@@ -633,6 +627,35 @@ export class MockNip29Relay {
     )
 
     return { id: this.groupId, relay: this.relayUrl, metadata, admins, members, roles }
+  }
+
+  private createGroupMetadata(groupId: string, name = groupId, about = 'Created from Nestr'): NestrEvent {
+    return sign(
+      {
+        kind: NIP29_KINDS.groupMetadata,
+        pubkey: this.relayPubkey,
+        created_at: now(),
+        tags: [
+          ...metadataTags(
+            groupId,
+            {
+              name: name.trim() || groupId,
+              about,
+              picture: 'https://placehold.co/128x128/f4f1e9/171922?text=N',
+              private: false,
+              restricted: true,
+              closed: false,
+              hidden: false,
+            },
+            'd',
+          ),
+          ['office', '1'],
+          ['office-map', 'nostr-office-v1'],
+        ],
+        content: '',
+      },
+      this.relaySecret,
+    )
   }
 
   private refreshGroupStateEvents() {
@@ -698,7 +721,7 @@ export class MockNip29Relay {
       counterparty: peer.pubkey,
       senderPubkey: peer.pubkey,
       recipientPubkey: self.pubkey,
-      content: 'DMs ride as NIP-17 in live mode. Mock mode keeps the thread readable.',
+      content: 'Direct messages are encrypted in live mode. Mock mode keeps the thread readable.',
       createdAt,
       protocol: 'mock',
     })

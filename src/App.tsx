@@ -110,6 +110,12 @@ function randomInviteCode() {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
+function randomGroupId() {
+  const bytes = new Uint8Array(8)
+  crypto.getRandomValues(bytes)
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
 function relayHostLabel(relayUrl: string) {
   try {
     return new URL(relayUrl).host
@@ -334,10 +340,13 @@ function App() {
   const [targetRoles, setTargetRoles] = useState('')
   const [eventIdInput, setEventIdInput] = useState('')
   const [inviteCode, setInviteCode] = useState(() => randomInviteCode())
+  const [newGroupName, setNewGroupName] = useState('')
+  const [newGroupId, setNewGroupId] = useState(() => randomGroupId())
   const [metadataEdits, setMetadataEdits] = useState<Partial<Nip29MetadataDraft>>({})
   const [connectSession, setConnectSession] = useState<NostrConnectSession | null>(null)
   const [nostrConnectQr, setNostrConnectQr] = useState<string | null>(null)
   const [authPrompt, setAuthPrompt] = useState<AuthPrompt | null>(null)
+  const [showCreateGroupDialog, setShowCreateGroupDialog] = useState(false)
   const callStageRef = useRef<HTMLDivElement | null>(null)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
   const dmMessagesEndRef = useRef<HTMLDivElement | null>(null)
@@ -1030,8 +1039,22 @@ function App() {
     if (ok) setInviteCode(randomInviteCode())
   }
 
-  async function createGroup() {
-    await runNip29Action('create-group', () => relay.publishCreateGroup(selfPubkey, 'group created from nestr'))
+  async function createGroup(targetGroupId = snapshot.group.id, name = 'chatroom created from nestr') {
+    await runNip29Action('create chatroom', () => relay.publishCreateGroup(selfPubkey, name, targetGroupId))
+  }
+
+  async function createRelayGroup(event: FormEvent) {
+    event.preventDefault()
+    const groupId = newGroupId.trim() || randomGroupId()
+    const groupName = newGroupName.trim() || groupId
+    const ok = await runNip29Action('create chatroom', () =>
+      relay.publishCreateGroup(selfPubkey, groupName, groupId),
+    )
+    if (ok) {
+      setNewGroupName('')
+      setNewGroupId(randomGroupId())
+      setShowCreateGroupDialog(false)
+    }
   }
 
   async function deleteGroup() {
@@ -1282,6 +1305,45 @@ function App() {
           </DialogContent>
         </Dialog>
       )}
+
+      <Dialog open={showCreateGroupDialog} onOpenChange={setShowCreateGroupDialog}>
+        <DialogContent className="auth-modal create-chatroom-modal">
+          <DialogHeader className="auth-modal-header">
+            <div>
+              <p className="eyebrow">{relayHost}</p>
+              <DialogTitle>Create Chatroom</DialogTitle>
+            </div>
+          </DialogHeader>
+          <DialogDescription className="auth-modal-copy">
+            Ask this relay to create a new chatroom. Some relays may require you to sign in or have permission.
+          </DialogDescription>
+          <form className="admin-form" onSubmit={createRelayGroup}>
+            <Input
+              value={newGroupName}
+              onChange={(event) => setNewGroupName(event.target.value)}
+              placeholder="Name"
+              aria-label="New chatroom name"
+            />
+            <Input
+              value={newGroupId}
+              onChange={(event) => setNewGroupId(event.target.value)}
+              placeholder="Room id"
+              aria-label="New chatroom id"
+              spellCheck={false}
+            />
+            <div className="auth-actions">
+              <Button type="button" className="secondary-action" onClick={() => setShowCreateGroupDialog(false)}>
+                Cancel
+              </Button>
+              <Button type="submit" className="primary-action">
+                <MessageCircle size={16} />
+                Create
+              </Button>
+            </div>
+            <span className="admin-log">{adminStatus}</span>
+          </form>
+        </DialogContent>
+      </Dialog>
 
       <nav className="app-rail" aria-label="Primary navigation">
         <Button
@@ -1887,20 +1949,29 @@ function App() {
           <div className="directory-header">
             <div>
               <p className="eyebrow">relay</p>
-              <h2>{relayHost}</h2>
+              <div className="relay-title-row">
+                <h2>{relayHost}</h2>
+                <span className="relay-dot" data-status={connectionStatus} />
+              </div>
             </div>
             <span>{relayGroupCountLabel} chats</span>
           </div>
-          <Label className="relay-search directory-search">
-            <Search size={15} />
-            <Input
-              type="search"
-              value={relaySearch}
-              onChange={(event) => setRelaySearch(event.target.value)}
-              placeholder="Search groups"
-              aria-label="Search relay groups"
-            />
-          </Label>
+          <div className="relay-toolbar">
+            <Label className="relay-search directory-search">
+              <Search size={15} />
+              <Input
+                type="search"
+                value={relaySearch}
+                onChange={(event) => setRelaySearch(event.target.value)}
+                placeholder="Search groups"
+                aria-label="Search relay groups"
+              />
+            </Label>
+            <Button type="button" className="primary-action" onClick={() => setShowCreateGroupDialog(true)}>
+              <MessageCircle size={16} />
+              Create
+            </Button>
+          </div>
           <div className="relay-chat-grid">
             {relayGroups.length === 0 ? (
               <div className="empty-state">Waiting for chatrooms from this relay.</div>
