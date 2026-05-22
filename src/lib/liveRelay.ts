@@ -97,11 +97,13 @@ export class LiveNip29Relay {
   readonly mode = 'live' as const
   readonly relayUrl: string
   readonly groupId: string
+  readonly hasSelectedGroup: boolean
 
   private readonly listeners = new Set<(snapshot: RelaySnapshot, event?: NestrEvent) => void>()
   private readonly profilePool = new SimplePool({ enableReconnect: true })
   private readonly events = new Map<string, NestrEvent>()
   private readonly directMessages = new Map<string, NestrDirectMessage>()
+  private readonly relayGroups = new Map<string, NestrEvent>()
   private readonly positions = new Map<string, WorldPosition>()
   private readonly users = new Map<string, MockUser>()
   private readonly profiles = new Map<string, NestrEvent>()
@@ -125,24 +127,27 @@ export class LiveNip29Relay {
   private lastPositionPublish = 0
   private positionSequence = 0
 
-  constructor(groupId: string, relayUrl: string) {
-    this.groupId = groupId
+  constructor(groupId: string | undefined, relayUrl: string) {
+    this.groupId = groupId ?? ''
+    this.hasSelectedGroup = Boolean(groupId)
     this.relayUrl = relayUrl
     const relayPubkey = placeholderPubkey(`relay:${relayUrl}`)
+    const placeholderGroupId = groupId ?? 'relay-directory'
     this.group = {
-      id: groupId,
+      id: placeholderGroupId,
       relay: relayUrl,
       metadata: placeholderEvent(39000, relayPubkey, [
-        ['d', groupId],
-        ['name', 'Live NIP-29 Office'],
-        ['about', `${groupId} on ${relayUrl}`],
+        ['d', placeholderGroupId],
+        ['name', groupId ? 'Live NIP-29 Office' : 'Relay Directory'],
+        ['about', groupId ? `${groupId} on ${relayUrl}` : `NIP-29 groups on ${relayUrl}`],
         ['restricted'],
         ['office', '1'],
       ]),
-      admins: placeholderEvent(39001, relayPubkey, [['d', groupId]], 'relay admins pending'),
-      members: placeholderEvent(39002, relayPubkey, [['d', groupId]], 'relay members pending'),
-      roles: placeholderEvent(39003, relayPubkey, [['d', groupId]], 'relay roles pending'),
+      admins: placeholderEvent(39001, relayPubkey, [['d', placeholderGroupId]], 'relay admins pending'),
+      members: placeholderEvent(39002, relayPubkey, [['d', placeholderGroupId]], 'relay members pending'),
+      roles: placeholderEvent(39003, relayPubkey, [['d', placeholderGroupId]], 'relay roles pending'),
     }
+    if (groupId) this.relayGroups.set(groupId, this.group.metadata)
     void this.connect()
   }
 
@@ -161,6 +166,9 @@ export class LiveNip29Relay {
       connectionStatus: this.connectionStatus,
       connectionMessage: this.connectionMessage,
       group: this.group,
+      relayGroups: Array.from(this.relayGroups.values()).sort((a, b) =>
+        (tagValue(a, 'name') ?? tagValue(a, 'd') ?? '').localeCompare(tagValue(b, 'name') ?? tagValue(b, 'd') ?? ''),
+      ),
       users: Array.from(this.users.values()),
       messages,
       directMessages: Array.from(this.directMessages.values()).sort((a, b) => a.createdAt - b.createdAt),
@@ -209,6 +217,7 @@ export class LiveNip29Relay {
 
   async publishGroupMessage(pubkey: string, content: string) {
     const trimmed = content.trim()
+    if (!this.hasSelectedGroup) return { ok: false, reason: 'group-required' }
     if (!trimmed || !this.signer || this.signer.pubkey !== pubkey || !this.relay) {
       return { ok: false, reason: 'live-signer-required' }
     }
@@ -259,6 +268,7 @@ export class LiveNip29Relay {
     vy: number,
     createdAt = Date.now(),
   ) {
+    if (!this.hasSelectedGroup) return { ok: false, reason: 'group-required' }
     if (!this.signer || this.signer.pubkey !== pubkey || !this.relay) {
       return { ok: false, reason: 'live-signer-required' }
     }
@@ -387,9 +397,14 @@ export class LiveNip29Relay {
 
     this.groupSub?.close()
     const filters: Filter[] = [
-      { kinds: [39000, 39001, 39002, 39003], '#d': [this.groupId], limit: 32 },
-      { '#h': [this.groupId], limit: 180 },
+      { kinds: [39000], limit: 240 },
     ]
+    if (this.hasSelectedGroup) {
+      filters.push(
+        { kinds: [39000, 39001, 39002, 39003], '#d': [this.groupId], limit: 32 },
+        { '#h': [this.groupId], limit: 180 },
+      )
+    }
 
     this.groupSub = this.relay.subscribe(filters, {
       onevent: (event) => this.receive(event as NestrEvent),
@@ -571,6 +586,7 @@ export class LiveNip29Relay {
     content = '',
     optimistic = true,
   ) {
+    if (!this.hasSelectedGroup) return { ok: false, reason: 'group-required' }
     if (!this.signer || this.signer.pubkey !== pubkey || !this.relay) {
       return { ok: false, reason: 'live-signer-required' }
     }
@@ -593,11 +609,23 @@ export class LiveNip29Relay {
   }
 
   private receive(event: NestrEvent) {
-    if (tagValue(event, 'd') === this.groupId) {
-      this.receiveGroupEvent(event)
+    if (event.kind === NIP29_KINDS.groupMetadata) {
+      const groupId = tagValue(event, 'd')
+      if (groupId) this.relayGroups.set(groupId, event)
+      if (this.hasSelectedGroup && groupId === this.groupId) {
+        this.receiveGroupEvent(event)
+        return
+      }
+      this.emit(event)
+      return
     }
 
-    if (tagValue(event, 'h') !== this.groupId) return
+    if (this.hasSelectedGroup && tagValue(event, 'd') === this.groupId) {
+      this.receiveGroupEvent(event)
+      return
+    }
+
+    if (!this.hasSelectedGroup || tagValue(event, 'h') !== this.groupId) return
 
     this.events.set(event.id, event)
     if (event.pubkey !== this.signer?.pubkey) {
@@ -705,7 +733,10 @@ export class LiveNip29Relay {
   }
 
   private receiveGroupEvent(event: NestrEvent) {
-    if (event.kind === 39000) this.group = { ...this.group, metadata: event }
+    if (event.kind === 39000) {
+      this.group = { ...this.group, metadata: event }
+      this.relayGroups.set(this.groupId, event)
+    }
     if (event.kind === 39001) {
       this.group = { ...this.group, admins: event }
       this.adminRoles.clear()
@@ -852,6 +883,6 @@ export class LiveNip29Relay {
   }
 }
 
-export function createLiveRelay(groupId: string, relayUrl: string) {
+export function createLiveRelay(groupId: string | undefined, relayUrl: string) {
   return new LiveNip29Relay(groupId, relayUrl)
 }

@@ -12,6 +12,17 @@ describe('launch URL parsing', () => {
       groupId: 'abc123',
       relayUrl: 'wss://groups.0xchat.com',
       nostrConnectRelays: [],
+      initialView: 'group',
+    })
+  })
+
+  it('opens a relay directory when only the relay param is present', () => {
+    expect(parseLaunch('?relay=groups.0xchat.com')).toEqual({
+      mode: 'live',
+      groupId: undefined,
+      relayUrl: 'wss://groups.0xchat.com',
+      nostrConnectRelays: [],
+      initialView: 'relay',
     })
   })
 
@@ -25,6 +36,7 @@ describe('launch URL parsing', () => {
       groupId: 'abc123',
       relayUrl: 'wss://groups.0xchat.com',
       nostrConnectRelays: ['wss://relay.nsec.app', 'wss://relay.example'],
+      initialView: 'group',
     })
   })
 })

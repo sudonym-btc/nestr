@@ -10,7 +10,6 @@ import {
   LockKeyhole,
   LogIn,
   LogOut,
-  Mail,
   Maximize2,
   MessageCircle,
   Mic,
@@ -214,6 +213,7 @@ interface StreamTileProps {
 }
 
 type AuthState = 'mock' | 'idle' | 'connecting' | 'reconnecting' | 'connected' | 'disconnected'
+type AppView = 'relay' | 'group' | 'dm'
 
 function StreamTile({ label, sublabel, stream, muted = false }: StreamTileProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null)
@@ -245,7 +245,9 @@ function App() {
   const [selfPubkey, setSelfPubkey] = useState(() => snapshot.users[0]?.pubkey ?? seededPubkey('live-viewer'))
   const [npubInput, setNpubInput] = useState<string>(() => npubForPubkey(snapshot.users[0]?.pubkey ?? selfPubkey))
   const [message, setMessage] = useState('')
-  const [chatMode, setChatMode] = useState<'chat' | 'dm'>('chat')
+  const [appView, setAppView] = useState<AppView>(() =>
+    launch.mode === 'live' ? launch.initialView : 'group',
+  )
   const [activeDmPubkey, setActiveDmPubkey] = useState<string | null>(null)
   const [dmMessage, setDmMessage] = useState('')
   const [callStarted, setCallStarted] = useState(false)
@@ -293,6 +295,9 @@ function App() {
   const health = meshHealth(mesh.participants)
   const metadataName = tagValue(snapshot.group.metadata, 'name') ?? 'NIP-29 office'
   const groupAbout = tagValue(snapshot.group.metadata, 'about') ?? ''
+  const relayHost = relayHostLabel(snapshot.group.relay)
+  const hasSelectedGroup = relay.mode === 'mock' || (launch.mode === 'live' && Boolean(launch.groupId))
+  const relayGroups = snapshot.relayGroups.length > 0 || !hasSelectedGroup ? snapshot.relayGroups : [snapshot.group.metadata]
   const connectionStatus = snapshot.connectionStatus ?? relay.mode
   const connectionMessage = authDetail || snapshot.connectionMessage || authStatus
   const currentUser = snapshot.users.find((user) => user.pubkey === selfPubkey)
@@ -311,9 +316,6 @@ function App() {
   )
   const dmThreads = useMemo(() => {
     const byPeer = new Map<string, { pubkey: string; lastAt: number; preview: string }>()
-    snapshot.users
-      .filter((user) => user.pubkey !== selfPubkey)
-      .forEach((user) => byPeer.set(user.pubkey, { pubkey: user.pubkey, lastAt: 0, preview: '' }))
 
     snapshot.directMessages.forEach((dm) => {
       if (dm.senderPubkey !== selfPubkey && dm.recipientPubkey !== selfPubkey) return
@@ -344,6 +346,7 @@ function App() {
         : [],
     [activeDmPubkey, selfPubkey, snapshot.directMessages],
   )
+  const activeDmPeer = activeDmPubkey ? snapshot.users.find((user) => user.pubkey === activeDmPubkey) : undefined
   const metadataBaseDraft = useMemo(
     () => groupMetadataDraft(snapshot.group.metadata),
     [snapshot.group.metadata],
@@ -717,6 +720,18 @@ function App() {
     setDmMessage('')
   }
 
+  function selectRelayGroup(groupId: string) {
+    if (hasSelectedGroup && groupId === snapshot.group.id) {
+      setAppView('group')
+      return
+    }
+
+    const url = new URL(window.location.href)
+    url.searchParams.set('c', groupId)
+    url.searchParams.set('relay', relayHostLabel(snapshot.group.relay))
+    window.location.href = url.toString()
+  }
+
   async function runNip29Action(label: string, action: () => Promise<{ ok: boolean; reason?: string }> | { ok: boolean; reason?: string }) {
     setAdminStatus(`${label}...`)
     try {
@@ -942,8 +957,197 @@ function App() {
   }
 
   return (
-    <main className="app-shell" data-auth-state={authState}>
-      <aside className="side-panel left-panel" aria-label="Office">
+    <main className="app-shell" data-auth-state={authState} data-view={appView}>
+      <nav className="app-rail" aria-label="Primary navigation">
+        <button
+          type="button"
+          className={`rail-button ${appView === 'dm' ? 'active' : ''}`}
+          onClick={() => {
+            setAppView('dm')
+            setCallStarted(false)
+            stopRemoteVideos()
+            setCallExpanded(false)
+          }}
+          aria-label="Direct messages"
+        >
+          <Send size={23} />
+        </button>
+        <div className="rail-divider" />
+        <button
+          type="button"
+          className={`rail-button relay ${appView !== 'dm' ? 'active' : ''}`}
+          onClick={() => setAppView('relay')}
+          aria-label={`Relay ${relayHost}`}
+          title={relayHost}
+        >
+          <Radio size={22} />
+        </button>
+      </nav>
+
+      <aside
+        className={`side-panel left-panel ${
+          appView === 'dm' ? 'dm-sidebar' : appView === 'relay' ? 'relay-sidebar' : ''
+        }`}
+        aria-label={appView === 'dm' ? 'Direct messages' : appView === 'relay' ? 'Relay chats' : 'Office'}
+      >
+        {appView === 'dm' ? (
+          <>
+            <div className="brand-row">
+              <div>
+                <p className="eyebrow">private</p>
+                <h1>Direct Messages</h1>
+              </div>
+              <span className="relay-dot" data-status={connectionStatus} />
+            </div>
+
+            {relay.mode === 'live' && (
+              <section className="signin live-auth" aria-label="Nostr auth">
+                <label>nostr auth</label>
+                <div className="auth-status">
+                  <AvatarChip pubkey={selfPubkey} user={currentUser} small />
+                  <div>
+                    <strong>{authStatus}</strong>
+                    <span>{connectionMessage}</span>
+                  </div>
+                </div>
+                {authState === 'disconnected' && (
+                  <div className="auth-actions">
+                    <button type="button" className="secondary-action" onClick={() => void retrySigner()}>
+                      <RefreshCcw size={16} />
+                      Retry
+                    </button>
+                    <button type="button" className="secondary-action danger" onClick={() => void logoutSigner()}>
+                      <LogOut size={16} />
+                      Logout
+                    </button>
+                  </div>
+                )}
+                {connectSession && nostrConnectQr && authState === 'connecting' && (
+                  <div className="connect-card">
+                    <img src={nostrConnectQr} alt="Nostr Connect QR" />
+                    <span>Listening on {connectSession.relays.map(relayHostLabel).join(', ')}</span>
+                    <a href={connectSession.uri}>Open Nostr Connect</a>
+                  </div>
+                )}
+              </section>
+            )}
+
+            <section className="panel-section dm-thread-list" aria-label="Gift wrap threads">
+              <div className="section-title">
+                <span>Gift wraps</span>
+                <span>{dmThreads.length} threads</span>
+              </div>
+              {dmThreads.length === 0 ? (
+                <div className="empty-state">No gift-wrapped DMs have arrived yet.</div>
+              ) : (
+                dmThreads.map((thread) => {
+                  const user = snapshot.users.find((candidate) => candidate.pubkey === thread.pubkey)
+                  return (
+                    <button
+                      key={thread.pubkey}
+                      type="button"
+                      className={`dm-thread ${activeDmPubkey === thread.pubkey ? 'active' : ''}`}
+                      onClick={() => setActiveDmPubkey(thread.pubkey)}
+                    >
+                      <span className="avatar-stack">
+                        <AvatarChip pubkey={thread.pubkey} user={user} />
+                        <span
+                          className={`presence-dot ${isOnline(thread.pubkey) ? 'online' : 'offline'}`}
+                          title={isOnline(thread.pubkey) ? 'Online' : 'Offline'}
+                        />
+                      </span>
+                      <span>
+                        <strong>{nameFor(thread.pubkey, snapshot.users)}</strong>
+                        <small>{thread.preview}</small>
+                      </span>
+                    </button>
+                  )
+                })
+              )}
+            </section>
+          </>
+        ) : appView === 'relay' ? (
+          <>
+            <div className="brand-row">
+              <div>
+                <p className="eyebrow">relay</p>
+                <h1>{relayHost}</h1>
+              </div>
+              <span className="relay-dot" data-status={connectionStatus} />
+            </div>
+
+            <div className="status-grid">
+              <span>
+                <Radio size={15} />
+                {connectionStatus}
+              </span>
+              <span>
+                <MessageCircle size={15} />
+                {relayGroups.length} chats
+              </span>
+            </div>
+
+            {relay.mode === 'live' && (
+              <section className="signin live-auth" aria-label="Nostr auth">
+                <label>nostr auth</label>
+                <div className="auth-status">
+                  <AvatarChip pubkey={selfPubkey} user={currentUser} small />
+                  <div>
+                    <strong>{authStatus}</strong>
+                    <span>{connectionMessage}</span>
+                  </div>
+                </div>
+                {authState === 'disconnected' && (
+                  <div className="auth-actions">
+                    <button type="button" className="secondary-action" onClick={() => void retrySigner()}>
+                      <RefreshCcw size={16} />
+                      Retry
+                    </button>
+                    <button type="button" className="secondary-action danger" onClick={() => void logoutSigner()}>
+                      <LogOut size={16} />
+                      Logout
+                    </button>
+                  </div>
+                )}
+                {connectSession && nostrConnectQr && authState === 'connecting' && (
+                  <div className="connect-card">
+                    <img src={nostrConnectQr} alt="Nostr Connect QR" />
+                    <span>Listening on {connectSession.relays.map(relayHostLabel).join(', ')}</span>
+                    <a href={connectSession.uri}>Open Nostr Connect</a>
+                  </div>
+                )}
+              </section>
+            )}
+
+            <section className="panel-section relay-channel-list" aria-label="Relay group chats">
+              <div className="section-title">
+                <span>Channels</span>
+                <span>{relayGroups.length}</span>
+              </div>
+              {relayGroups.length === 0 ? (
+                <div className="empty-state">Waiting for NIP-29 group metadata from this relay.</div>
+              ) : (
+                relayGroups.map((groupEvent) => {
+                  const groupId = tagValue(groupEvent, 'd') ?? snapshot.group.id
+                  const name = tagValue(groupEvent, 'name') ?? groupId
+
+                  return (
+                    <button
+                      type="button"
+                      key={`${groupEvent.pubkey}:${groupId}`}
+                      className={`relay-nav-row ${hasSelectedGroup && groupId === snapshot.group.id ? 'active' : ''}`}
+                      onClick={() => selectRelayGroup(groupId)}
+                    >
+                      <MessageCircle size={16} />
+                      <span>{name}</span>
+                    </button>
+                  )
+                })
+              )}
+            </section>
+          </>
+        ) : (
+          <>
         <div className="brand-row">
           <div>
             <p className="eyebrow">nestr</p>
@@ -972,6 +1176,25 @@ function App() {
             {snapshot.group.id}
           </span>
         </div>
+
+        <section className="relay-nav" aria-label="Relay channels">
+          <button
+            type="button"
+            className="relay-nav-row"
+            onClick={() => setAppView('relay')}
+          >
+            <Radio size={16} />
+            <span>{relayHost}</span>
+          </button>
+          <button
+            type="button"
+            className={`relay-nav-row ${appView === 'group' ? 'active' : ''}`}
+            onClick={() => setAppView('group')}
+          >
+            <MessageCircle size={16} />
+            <span>{metadataName}</span>
+          </button>
+        </section>
 
         {relay.mode === 'mock' ? (
           <form className="signin" onSubmit={joinOffice}>
@@ -1277,122 +1500,102 @@ function App() {
             </button>
           ))}
         </section>
+          </>
+        )}
       </aside>
 
-      <section className="world-panel" aria-label="Spatial office">
-        <PhaserOffice
-          snapshot={{
-            map: officeMap,
-            users: snapshot.users,
-            positions: snapshot.positions,
-            selfPubkey,
-          }}
-          onMove={handleMove}
-        />
-        <div className="world-bottombar">
-          <span>{currentUser?.name ?? 'guest'}</span>
-          <span>{shortNpub(selfPubkey)}</span>
-        </div>
-        {callStarted && (
-          <section
-            ref={callStageRef}
-            className={`call-stage ${callExpanded ? 'expanded' : ''}`}
-            aria-label={relay.mode === 'mock' ? 'Mock WebRTC call' : 'WebRTC call'}
-          >
-            <div className="call-stage-bar">
-              <div>
-                <strong>{relay.mode === 'mock' ? 'Mock WebRTC mesh' : 'WebRTC mesh'}</strong>
-                <span>{displayedMesh.participants} participants · Nostr-signaled proximity call</span>
-              </div>
-              <button
-                type="button"
-                className="icon-button"
-                onClick={toggleCallFullscreen}
-                aria-label={callExpanded ? 'Exit fullscreen call' : 'Fullscreen call'}
-              >
-                {callExpanded ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
-              </button>
+      {appView === 'group' && hasSelectedGroup && (
+        <>
+          <section className="world-panel" aria-label="Spatial office">
+            <PhaserOffice
+              snapshot={{
+                map: officeMap,
+                users: snapshot.users,
+                positions: snapshot.positions,
+                selfPubkey,
+              }}
+              onMove={handleMove}
+            />
+            <div className="world-bottombar">
+              <span>{currentUser?.name ?? 'guest'}</span>
+              <span>{shortNpub(selfPubkey)}</span>
             </div>
-            <div className="media-controls" aria-label="Media controls">
-              <button
-                type="button"
-                className={cameraEnabled ? '' : 'off'}
-                onClick={toggleCamera}
-                aria-label={cameraEnabled ? 'Disable camera' : 'Enable camera'}
+            {callStarted && (
+              <section
+                ref={callStageRef}
+                className={`call-stage ${callExpanded ? 'expanded' : ''}`}
+                aria-label={relay.mode === 'mock' ? 'Mock WebRTC call' : 'WebRTC call'}
               >
-                {cameraEnabled ? <Camera size={18} /> : <CameraOff size={18} />}
-                <span>Camera</span>
-              </button>
-              <button
-                type="button"
-                className={micEnabled ? '' : 'off'}
-                onClick={toggleMic}
-                aria-label={micEnabled ? 'Mute microphone' : 'Enable microphone'}
-              >
-                {micEnabled ? <Mic size={18} /> : <MicOff size={18} />}
-                <span>Mic</span>
-              </button>
-            </div>
-            <div className="stream-grid">
-              <StreamTile
-                label={currentUser?.name ?? 'You'}
-                sublabel={
-                  !cameraEnabled
-                    ? 'camera off'
-                    : mediaState === 'live'
-                    ? 'local camera'
-                    : mediaState === 'blocked'
-                      ? 'camera blocked'
-                      : 'requesting camera'
-                }
-                stream={cameraEnabled ? localStream : null}
-                muted
-              />
-              {remoteVideos.map((video) => (
-                <StreamTile
-                  key={video.pubkey}
-                  label={video.name}
-                  sublabel="mock peer stream"
-                  stream={video.stream}
-                />
-              ))}
-            </div>
-          </section>
-        )}
-      </section>
-
-      <aside className="side-panel chat-panel" aria-label="Chat and direct messages">
-        <div className="chat-header">
-          <div>
-            <h2>{chatMode === 'chat' ? 'Chat' : activeDmPubkey ? nameFor(activeDmPubkey, snapshot.users) : 'DMs'}</h2>
-            {chatMode === 'dm' && activeDmPubkey && (
-              <p>{shortNpub(activeDmPubkey)} · NIP-17</p>
+                <div className="call-stage-bar">
+                  <div>
+                    <strong>{relay.mode === 'mock' ? 'Mock WebRTC mesh' : 'WebRTC mesh'}</strong>
+                    <span>{displayedMesh.participants} participants · Nostr-signaled proximity call</span>
+                  </div>
+                  <button
+                    type="button"
+                    className="icon-button"
+                    onClick={toggleCallFullscreen}
+                    aria-label={callExpanded ? 'Exit fullscreen call' : 'Fullscreen call'}
+                  >
+                    {callExpanded ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+                  </button>
+                </div>
+                <div className="media-controls" aria-label="Media controls">
+                  <button
+                    type="button"
+                    className={cameraEnabled ? '' : 'off'}
+                    onClick={toggleCamera}
+                    aria-label={cameraEnabled ? 'Disable camera' : 'Enable camera'}
+                  >
+                    {cameraEnabled ? <Camera size={18} /> : <CameraOff size={18} />}
+                    <span>Camera</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={micEnabled ? '' : 'off'}
+                    onClick={toggleMic}
+                    aria-label={micEnabled ? 'Mute microphone' : 'Enable microphone'}
+                  >
+                    {micEnabled ? <Mic size={18} /> : <MicOff size={18} />}
+                    <span>Mic</span>
+                  </button>
+                </div>
+                <div className="stream-grid">
+                  <StreamTile
+                    label={currentUser?.name ?? 'You'}
+                    sublabel={
+                      !cameraEnabled
+                        ? 'camera off'
+                        : mediaState === 'live'
+                        ? 'local camera'
+                        : mediaState === 'blocked'
+                          ? 'camera blocked'
+                          : 'requesting camera'
+                    }
+                    stream={cameraEnabled ? localStream : null}
+                    muted
+                  />
+                  {remoteVideos.map((video) => (
+                    <StreamTile
+                      key={video.pubkey}
+                      label={video.name}
+                      sublabel="mock peer stream"
+                      stream={video.stream}
+                    />
+                  ))}
+                </div>
+              </section>
             )}
-          </div>
-          <div className="chat-switcher" role="tablist" aria-label="Messaging mode">
-            <button
-              type="button"
-              className={chatMode === 'chat' ? 'active' : ''}
-              onClick={() => setChatMode('chat')}
-              aria-label="Open chat"
-              aria-selected={chatMode === 'chat'}
-            >
-              <MessageCircle size={19} />
-            </button>
-            <button
-              type="button"
-              className={chatMode === 'dm' ? 'active' : ''}
-              onClick={() => setChatMode('dm')}
-              aria-label="Open direct messages"
-              aria-selected={chatMode === 'dm'}
-            >
-              <Mail size={19} />
-            </button>
-          </div>
-        </div>
+          </section>
 
-        {chatMode === 'chat' ? (
-          <>
+          <aside className="side-panel chat-panel" aria-label="Chat">
+            <div className="chat-header">
+              <div>
+                <h2>Chat</h2>
+              </div>
+              <MessageCircle size={22} />
+            </div>
+
             <div className="messages" role="log" aria-label="Messages">
               {snapshot.messages.map((event) => {
                 const sender = snapshot.users.find((user) => user.pubkey === event.pubkey)
@@ -1438,100 +1641,140 @@ function App() {
                 </button>
               </div>
             </form>
-          </>
-        ) : (
-          <>
-            {activeDmPubkey ? (
-              <button
-                type="button"
-                className="dm-back"
-                onClick={() => setActiveDmPubkey(null)}
-              >
-                <ChevronLeft size={17} />
-                Threads
-              </button>
+          </aside>
+        </>
+      )}
+
+      {appView === 'relay' && (
+        <section className="world-panel relay-directory-panel" aria-label="Relay chats">
+          <div className="directory-header">
+            <div>
+              <p className="eyebrow">relay</p>
+              <h2>{relayHost}</h2>
+            </div>
+            <span>{relayGroups.length} chats</span>
+          </div>
+          <div className="relay-chat-grid">
+            {relayGroups.length === 0 ? (
+              <div className="empty-state">Waiting for NIP-29 group metadata from this relay.</div>
             ) : (
-              <div className="dm-subhead">
-                <span>{relay.mode === 'live' ? 'Gift-wrapped NIP-17' : 'Mock NIP-17'}</span>
-                <span>{dmThreads.length} threads</span>
-              </div>
+              relayGroups.map((groupEvent) => {
+                const groupId = tagValue(groupEvent, 'd') ?? snapshot.group.id
+                const name = tagValue(groupEvent, 'name') ?? groupId
+                const about = tagValue(groupEvent, 'about') ?? 'NIP-29 group'
+
+                return (
+                  <button
+                    type="button"
+                    key={`${groupEvent.pubkey}:${groupId}`}
+                    className={`relay-chat-card ${hasSelectedGroup && groupId === snapshot.group.id ? 'current' : ''}`}
+                    onClick={() => selectRelayGroup(groupId)}
+                  >
+                    <span className="relay-chat-hash">#</span>
+                    <span>
+                      <strong>{name}</strong>
+                      <small>{about}</small>
+                    </span>
+                  </button>
+                )
+              })
             )}
+          </div>
+        </section>
+      )}
 
-            {activeDmPubkey ? (
-              <>
-                <div className="messages dm-messages" role="log" aria-label="Direct messages">
-                  {activeDmMessages.length === 0 && (
-                    <div className="empty-state">
-                      Start an encrypted conversation with {nameFor(activeDmPubkey, snapshot.users)}.
-                    </div>
-                  )}
-                  {activeDmMessages.map((dm) => {
-                    const outgoing = dm.senderPubkey === selfPubkey
-                    const sender = snapshot.users.find((user) => user.pubkey === dm.senderPubkey)
-
-                    return (
-                      <article key={dm.id} className={`message dm-message ${outgoing ? 'outgoing' : 'incoming'}`}>
-                        <div className="message-meta">
-                          <AvatarChip pubkey={dm.senderPubkey} user={sender} small />
-                          <strong>{outgoing ? 'You' : nameFor(dm.senderPubkey, snapshot.users)}</strong>
-                          <time>{new Date(dm.createdAt * 1000).toLocaleTimeString([], {
-                            hour: '2-digit',
-                            minute: '2-digit',
-                          })}</time>
-                        </div>
-                        <p>{dm.content}</p>
-                      </article>
-                    )
-                  })}
-                  <div ref={dmMessagesEndRef} />
+      {appView === 'dm' && (
+        <section className="world-panel dm-main-panel" aria-label="Gift wrapped direct messages">
+          {activeDmPubkey ? (
+            <>
+              <div className="directory-header">
+                <div>
+                  <p className="eyebrow">nip-17</p>
+                  <h2>{activeDmPeer?.name ?? nameFor(activeDmPubkey, snapshot.users)}</h2>
                 </div>
+                <button type="button" className="dm-back" onClick={() => setActiveDmPubkey(null)}>
+                  <ChevronLeft size={17} />
+                  Threads
+                </button>
+              </div>
+              <div className="messages dm-messages" role="log" aria-label="Direct messages">
+                {activeDmMessages.map((dm) => {
+                  const outgoing = dm.senderPubkey === selfPubkey
+                  const sender = snapshot.users.find((user) => user.pubkey === dm.senderPubkey)
 
-                <form className="composer" onSubmit={sendDirectMessage}>
-                  <label htmlFor="dm-message">Direct message</label>
-                  <div className="input-row">
-                    <input
-                      id="dm-message"
-                      value={dmMessage}
-                      onChange={(event) => setDmMessage(event.target.value)}
-                      placeholder="Send a NIP-17 DM"
-                    />
-                    <button type="submit" aria-label="Send direct message">
-                      <Send size={18} />
-                    </button>
-                  </div>
-                </form>
-              </>
-            ) : (
-              <div className="dm-list" role="list" aria-label="Direct message threads">
-                {dmThreads.map((thread) => {
-                  const user = snapshot.users.find((candidate) => candidate.pubkey === thread.pubkey)
                   return (
-                    <button
-                      key={thread.pubkey}
-                      type="button"
-                      role="listitem"
-                      className="dm-thread"
-                      onClick={() => setActiveDmPubkey(thread.pubkey)}
-                    >
-                      <span className="avatar-stack">
-                        <AvatarChip pubkey={thread.pubkey} user={user} />
-                        <span
-                          className={`presence-dot ${isOnline(thread.pubkey) ? 'online' : 'offline'}`}
-                          title={isOnline(thread.pubkey) ? 'Online' : 'Offline'}
-                        />
-                      </span>
-                      <span>
-                        <strong>{nameFor(thread.pubkey, snapshot.users)}</strong>
-                        <small>{thread.preview || shortNpub(thread.pubkey)}</small>
-                      </span>
-                    </button>
+                    <article key={dm.id} className={`message dm-message ${outgoing ? 'outgoing' : 'incoming'}`}>
+                      <div className="message-meta">
+                        <AvatarChip pubkey={dm.senderPubkey} user={sender} small />
+                        <strong>{outgoing ? 'You' : nameFor(dm.senderPubkey, snapshot.users)}</strong>
+                        <time>{new Date(dm.createdAt * 1000).toLocaleTimeString([], {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        })}</time>
+                      </div>
+                      <p>{dm.content}</p>
+                    </article>
                   )
                 })}
+                <div ref={dmMessagesEndRef} />
               </div>
-            )}
-          </>
-        )}
-      </aside>
+              <form className="composer" onSubmit={sendDirectMessage}>
+                <label htmlFor="dm-message">Direct message</label>
+                <div className="input-row">
+                  <input
+                    id="dm-message"
+                    value={dmMessage}
+                    onChange={(event) => setDmMessage(event.target.value)}
+                    placeholder="Send a NIP-17 DM"
+                  />
+                  <button type="submit" aria-label="Send direct message">
+                    <Send size={18} />
+                  </button>
+                </div>
+              </form>
+            </>
+          ) : (
+            <>
+              <div className="directory-header">
+                <div>
+                  <p className="eyebrow">nip-17</p>
+                  <h2>Gift Wrap Threads</h2>
+                </div>
+                <span>{dmThreads.length} threads</span>
+              </div>
+              <div className="dm-overview-grid">
+                {dmThreads.length === 0 ? (
+                  <div className="empty-state">No gift-wrapped DMs have arrived yet.</div>
+                ) : (
+                  dmThreads.map((thread) => {
+                    const user = snapshot.users.find((candidate) => candidate.pubkey === thread.pubkey)
+                    return (
+                      <button
+                        key={thread.pubkey}
+                        type="button"
+                        className="dm-overview-card"
+                        onClick={() => setActiveDmPubkey(thread.pubkey)}
+                      >
+                        <span className="avatar-stack">
+                          <AvatarChip pubkey={thread.pubkey} user={user} />
+                          <span
+                            className={`presence-dot ${isOnline(thread.pubkey) ? 'online' : 'offline'}`}
+                            title={isOnline(thread.pubkey) ? 'Online' : 'Offline'}
+                          />
+                        </span>
+                        <span>
+                          <strong>{nameFor(thread.pubkey, snapshot.users)}</strong>
+                          <small>{thread.preview}</small>
+                        </span>
+                      </button>
+                    )
+                  })
+                )}
+              </div>
+            </>
+          )}
+        </section>
+      )}
     </main>
   )
 }

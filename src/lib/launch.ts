@@ -4,9 +4,10 @@ export interface MockLaunch {
 
 export interface LiveLaunch {
   mode: 'live'
-  groupId: string
+  groupId?: string
   relayUrl: string
   nostrConnectRelays: string[]
+  initialView: 'relay' | 'group'
 }
 
 export type LaunchConfig = MockLaunch | LiveLaunch
@@ -43,12 +44,13 @@ export function parseLaunch(search = globalThis.location?.search ?? ''): LaunchC
     'nip46_relay',
   ]).map(normalizeRelayUrl)
 
-  if (groupId && relay) {
+  if (relay) {
     return {
       mode: 'live',
-      groupId,
+      groupId: groupId ?? undefined,
       relayUrl: normalizeRelayUrl(relay),
       nostrConnectRelays,
+      initialView: groupId ? 'group' : 'relay',
     }
   }
 

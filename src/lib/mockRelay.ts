@@ -60,6 +60,7 @@ export interface RelaySnapshot {
   connectionStatus?: 'mock' | 'connecting' | 'connected' | 'authenticated' | 'disconnected' | 'error'
   connectionMessage?: string
   group: Nip29Group
+  relayGroups: NestrEvent[]
   users: MockUser[]
   messages: NestrEvent[]
   directMessages: NestrDirectMessage[]
@@ -159,6 +160,7 @@ export class MockNip29Relay {
       connectionStatus: 'mock',
       connectionMessage: 'local mock relay',
       group: this.group,
+      relayGroups: [this.group.metadata],
       users: Array.from(this.users.values()),
       messages,
       directMessages: this.directMessages.slice().sort((a, b) => a.createdAt - b.createdAt),

@@ -21,3 +21,16 @@ test('renders the NIP-29 office and sends global chat', async ({ page }) => {
 
   await page.screenshot({ path: 'test-results/nestr-office.png', fullPage: true })
 })
+
+test('uses launch params to choose relay directory or group map', async ({ page }) => {
+  await page.goto('/?relay=groups.0xchat.com')
+
+  await expect(page.getByRole('heading', { name: 'groups.0xchat.com' }).first()).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Relay chats' })).toBeVisible()
+  await expect(page.locator('canvas')).toHaveCount(0)
+
+  await page.goto('/?c=0bdfff7a01de485de1343b83ec11b0d66d92e4d75e8c5851a05dab288be4f0aa&relay=groups.0xchat.com')
+
+  await expect(page.getByLabel('Spatial office')).toBeVisible()
+  await expect(page.locator('canvas')).toBeVisible()
+})
