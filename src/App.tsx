@@ -710,7 +710,7 @@ function App() {
         <div className="chat-header">
           <div>
             <p className="eyebrow">global</p>
-            <h2>NIP-29 chat</h2>
+            <h2>Chat</h2>
           </div>
           <MessageCircle size={22} />
         </div>

@@ -4,7 +4,7 @@ test('renders the NIP-29 office and sends global chat', async ({ page }) => {
   await page.goto('/')
 
   await expect(page.getByRole('heading', { name: 'Nestr Design Office' })).toBeVisible()
-  await expect(page.getByRole('heading', { name: 'NIP-29 chat' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Chat' })).toBeVisible()
   await expect(page.locator('canvas')).toBeVisible()
 
   await page.getByRole('textbox', { name: 'Message' }).fill('hello from playwright')
