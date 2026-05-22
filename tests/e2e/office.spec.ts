@@ -40,3 +40,28 @@ test('uses launch params to choose relay directory or group map', async ({ page 
   await expect(page.getByLabel('Spatial office')).toBeVisible()
   await expect(page.locator('canvas')).toBeVisible()
 })
+
+test('completes NIP-07 sign-in from an auth-gated live action', async ({ page }) => {
+  const pubkey = 'a'.repeat(64)
+  await page.addInitScript((injectedPubkey) => {
+    window.nostr = {
+      getPublicKey: async () => injectedPubkey,
+      signEvent: async (event) => ({
+        ...event,
+        id: 'b'.repeat(64),
+        pubkey: injectedPubkey,
+        sig: 'c'.repeat(128),
+      }),
+      nip44: {
+        encrypt: async (_pubkey, plaintext) => plaintext,
+        decrypt: async (_pubkey, ciphertext) => ciphertext,
+      },
+    }
+  }, pubkey)
+
+  await page.goto('/?relay=groups.0xchat.com')
+  await page.getByRole('button', { name: 'Direct messages' }).click()
+
+  await expect(page.getByLabel('Signer status')).toContainText('signed in')
+  await expect(page.getByRole('dialog', { name: 'Nostr sign in' })).toHaveCount(0)
+})

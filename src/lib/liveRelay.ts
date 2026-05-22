@@ -190,6 +190,7 @@ export class LiveNip29Relay {
 
   async setSigner(signer: NestrSigner) {
     this.signer = signer
+    if (this.relay) this.relay.onauth = relayAuthSigner(signer)
     this.upsertUser(signer.pubkey)
     this.recordActivity(signer.pubkey)
     this.connectionMessage = `${signer.label} connected`
@@ -200,6 +201,7 @@ export class LiveNip29Relay {
 
   clearSigner() {
     this.signer = undefined
+    if (this.relay) this.relay.onauth = undefined
     this.dmSub?.close()
     this.dmSub = undefined
     this.closeDmRelaySubs()
@@ -376,10 +378,7 @@ export class LiveNip29Relay {
       this.relay = relay
       this.connectionStatus = 'connected'
       this.connectionMessage = 'live relay connected'
-      relay.onauth = async (event: EventTemplate) => {
-        if (!this.signer) throw new Error('signer required for relay auth')
-        return relayAuthSigner(this.signer)(event)
-      }
+      if (this.signer) relay.onauth = relayAuthSigner(this.signer)
 
       this.openGroupSubscription()
       this.openDmSubscription()

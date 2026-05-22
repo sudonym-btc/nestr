@@ -524,7 +524,7 @@ function App() {
       clearConnectSession()
 
       const result = await relay.publishPosition(signer.pubkey, spawn.x, spawn.y, 0, 0)
-      if (!result.ok && result.reason !== 'throttled') {
+      if (!result.ok && result.reason !== 'throttled' && result.reason !== 'group-required') {
         setAuthDetail(`position publish failed: ${result.reason}`)
       }
     },
@@ -595,7 +595,7 @@ function App() {
 
     session.ready
       .then(async () => {
-        if (attempt !== authAttemptRef.current) return
+        if (attempt !== authAttemptRef.current || activeSignerRef.current) return
         setAuthDetail(`scan QR; listening on ${session.relays.map(relayHostLabel).join(', ')}`)
         try {
           const dataUrl = await QRCode.toDataURL(session.uri, {
@@ -612,7 +612,7 @@ function App() {
         }
       })
       .catch((error) => {
-        if (attempt !== authAttemptRef.current) return
+        if (attempt !== authAttemptRef.current || activeSignerRef.current) return
         setAuthStatus('Nostr Connect listener failed')
         setAuthDetail(errorMessage(error))
       })
@@ -620,7 +620,7 @@ function App() {
     session.waitForSigner
       .then((result) => completeAuthAttempt(attempt, result.signer, result.storedSession))
       .catch((error) => {
-        if (attempt !== authAttemptRef.current) return
+        if (attempt !== authAttemptRef.current || activeSignerRef.current) return
         setAuthDetail(`Nostr Connect unavailable: ${errorMessage(error)}`)
       })
 
@@ -639,7 +639,7 @@ function App() {
       connectNip07Signer()
         .then((signer) => completeAuthAttempt(attempt, signer))
         .catch((error) => {
-          if (attempt !== authAttemptRef.current) return
+          if (attempt !== authAttemptRef.current || activeSignerRef.current) return
           setAuthStatus('waiting for Nostr Connect')
           setAuthDetail(`NIP-07 unavailable: ${errorMessage(error)}`)
         })
