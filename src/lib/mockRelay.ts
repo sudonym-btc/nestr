@@ -226,11 +226,12 @@ export class MockNip29Relay {
     return { ok: true, event }
   }
 
-  tickBots(excludePubkey: string, map: OfficeMap) {
+  tickBots(excludePubkey: string, map: OfficeMap, frozenPubkeys: string[] = []) {
     const timestamp = Date.now()
+    const frozen = new Set(frozenPubkeys)
 
     Array.from(this.users.values())
-      .filter((user) => user.pubkey !== excludePubkey)
+      .filter((user) => user.pubkey !== excludePubkey && !frozen.has(user.pubkey))
       .forEach((user, index) => {
         const current = this.positions.get(user.pubkey) ?? {
           pubkey: user.pubkey,

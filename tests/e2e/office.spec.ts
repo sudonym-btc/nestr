@@ -16,6 +16,8 @@ test('renders the NIP-29 office and sends global chat', async ({ page }) => {
   await expect(page.getByText('mock peer stream').first()).toBeVisible()
   await expect(page.getByText(/local camera|camera blocked/)).toBeVisible()
   await expect(page.getByRole('button', { name: 'Fullscreen call' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Disable camera' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Mute microphone' })).toBeVisible()
 
   await page.screenshot({ path: 'test-results/nestr-office.png', fullPage: true })
 })

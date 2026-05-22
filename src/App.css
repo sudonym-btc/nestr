@@ -423,6 +423,32 @@ input:focus {
   padding: 12px 14px;
 }
 
+.media-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 10px 12px;
+}
+
+.media-controls button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.12);
+  color: white;
+  font-weight: 800;
+  padding: 0 12px;
+}
+
+.media-controls button.off {
+  background: rgba(228, 111, 88, 0.28);
+  border-color: rgba(228, 111, 88, 0.5);
+}
+
 .call-stage-bar strong,
 .stream-label strong {
   display: block;

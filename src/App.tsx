@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import {
+  Camera,
+  CameraOff,
   LockKeyhole,
   LogIn,
   Maximize2,
   MessageCircle,
   Mic,
+  MicOff,
   Minimize2,
   Radio,
   Send,
@@ -65,8 +68,11 @@ function App() {
   const [mediaState, setMediaState] = useState<'idle' | 'requesting' | 'live' | 'blocked'>('idle')
   const [localStream, setLocalStream] = useState<MediaStream | null>(null)
   const [remoteVideos, setRemoteVideos] = useState<MockPeerVideo[]>([])
+  const [cameraEnabled, setCameraEnabled] = useState(true)
+  const [micEnabled, setMicEnabled] = useState(true)
   const [callExpanded, setCallExpanded] = useState(false)
   const callStageRef = useRef<HTMLDivElement | null>(null)
+  const remoteVideosRef = useRef<MockPeerVideo[]>([])
 
   const activeCount = Math.max(snapshot.positions.length, snapshot.users.length)
   const officeMap = useMemo(
@@ -92,17 +98,19 @@ function App() {
       name: nameFor(pubkey, snapshot.users),
     }))
   }, [nearby, selfPubkey, snapshot.users])
+  const callPeerKey = callPeers.map((peer) => `${peer.pubkey}:${peer.name}`).join('|')
   const displayedMesh = estimateWebRtcMesh((callStarted ? callPeers.length : nearby.length) + 1)
+  const frozenPeerPubkeys = remoteVideos.map((video) => video.pubkey).join('|')
 
   useEffect(() => relay.subscribe((next) => setSnapshot(next)), [relay])
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      relay.tickBots(selfPubkey, officeMap)
+      relay.tickBots(selfPubkey, officeMap, frozenPeerPubkeys.split('|').filter(Boolean))
     }, 560)
 
     return () => window.clearInterval(timer)
-  }, [officeMap, relay, selfPubkey])
+  }, [frozenPeerPubkeys, officeMap, relay, selfPubkey])
 
   useEffect(() => {
     return () => {
@@ -111,8 +119,18 @@ function App() {
   }, [localStream])
 
   useEffect(() => {
-    return () => remoteVideos.forEach((video) => video.stop())
-  }, [remoteVideos])
+    return () => remoteVideosRef.current.forEach((video) => video.stop())
+  }, [])
+
+  useEffect(() => {
+    if (!callStarted) return undefined
+
+    const timer = window.setTimeout(() => {
+      replaceRemoteVideos(reconcileMockVideos(callPeerKey))
+    }, 0)
+
+    return () => window.clearTimeout(timer)
+  }, [callPeerKey, callStarted])
 
   useEffect(() => {
     const handleFullscreenChange = () => {
@@ -136,8 +154,7 @@ function App() {
     setSelfPubkey(user.pubkey)
     setNpubInput(user.npub)
     setCallStarted(false)
-    remoteVideos.forEach((video) => video.stop())
-    setRemoteVideos([])
+    stopRemoteVideos()
     setCallExpanded(false)
   }
 
@@ -147,12 +164,75 @@ function App() {
     setMessage('')
   }
 
+  function reconcileMockVideos(peerKey: string) {
+    const peers = peerKey
+      .split('|')
+      .filter(Boolean)
+      .map((peer) => {
+        const [pubkey, name] = peer.split(':')
+        return { pubkey, name }
+      })
+    const previous = new Map(remoteVideosRef.current.map((video) => [video.pubkey, video]))
+    const wanted = new Set(peers.map((peer) => peer.pubkey))
+    const next = peers.map((peer) => previous.get(peer.pubkey) ?? createMockPeerVideo(peer.pubkey, peer.name))
+
+    remoteVideosRef.current
+      .filter((video) => !wanted.has(video.pubkey))
+      .forEach((video) => video.stop())
+
+    return next
+  }
+
+  function replaceRemoteVideos(videos: MockPeerVideo[]) {
+    remoteVideosRef.current = videos
+    setRemoteVideos(videos)
+  }
+
+  function stopRemoteVideos() {
+    remoteVideosRef.current.forEach((video) => video.stop())
+    remoteVideosRef.current = []
+    setRemoteVideos([])
+  }
+
+  async function requestLocalMedia(nextCamera = cameraEnabled, nextMic = micEnabled) {
+    localStream?.getTracks().forEach((track) => track.stop())
+    setLocalStream(null)
+
+    if (!nextCamera && !nextMic) {
+      setMediaState('idle')
+      return
+    }
+
+    setMediaState('requesting')
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: nextMic,
+        video: nextCamera
+          ? {
+              width: { ideal: 640 },
+              height: { ideal: 360 },
+            }
+          : false,
+      })
+      stream.getAudioTracks().forEach((track) => {
+        track.enabled = nextMic
+      })
+      stream.getVideoTracks().forEach((track) => {
+        track.enabled = nextCamera
+      })
+      setLocalStream(stream)
+      setMediaState('live')
+    } catch {
+      setMediaState('blocked')
+    }
+  }
+
   async function toggleCall() {
     if (callStarted) {
       localStream?.getTracks().forEach((track) => track.stop())
-      remoteVideos.forEach((video) => video.stop())
+      stopRemoteVideos()
       setLocalStream(null)
-      setRemoteVideos([])
       setCallStarted(false)
       setCallExpanded(false)
       setMediaState('idle')
@@ -160,23 +240,35 @@ function App() {
     }
 
     setMediaState('requesting')
-    remoteVideos.forEach((video) => video.stop())
-    setRemoteVideos(callPeers.map((peer) => createMockPeerVideo(peer.pubkey, peer.name)))
+    setCameraEnabled(true)
+    setMicEnabled(true)
+    replaceRemoteVideos(reconcileMockVideos(callPeerKey))
     setCallStarted(true)
+    await requestLocalMedia(true, true)
+  }
 
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: {
-          width: { ideal: 640 },
-          height: { ideal: 360 },
-        },
+  async function toggleCamera() {
+    const nextCamera = !cameraEnabled
+    setCameraEnabled(nextCamera)
+    if (localStream?.getVideoTracks().length) {
+      localStream.getVideoTracks().forEach((track) => {
+        track.enabled = nextCamera
       })
-      setLocalStream(stream)
-      setMediaState('live')
-    } catch {
-      setMediaState('blocked')
+      if (!nextCamera) return
     }
+    await requestLocalMedia(nextCamera, micEnabled)
+  }
+
+  async function toggleMic() {
+    const nextMic = !micEnabled
+    setMicEnabled(nextMic)
+    if (localStream?.getAudioTracks().length) {
+      localStream.getAudioTracks().forEach((track) => {
+        track.enabled = nextMic
+      })
+      return
+    }
+    await requestLocalMedia(cameraEnabled, nextMic)
   }
 
   async function toggleCallFullscreen() {
@@ -288,8 +380,7 @@ function App() {
                 setSelfPubkey(user.pubkey)
                 setNpubInput(user.npub)
                 setCallStarted(false)
-                remoteVideos.forEach((video) => video.stop())
-                setRemoteVideos([])
+                stopRemoteVideos()
                 setCallExpanded(false)
               }}
             >
@@ -347,17 +438,39 @@ function App() {
                 {callExpanded ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
               </button>
             </div>
+            <div className="media-controls" aria-label="Media controls">
+              <button
+                type="button"
+                className={cameraEnabled ? '' : 'off'}
+                onClick={toggleCamera}
+                aria-label={cameraEnabled ? 'Disable camera' : 'Enable camera'}
+              >
+                {cameraEnabled ? <Camera size={18} /> : <CameraOff size={18} />}
+                <span>Camera</span>
+              </button>
+              <button
+                type="button"
+                className={micEnabled ? '' : 'off'}
+                onClick={toggleMic}
+                aria-label={micEnabled ? 'Mute microphone' : 'Enable microphone'}
+              >
+                {micEnabled ? <Mic size={18} /> : <MicOff size={18} />}
+                <span>Mic</span>
+              </button>
+            </div>
             <div className="stream-grid">
               <StreamTile
                 label={currentUser?.name ?? 'You'}
                 sublabel={
-                  mediaState === 'live'
+                  !cameraEnabled
+                    ? 'camera off'
+                    : mediaState === 'live'
                     ? 'local camera'
                     : mediaState === 'blocked'
                       ? 'camera blocked'
                       : 'requesting camera'
                 }
-                stream={localStream}
+                stream={cameraEnabled ? localStream : null}
                 muted
               />
               {remoteVideos.map((video) => (

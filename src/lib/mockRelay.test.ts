@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { createMockRelay } from './mockRelay'
 import { OFFICE_KINDS } from './nostr'
+import { buildOfficeMap } from './world'
 
 describe('mock NIP-29 relay', () => {
   it('seeds relay-generated group metadata and global chat', () => {
@@ -46,5 +47,26 @@ describe('mock NIP-29 relay', () => {
       content: '{}',
     })
     expect(result.ok).toBe(false)
+  })
+
+  it('keeps mock streaming users still while ticking bots', () => {
+    const relay = createMockRelay()
+    const snapshot = relay.snapshot()
+    const frozenUser = snapshot.users[1]
+    const movingUser = snapshot.users[2]
+    const beforeFrozen = snapshot.positions.find((position) => position.pubkey === frozenUser.pubkey)
+    const beforeMoving = snapshot.positions.find((position) => position.pubkey === movingUser.pubkey)
+
+    relay.tickBots(snapshot.users[0].pubkey, buildOfficeMap(snapshot.group.id, snapshot.users.length), [
+      frozenUser.pubkey,
+    ])
+
+    const after = relay.snapshot()
+    const afterFrozen = after.positions.find((position) => position.pubkey === frozenUser.pubkey)
+    const afterMoving = after.positions.find((position) => position.pubkey === movingUser.pubkey)
+
+    expect(afterFrozen?.x).toBe(beforeFrozen?.x)
+    expect(afterFrozen?.y).toBe(beforeFrozen?.y)
+    expect(afterMoving?.x).not.toBe(beforeMoving?.x)
   })
 })
