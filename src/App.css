@@ -787,6 +787,56 @@ input:focus {
   padding-bottom: 12px;
 }
 
+.chat-header {
+  gap: 12px;
+}
+
+.chat-header > div:first-child {
+  min-width: 0;
+}
+
+.chat-header p {
+  margin: 3px 0 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-switcher {
+  display: inline-grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 5px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  padding: 4px;
+}
+
+.chat-switcher button,
+.dm-back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+}
+
+.chat-switcher button {
+  width: 34px;
+  height: 32px;
+}
+
+.chat-switcher button.active {
+  background: #fff;
+  color: var(--blue);
+  box-shadow: 0 2px 8px rgba(22, 26, 36, 0.08);
+}
+
 .messages {
   display: flex;
   flex: 1;
@@ -866,9 +916,124 @@ input:focus {
   color: var(--blue);
 }
 
+.avatar-stack {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.presence-dot {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 10px;
+  height: 10px;
+  border: 2px solid #fff;
+  border-radius: 999px;
+  background: #a8aaa4;
+}
+
+.presence-dot.online {
+  background: #45ad76;
+}
+
+.presence-dot.offline {
+  background: #a8aaa4;
+}
+
+.dm-subhead,
+.dm-back {
+  min-height: 34px;
+}
+
+.dm-subhead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.dm-back {
+  align-self: flex-start;
+  gap: 5px;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--ink);
+  font-weight: 800;
+  padding: 0 10px;
+}
+
+.dm-list {
+  display: flex;
+  flex: 1;
+  min-height: 220px;
+  flex-direction: column;
+  gap: 6px;
+  overflow: auto;
+}
+
+.dm-thread {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--ink);
+  padding: 9px;
+  text-align: left;
+}
+
+.dm-thread:hover,
+.dm-thread:focus-visible {
+  border-color: var(--line);
+  background: #fff;
+}
+
+.dm-thread span:last-child {
+  min-width: 0;
+}
+
+.dm-thread strong,
+.dm-thread small {
+  display: block;
+}
+
+.dm-thread small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dm-message.outgoing {
+  border-color: rgba(45, 64, 220, 0.22);
+  background: #f4f6ff;
+}
+
+.empty-state {
+  display: grid;
+  min-height: 160px;
+  place-items: center;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.35;
+  padding: 16px;
+  text-align: center;
+}
+
 @media (max-width: 1120px) {
   .app-shell {
     grid-template-columns: 260px minmax(360px, 1fr);
+    overflow: auto;
   }
 
   .chat-panel {
@@ -881,6 +1046,7 @@ input:focus {
   .app-shell {
     grid-template-columns: 1fr;
     height: auto;
+    min-height: 100svh;
     overflow: visible;
     padding: 8px;
   }
@@ -891,11 +1057,63 @@ input:focus {
     min-height: auto;
   }
 
+  .side-panel {
+    gap: 14px;
+    padding: 14px;
+  }
+
+  h1 {
+    max-width: none;
+    font-size: 25px;
+  }
+
+  h2 {
+    min-width: 0;
+    overflow: hidden;
+    font-size: 22px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .status-grid,
+  .auth-actions,
+  .flag-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .people-list,
+  .messages,
+  .dm-list {
+    max-height: none;
+    min-height: 280px;
+  }
+
   .world-panel {
-    min-height: 72svh;
+    height: 78svh;
+    min-height: 520px;
+  }
+
+  .world-bottombar {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .topbar-meta {
     display: none;
+  }
+
+  .chat-panel {
+    min-height: 620px;
+  }
+
+  .call-stage {
+    right: 8px;
+    bottom: 78px;
+    width: calc(100% - 16px);
+    max-height: min(72svh, calc(100% - 98px));
+  }
+
+  .stream-grid {
+    grid-template-columns: 1fr;
   }
 }

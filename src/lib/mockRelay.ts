@@ -10,6 +10,7 @@ import {
   groupTag,
   isEphemeralKind,
   tagValue,
+  type NestrDirectMessage,
   type NestrEvent,
 } from './nostr'
 import { npubForPubkey, resolvePubkey, seededSecret, shortNpub } from './avatar'
@@ -61,11 +62,13 @@ export interface RelaySnapshot {
   group: Nip29Group
   users: MockUser[]
   messages: NestrEvent[]
+  directMessages: NestrDirectMessage[]
   joinRequests: NestrEvent[]
   moderationEvents: NestrEvent[]
   invites: NestrEvent[]
   deletedEventIds: string[]
   positions: WorldPosition[]
+  presence: Record<string, number>
   eventCount: number
 }
 
@@ -121,8 +124,10 @@ export class MockNip29Relay {
   private readonly groupId = DEFAULT_GROUP_ID
   private readonly listeners = new Set<RelayListener>()
   private readonly events: NestrEvent[] = []
+  private readonly directMessages: NestrDirectMessage[] = []
   private readonly users = new Map<string, MockUser>()
   private readonly positions = new Map<string, WorldPosition>()
+  private readonly activityAt = new Map<string, number>()
   private readonly memberPubkeys = new Set<string>()
   private readonly adminRoles = new Map<string, string[]>()
   private readonly deletedEventIds = new Set<string>()
@@ -136,6 +141,7 @@ export class MockNip29Relay {
     this.group = this.createGroup()
     demoUsers.forEach((user, index) => this.addSeedUser(user, index))
     this.seedMessages()
+    this.seedDirectMessages()
   }
 
   snapshot(): RelaySnapshot {
@@ -155,11 +161,13 @@ export class MockNip29Relay {
       group: this.group,
       users: Array.from(this.users.values()),
       messages,
+      directMessages: this.directMessages.slice().sort((a, b) => a.createdAt - b.createdAt),
       joinRequests: pendingJoinRequests(this.events, members),
       moderationEvents,
       invites: this.events.filter((event) => event.kind === NIP29_KINDS.createInvite),
       deletedEventIds: Array.from(this.deletedEventIds),
       positions: Array.from(this.positions.values()),
+      presence: Object.fromEntries(this.activityAt),
       eventCount: this.events.length,
     }
   }
@@ -213,6 +221,46 @@ export class MockNip29Relay {
       : mockSignature(template)
 
     return this.publish(event)
+  }
+
+  publishDirectMessage(senderPubkey: string, recipientPubkey: string, content: string) {
+    this.ensureKnownUser(senderPubkey)
+    this.ensureKnownUser(recipientPubkey)
+    const trimmed = content.trim()
+    if (!trimmed) return { ok: false, reason: 'invalid-message' }
+
+    const createdAt = now()
+    const id = bytesToHex(sha256(encoder.encode(`dm:${senderPubkey}:${recipientPubkey}:${trimmed}:${createdAt}`)))
+    this.directMessages.push({
+      id,
+      counterparty: recipientPubkey,
+      senderPubkey,
+      recipientPubkey,
+      content: trimmed,
+      createdAt,
+      protocol: 'mock',
+    })
+    this.recordActivity(senderPubkey, createdAt * 1000)
+    this.emit()
+
+    if (recipientPubkey !== senderPubkey) {
+      setTimeout(() => {
+        const replyAt = now()
+        this.directMessages.push({
+          id: bytesToHex(sha256(encoder.encode(`dm-reply:${id}`))),
+          counterparty: senderPubkey,
+          senderPubkey: recipientPubkey,
+          recipientPubkey: senderPubkey,
+          content: `Got it: ${trimmed.slice(0, 90)}`,
+          createdAt: replyAt,
+          protocol: 'mock',
+        })
+        this.recordActivity(recipientPubkey, replyAt * 1000)
+        this.emit()
+      }, 900)
+    }
+
+    return { ok: true, event: this.directMessages.at(-1) }
   }
 
   publishPosition(
@@ -333,6 +381,8 @@ export class MockNip29Relay {
       })
     }
 
+    this.recordActivity(event.pubkey, event.created_at * 1000)
+
     if (isNip29ModerationKind(event.kind)) {
       this.applyModerationEvent(event)
     }
@@ -384,6 +434,7 @@ export class MockNip29Relay {
       facing: 'south',
       updatedAt: Date.now(),
     })
+    this.recordActivity(user.pubkey, Date.now() - index * 3 * 60 * 1000)
   }
 
   private ensureKnownUser(pubkey: string) {
@@ -631,7 +682,30 @@ export class MockNip29Relay {
       )
 
       this.events.push(event)
+      this.recordActivity(user.pubkey, event.created_at * 1000)
     })
+  }
+
+  private seedDirectMessages() {
+    const self = demoUsers[0]
+    const peer = demoUsers[1]
+    const createdAt = now() - 120
+
+    this.directMessages.push({
+      id: bytesToHex(sha256(encoder.encode('seed-dm-brad-som'))),
+      counterparty: peer.pubkey,
+      senderPubkey: peer.pubkey,
+      recipientPubkey: self.pubkey,
+      content: 'DMs ride as NIP-17 in live mode. Mock mode keeps the thread readable.',
+      createdAt,
+      protocol: 'mock',
+    })
+    this.recordActivity(peer.pubkey, createdAt * 1000)
+  }
+
+  private recordActivity(pubkey: string, atMs = Date.now()) {
+    const previous = this.activityAt.get(pubkey) ?? 0
+    if (atMs > previous) this.activityAt.set(pubkey, atMs)
   }
 
   private emit(event?: NestrEvent) {

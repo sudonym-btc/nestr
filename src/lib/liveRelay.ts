@@ -13,6 +13,7 @@ import {
   OFFICE_KINDS,
   groupTag,
   tagValue,
+  type NestrDirectMessage,
   type NestrEvent,
   type NestrSigner,
 } from './nostr'
@@ -40,6 +41,8 @@ import {
   positionEventTime,
   shouldApplyPositionUpdate,
 } from './positionEvents'
+import { createNip17DirectMessage, unwrapNip17DirectMessage } from './nip17'
+import { ACTIVITY_KINDS, PRESENCE_WINDOW_MS } from './presence'
 import type { WorldPosition } from './world'
 
 const encoder = new TextEncoder()
@@ -98,10 +101,12 @@ export class LiveNip29Relay {
   private readonly listeners = new Set<(snapshot: RelaySnapshot, event?: NestrEvent) => void>()
   private readonly profilePool = new SimplePool({ enableReconnect: true })
   private readonly events = new Map<string, NestrEvent>()
+  private readonly directMessages = new Map<string, NestrDirectMessage>()
   private readonly positions = new Map<string, WorldPosition>()
   private readonly users = new Map<string, MockUser>()
   private readonly profiles = new Map<string, NestrEvent>()
   private readonly blossomServers = new Map<string, string[]>()
+  private readonly activityAt = new Map<string, number>()
   private readonly memberPubkeys = new Set<string>()
   private readonly adminRoles = new Map<string, string[]>()
   private readonly deletedEventIds = new Set<string>()
@@ -109,6 +114,9 @@ export class LiveNip29Relay {
   private readonly timelineRefs: string[] = []
   private relay?: Relay
   private groupSub?: ReturnType<Relay['subscribe']>
+  private dmSub?: ReturnType<Relay['subscribe']>
+  private readonly dmRelaySubs: ReturnType<SimplePool['subscribe']>[] = []
+  private presenceSub?: ReturnType<SimplePool['subscribe']>
   private profileFetchTimer?: ReturnType<typeof setTimeout>
   private group: Nip29Group
   private signer?: NestrSigner
@@ -155,11 +163,13 @@ export class LiveNip29Relay {
       group: this.group,
       users: Array.from(this.users.values()),
       messages,
+      directMessages: Array.from(this.directMessages.values()).sort((a, b) => a.createdAt - b.createdAt),
       joinRequests: pendingJoinRequests(events, this.memberPubkeys),
       moderationEvents,
       invites: events.filter((event) => event.kind === NIP29_KINDS.createInvite),
       deletedEventIds: Array.from(this.deletedEventIds),
       positions: Array.from(this.positions.values()),
+      presence: Object.fromEntries(this.activityAt),
       eventCount: this.events.size,
     }
   }
@@ -173,13 +183,18 @@ export class LiveNip29Relay {
   async setSigner(signer: NestrSigner) {
     this.signer = signer
     this.upsertUser(signer.pubkey)
+    this.recordActivity(signer.pubkey)
     this.connectionMessage = `${signer.label} connected`
     this.emit()
     await this.authenticateAndRefetch()
+    this.openDmSubscription()
   }
 
   clearSigner() {
     this.signer = undefined
+    this.dmSub?.close()
+    this.dmSub = undefined
+    this.closeDmRelaySubs()
     this.connectionMessage = 'signer disconnected'
     this.emit()
   }
@@ -206,6 +221,34 @@ export class LiveNip29Relay {
     })
 
     return this.publishSigned(event)
+  }
+
+  async publishDirectMessage(pubkey: string, recipientPubkey: string, content: string) {
+    const trimmed = content.trim()
+    if (!trimmed || !this.signer || this.signer.pubkey !== pubkey || !this.relay) {
+      return { ok: false, reason: 'live-signer-required' }
+    }
+
+    try {
+      const { message, wraps } = await createNip17DirectMessage(this.signer, recipientPubkey, trimmed)
+      this.directMessages.set(message.id, message)
+      this.upsertUser(recipientPubkey)
+      this.queueProfileFetch([recipientPubkey])
+      this.recordActivity(pubkey, message.createdAt * 1000)
+      this.emit()
+
+      const relayUrls = await this.fetchDmRelays(recipientPubkey)
+      const publishRelays = Array.from(new Set([this.relayUrl, ...relayUrls]))
+      for (const wrap of wraps) {
+        await this.publishToRelays(wrap, publishRelays)
+      }
+
+      return { ok: true, event: wraps[0] }
+    } catch (error) {
+      this.connectionMessage = error instanceof Error ? error.message : String(error)
+      this.emit()
+      return { ok: false, reason: this.connectionMessage }
+    }
   }
 
   async publishPosition(
@@ -309,6 +352,9 @@ export class LiveNip29Relay {
 
   close() {
     this.groupSub?.close()
+    this.dmSub?.close()
+    this.closeDmRelaySubs()
+    this.presenceSub?.close()
     if (this.profileFetchTimer) clearTimeout(this.profileFetchTimer)
     this.profilePool.destroy()
     this.relay?.close()
@@ -326,6 +372,7 @@ export class LiveNip29Relay {
       }
 
       this.openGroupSubscription()
+      this.openDmSubscription()
       if (this.signer) void this.authenticateAndRefetch()
       this.emit()
     } catch (error) {
@@ -361,6 +408,77 @@ export class LiveNip29Relay {
       oneose: () => this.emit(),
       eoseTimeout: 3500,
     })
+  }
+
+  private openDmSubscription() {
+    if (!this.relay || !this.signer) return
+
+    this.dmSub?.close()
+    this.dmSub = this.relay.subscribe(
+      [{ kinds: [1059], '#p': [this.signer.pubkey], limit: 120 }],
+      {
+        onevent: (event) => {
+          void this.receiveDirectMessage(event as NestrEvent)
+        },
+        onclose: (reason) => {
+          if (reason?.startsWith('auth-required') && this.signer) {
+            this.connectionMessage = 'relay requested NIP-42 auth for DMs'
+            this.emit()
+            void this.authenticateAndRefetch().then(() => this.openDmSubscription())
+          }
+        },
+        eoseTimeout: 3500,
+      },
+    )
+    void this.openDmRelaySubscriptions()
+  }
+
+  private async openDmRelaySubscriptions() {
+    if (!this.signer) return
+    this.closeDmRelaySubs()
+
+    const relayUrls = (await this.fetchDmRelays(this.signer.pubkey)).filter((url) => url !== this.relayUrl)
+    if (relayUrls.length === 0) return
+
+    const sub = this.profilePool.subscribe(
+      relayUrls,
+      { kinds: [1059], '#p': [this.signer.pubkey], limit: 120 },
+      {
+        onevent: (event) => {
+          void this.receiveDirectMessage(event as NestrEvent)
+        },
+        onauth: relayAuthSigner(this.signer),
+        eoseTimeout: 3500,
+      },
+    )
+    this.dmRelaySubs.push(sub)
+  }
+
+  private closeDmRelaySubs() {
+    this.dmRelaySubs.splice(0).forEach((sub) => sub.close())
+  }
+
+  private refreshPresenceSubscription() {
+    const authors = Array.from(new Set([...this.memberPubkeys, ...this.adminRoles.keys()]))
+      .filter((pubkey) => /^[0-9a-f]{64}$/i.test(pubkey))
+      .sort()
+    this.presenceSub?.close()
+    this.presenceSub = undefined
+    if (authors.length === 0) return
+
+    const relays = Array.from(new Set([this.relayUrl, ...PROFILE_RELAYS]))
+    const since = Math.floor((Date.now() - PRESENCE_WINDOW_MS) / 1000)
+    this.presenceSub = this.profilePool.subscribe(
+      relays,
+      { kinds: ACTIVITY_KINDS, authors, since, limit: authors.length * 4 },
+      {
+        onevent: (event) => {
+          this.recordActivity(event.pubkey, event.created_at * 1000)
+          this.emit()
+        },
+        eoseTimeout: 3500,
+      },
+    )
   }
 
   private async authenticateAndRefetch() {
@@ -415,6 +533,37 @@ export class LiveNip29Relay {
     }
   }
 
+  private async publishRaw(event: NestrEvent) {
+    try {
+      return await this.relay!.publish(event)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (message.startsWith('auth-required') && this.signer) {
+        await this.authenticateAndRefetch()
+        return this.relay!.publish(event)
+      }
+
+      throw error
+    }
+  }
+
+  private async publishToRelays(event: NestrEvent, relayUrls: string[]) {
+    const unique = Array.from(new Set(relayUrls))
+    const current = unique.includes(this.relayUrl)
+    const extraRelays = unique.filter((url) => url !== this.relayUrl)
+
+    if (current) await this.publishRaw(event)
+    if (extraRelays.length > 0) {
+      const signer = this.signer
+      await Promise.all(
+        this.profilePool.publish(extraRelays, event, {
+          maxWait: 4000,
+          onauth: signer ? relayAuthSigner(signer) : undefined,
+        }),
+      )
+    }
+  }
+
   private async publishNip29Event(
     pubkey: string,
     kind: number,
@@ -455,6 +604,7 @@ export class LiveNip29Relay {
       this.timelineRefs.unshift(event.id.slice(0, 8))
       this.timelineRefs.splice(50)
     }
+    this.recordActivity(event.pubkey, event.created_at * 1000)
     this.upsertUser(event.pubkey)
     this.queueProfileFetch([event.pubkey, ...profilePubkeysFromReferences(event.content, event.tags)])
 
@@ -499,6 +649,18 @@ export class LiveNip29Relay {
     this.emit(event)
   }
 
+  private async receiveDirectMessage(event: NestrEvent) {
+    if (!this.signer) return
+    const message = await unwrapNip17DirectMessage(this.signer, event)
+    if (!message) return
+
+    this.directMessages.set(message.id, message)
+    this.upsertUser(message.counterparty)
+    this.queueProfileFetch([message.counterparty, message.senderPubkey, message.recipientPubkey])
+    this.recordActivity(message.senderPubkey, message.createdAt * 1000)
+    this.emit(event)
+  }
+
   private applyModerationEvent(event: NestrEvent) {
     if (event.kind === NIP29_KINDS.putUser) {
       const pubkey = targetPubkey(event)
@@ -509,6 +671,7 @@ export class LiveNip29Relay {
       else this.adminRoles.delete(pubkey)
       this.upsertUser(pubkey)
       this.queueProfileFetch([pubkey])
+      this.refreshPresenceSubscription()
     }
 
     if (event.kind === NIP29_KINDS.removeUser) {
@@ -518,6 +681,7 @@ export class LiveNip29Relay {
       this.adminRoles.delete(pubkey)
       this.positions.delete(pubkey)
       this.users.delete(pubkey)
+      this.refreshPresenceSubscription()
     }
 
     if (event.kind === NIP29_KINDS.editMetadata) {
@@ -551,6 +715,7 @@ export class LiveNip29Relay {
           this.adminRoles.set(tag[1], tag.slice(2).filter(Boolean))
           this.upsertUser(tag[1])
         })
+      this.refreshPresenceSubscription()
     }
     if (event.kind === 39002) {
       this.group = { ...this.group, members: event }
@@ -561,6 +726,7 @@ export class LiveNip29Relay {
           this.memberPubkeys.add(tag[1])
           this.upsertUser(tag[1])
         })
+      this.refreshPresenceSubscription()
     }
     if (event.kind === 39003) this.group = { ...this.group, roles: event }
     if (event.kind === NIP29_KINDS.groupAdmins || event.kind === NIP29_KINDS.groupMembers) {
@@ -619,6 +785,24 @@ export class LiveNip29Relay {
     }, 120)
   }
 
+  private async fetchDmRelays(pubkey: string) {
+    const relays = Array.from(new Set([this.relayUrl, ...PROFILE_RELAYS]))
+    try {
+      const events = (await this.profilePool.querySync(
+        relays,
+        { kinds: [10050], authors: [pubkey], limit: 8 },
+        { maxWait: 3000 },
+      )) as NestrEvent[]
+      const newest = events.sort((a, b) => b.created_at - a.created_at)[0]
+      if (!newest) return []
+      return newest.tags
+        .filter((tag) => (tag[0] === 'relay' || tag[0] === 'r') && /^wss:\/\//i.test(tag[1] ?? ''))
+        .map((tag) => tag[1])
+    } catch {
+      return []
+    }
+  }
+
   private async fetchQueuedProfiles() {
     const authors = Array.from(this.profileQueue).slice(0, 80)
     authors.forEach((pubkey) => this.profileQueue.delete(pubkey))
@@ -655,6 +839,11 @@ export class LiveNip29Relay {
 
   private previousTags() {
     return this.timelineRefs.slice(0, 3).map((id) => ['previous', id])
+  }
+
+  private recordActivity(pubkey: string, atMs = Date.now()) {
+    const previous = this.activityAt.get(pubkey) ?? 0
+    if (atMs > previous) this.activityAt.set(pubkey, atMs)
   }
 
   private emit(event?: NestrEvent) {

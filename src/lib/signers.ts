@@ -21,6 +21,10 @@ declare global {
         created_at: number
         sig: string
       }>
+      nip44?: {
+        encrypt: (pubkey: string, plaintext: string) => Promise<string>
+        decrypt: (pubkey: string, ciphertext: string) => Promise<string>
+      }
     }
   }
 }
@@ -33,6 +37,9 @@ function randomHex(bytes = 16) {
 
 export const NESTR_NIP46_PERMISSIONS = [
   'get_public_key',
+  'nip44_encrypt',
+  'nip44_decrypt',
+  'sign_event:13',
   'sign_event:9',
   'sign_event:9000',
   'sign_event:9001',
@@ -57,6 +64,12 @@ export async function connectNip07Signer(): Promise<NestrSigner> {
     pubkey,
     label: 'NIP-07',
     signEvent: (event) => window.nostr!.signEvent(event),
+    nip44Encrypt: window.nostr.nip44?.encrypt
+      ? (thirdPartyPubkey, plaintext) => window.nostr!.nip44!.encrypt(thirdPartyPubkey, plaintext)
+      : undefined,
+    nip44Decrypt: window.nostr.nip44?.decrypt
+      ? (thirdPartyPubkey, ciphertext) => window.nostr!.nip44!.decrypt(thirdPartyPubkey, ciphertext)
+      : undefined,
     ping: async () => {
       const current = await window.nostr!.getPublicKey()
       if (current !== pubkey) throw new Error('NIP-07 signer switched accounts')
@@ -101,6 +114,8 @@ function signerAdapter(signer: BunkerSigner, pubkey: string): NestrSigner {
     pubkey,
     label: 'NIP-46',
     signEvent: (event) => signer.signEvent(event),
+    nip44Encrypt: (thirdPartyPubkey, plaintext) => signer.nip44Encrypt(thirdPartyPubkey, plaintext),
+    nip44Decrypt: (thirdPartyPubkey, ciphertext) => signer.nip44Decrypt(thirdPartyPubkey, ciphertext),
     ping: () => signer.ping(),
     close: () => signer.close(),
   }

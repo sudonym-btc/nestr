@@ -3,12 +3,14 @@ import * as QRCode from 'qrcode'
 import {
   Camera,
   CameraOff,
+  ChevronLeft,
   Check,
   DoorOpen,
   Edit3,
   LockKeyhole,
   LogIn,
   LogOut,
+  Mail,
   Maximize2,
   MessageCircle,
   Mic,
@@ -41,6 +43,8 @@ import {
 } from './lib/nip29'
 import { createMockPeerVideo, type MockPeerVideo } from './lib/mockVideo'
 import { parseNostrReferences, type EntityPart } from './lib/nostrReferences'
+import { playMessageSound, primeMessageSound } from './lib/messageSound'
+import { isOnlineFromActivity } from './lib/presence'
 import {
   connectNip07Signer,
   restoreNostrConnectSigner,
@@ -233,6 +237,9 @@ function App() {
   const [selfPubkey, setSelfPubkey] = useState(() => snapshot.users[0]?.pubkey ?? seededPubkey('live-viewer'))
   const [npubInput, setNpubInput] = useState<string>(() => npubForPubkey(snapshot.users[0]?.pubkey ?? selfPubkey))
   const [message, setMessage] = useState('')
+  const [chatMode, setChatMode] = useState<'chat' | 'dm'>('chat')
+  const [activeDmPubkey, setActiveDmPubkey] = useState<string | null>(null)
+  const [dmMessage, setDmMessage] = useState('')
   const [callStarted, setCallStarted] = useState(false)
   const [mediaState, setMediaState] = useState<'idle' | 'requesting' | 'live' | 'blocked'>('idle')
   const [localStream, setLocalStream] = useState<MediaStream | null>(null)
@@ -260,6 +267,8 @@ function App() {
   const [nostrConnectQr, setNostrConnectQr] = useState<string | null>(null)
   const callStageRef = useRef<HTMLDivElement | null>(null)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
+  const dmMessagesEndRef = useRef<HTMLDivElement | null>(null)
+  const notifiedRef = useRef({ initialized: false, chat: new Set<string>(), dm: new Set<string>() })
   const autoAuthAttemptedRef = useRef(false)
   const authAttemptRef = useRef(0)
   const activeSignerRef = useRef<NestrSigner | null>(null)
@@ -288,6 +297,45 @@ function App() {
   const canManageGroup = currentRoles.length > 0 || currentUser?.role === 'admin' || currentUser?.role === 'moderator'
   const supportedRoles = supportedRoleTags(snapshot.group.roles)
   const visiblePeople = snapshot.users.filter((user) => groupMemberSet.has(user.pubkey) || user.pubkey === selfPubkey)
+  const isOnline = useCallback(
+    (pubkey: string) => isOnlineFromActivity(pubkey, snapshot.presence, snapshot.positions),
+    [snapshot.positions, snapshot.presence],
+  )
+  const dmThreads = useMemo(() => {
+    const byPeer = new Map<string, { pubkey: string; lastAt: number; preview: string }>()
+    snapshot.users
+      .filter((user) => user.pubkey !== selfPubkey)
+      .forEach((user) => byPeer.set(user.pubkey, { pubkey: user.pubkey, lastAt: 0, preview: '' }))
+
+    snapshot.directMessages.forEach((dm) => {
+      if (dm.senderPubkey !== selfPubkey && dm.recipientPubkey !== selfPubkey) return
+      const peer = dm.senderPubkey === selfPubkey ? dm.recipientPubkey : dm.senderPubkey
+      const current = byPeer.get(peer)
+      if (!current || dm.createdAt >= current.lastAt) {
+        byPeer.set(peer, {
+          pubkey: peer,
+          lastAt: dm.createdAt,
+          preview: `${dm.senderPubkey === selfPubkey ? 'You: ' : ''}${dm.content}`,
+        })
+      }
+    })
+
+    return Array.from(byPeer.values()).sort((a, b) => {
+      if (a.lastAt !== b.lastAt) return b.lastAt - a.lastAt
+      return nameFor(a.pubkey, snapshot.users).localeCompare(nameFor(b.pubkey, snapshot.users))
+    })
+  }, [selfPubkey, snapshot.directMessages, snapshot.users])
+  const activeDmMessages = useMemo(
+    () =>
+      activeDmPubkey
+        ? snapshot.directMessages.filter(
+            (dm) =>
+              (dm.senderPubkey === selfPubkey && dm.recipientPubkey === activeDmPubkey) ||
+              (dm.senderPubkey === activeDmPubkey && dm.recipientPubkey === selfPubkey),
+          )
+        : [],
+    [activeDmPubkey, selfPubkey, snapshot.directMessages],
+  )
   const metadataBaseDraft = useMemo(
     () => groupMetadataDraft(snapshot.group.metadata),
     [snapshot.group.metadata],
@@ -363,6 +411,47 @@ function App() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ block: 'end' })
   }, [snapshot.messages.length, snapshot.group.id])
+
+  useEffect(() => {
+    dmMessagesEndRef.current?.scrollIntoView({ block: 'end' })
+  }, [activeDmPubkey, activeDmMessages.length])
+
+  useEffect(() => {
+    const prime = () => {
+      void primeMessageSound()
+    }
+    window.addEventListener('pointerdown', prime)
+    window.addEventListener('keydown', prime)
+    return () => {
+      window.removeEventListener('pointerdown', prime)
+      window.removeEventListener('keydown', prime)
+    }
+  }, [])
+
+  useEffect(() => {
+    const notified = notifiedRef.current
+    if (!notified.initialized) {
+      snapshot.messages.forEach((event) => notified.chat.add(event.id))
+      snapshot.directMessages.forEach((dm) => notified.dm.add(dm.id))
+      notified.initialized = true
+      return
+    }
+
+    let shouldPlay = false
+    const isChatMember = relay.mode === 'mock' || currentIsMember
+    snapshot.messages.forEach((event) => {
+      if (notified.chat.has(event.id)) return
+      notified.chat.add(event.id)
+      if (isChatMember && event.pubkey !== selfPubkey) shouldPlay = true
+    })
+    snapshot.directMessages.forEach((dm) => {
+      if (notified.dm.has(dm.id)) return
+      notified.dm.add(dm.id)
+      if (dm.senderPubkey !== selfPubkey && dm.recipientPubkey === selfPubkey) shouldPlay = true
+    })
+
+    if (shouldPlay) playMessageSound()
+  }, [currentIsMember, relay.mode, selfPubkey, snapshot.directMessages, snapshot.messages])
 
   const clearConnectSession = useCallback(() => {
     connectSessionRef.current?.abort()
@@ -597,6 +686,23 @@ function App() {
       return
     }
     setMessage('')
+  }
+
+  async function sendDirectMessage(event: FormEvent) {
+    event.preventDefault()
+    if (!activeDmPubkey) return
+
+    const result = await relay.publishDirectMessage(selfPubkey, activeDmPubkey, dmMessage)
+    if (!result.ok) {
+      setAuthStatus(
+        result.reason === 'live-signer-required'
+          ? 'connect a signer to send encrypted NIP-17 DMs'
+          : String(result.reason),
+      )
+      return
+    }
+
+    setDmMessage('')
   }
 
   async function runNip29Action(label: string, action: () => Promise<{ ok: boolean; reason?: string }> | { ok: boolean; reason?: string }) {
@@ -1144,7 +1250,13 @@ function App() {
                 setCallExpanded(false)
               }}
             >
-              <AvatarChip pubkey={user.pubkey} user={user} />
+              <span className="avatar-stack">
+                <AvatarChip pubkey={user.pubkey} user={user} />
+                <span
+                  className={`presence-dot ${isOnline(user.pubkey) ? 'online' : 'offline'}`}
+                  title={isOnline(user.pubkey) ? 'Online' : 'Offline'}
+                />
+              </span>
               <span>
                 <strong>{user.pubkey === selfPubkey ? 'You' : user.name}</strong>
                 <small>{user.role}</small>
@@ -1236,60 +1348,176 @@ function App() {
         )}
       </section>
 
-      <aside className="side-panel chat-panel" aria-label="Global NIP-29 chat">
+      <aside className="side-panel chat-panel" aria-label="Chat and direct messages">
         <div className="chat-header">
           <div>
-            <p className="eyebrow">global</p>
-            <h2>Chat</h2>
+            <h2>{chatMode === 'chat' ? 'Chat' : activeDmPubkey ? nameFor(activeDmPubkey, snapshot.users) : 'DMs'}</h2>
+            {chatMode === 'dm' && activeDmPubkey && (
+              <p>{shortNpub(activeDmPubkey)} · NIP-17</p>
+            )}
           </div>
-          <MessageCircle size={22} />
-        </div>
-
-        <div className="messages" role="log" aria-label="Messages">
-          {snapshot.messages.map((event) => {
-            const sender = snapshot.users.find((user) => user.pubkey === event.pubkey)
-
-            return (
-              <article key={event.id} className="message">
-                <div className="message-meta">
-                  <AvatarChip pubkey={event.pubkey} user={sender} small />
-                  <strong>{nameFor(event.pubkey, snapshot.users)}</strong>
-                  <time>{new Date(event.created_at * 1000).toLocaleTimeString([], {
-                    hour: '2-digit',
-                    minute: '2-digit',
-                  })}</time>
-                  {canManageGroup && (
-                    <button
-                      type="button"
-                      className="message-delete"
-                      onClick={() => void deleteEvent(event.id)}
-                      aria-label={`Delete message from ${nameFor(event.pubkey, snapshot.users)}`}
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                  )}
-                </div>
-                <MessageContent event={event} users={snapshot.users} />
-              </article>
-            )
-          })}
-          <div ref={messagesEndRef} />
-        </div>
-
-        <form className="composer" onSubmit={sendMessage}>
-          <label htmlFor="message">Message</label>
-          <div className="input-row">
-            <input
-              id="message"
-              value={message}
-              onChange={(event) => setMessage(event.target.value)}
-              placeholder="Write to the room"
-            />
-            <button type="submit" aria-label="Send message">
-              <Send size={18} />
+          <div className="chat-switcher" role="tablist" aria-label="Messaging mode">
+            <button
+              type="button"
+              className={chatMode === 'chat' ? 'active' : ''}
+              onClick={() => setChatMode('chat')}
+              aria-label="Open chat"
+              aria-selected={chatMode === 'chat'}
+            >
+              <MessageCircle size={19} />
+            </button>
+            <button
+              type="button"
+              className={chatMode === 'dm' ? 'active' : ''}
+              onClick={() => setChatMode('dm')}
+              aria-label="Open direct messages"
+              aria-selected={chatMode === 'dm'}
+            >
+              <Mail size={19} />
             </button>
           </div>
-        </form>
+        </div>
+
+        {chatMode === 'chat' ? (
+          <>
+            <div className="messages" role="log" aria-label="Messages">
+              {snapshot.messages.map((event) => {
+                const sender = snapshot.users.find((user) => user.pubkey === event.pubkey)
+
+                return (
+                  <article key={event.id} className="message">
+                    <div className="message-meta">
+                      <AvatarChip pubkey={event.pubkey} user={sender} small />
+                      <strong>{nameFor(event.pubkey, snapshot.users)}</strong>
+                      <time>{new Date(event.created_at * 1000).toLocaleTimeString([], {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      })}</time>
+                      {canManageGroup && (
+                        <button
+                          type="button"
+                          className="message-delete"
+                          onClick={() => void deleteEvent(event.id)}
+                          aria-label={`Delete message from ${nameFor(event.pubkey, snapshot.users)}`}
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      )}
+                    </div>
+                    <MessageContent event={event} users={snapshot.users} />
+                  </article>
+                )
+              })}
+              <div ref={messagesEndRef} />
+            </div>
+
+            <form className="composer" onSubmit={sendMessage}>
+              <label htmlFor="message">Message</label>
+              <div className="input-row">
+                <input
+                  id="message"
+                  value={message}
+                  onChange={(event) => setMessage(event.target.value)}
+                  placeholder="Write to the room"
+                />
+                <button type="submit" aria-label="Send message">
+                  <Send size={18} />
+                </button>
+              </div>
+            </form>
+          </>
+        ) : (
+          <>
+            {activeDmPubkey ? (
+              <button
+                type="button"
+                className="dm-back"
+                onClick={() => setActiveDmPubkey(null)}
+              >
+                <ChevronLeft size={17} />
+                Threads
+              </button>
+            ) : (
+              <div className="dm-subhead">
+                <span>{relay.mode === 'live' ? 'Gift-wrapped NIP-17' : 'Mock NIP-17'}</span>
+                <span>{dmThreads.length} threads</span>
+              </div>
+            )}
+
+            {activeDmPubkey ? (
+              <>
+                <div className="messages dm-messages" role="log" aria-label="Direct messages">
+                  {activeDmMessages.length === 0 && (
+                    <div className="empty-state">
+                      Start an encrypted conversation with {nameFor(activeDmPubkey, snapshot.users)}.
+                    </div>
+                  )}
+                  {activeDmMessages.map((dm) => {
+                    const outgoing = dm.senderPubkey === selfPubkey
+                    const sender = snapshot.users.find((user) => user.pubkey === dm.senderPubkey)
+
+                    return (
+                      <article key={dm.id} className={`message dm-message ${outgoing ? 'outgoing' : 'incoming'}`}>
+                        <div className="message-meta">
+                          <AvatarChip pubkey={dm.senderPubkey} user={sender} small />
+                          <strong>{outgoing ? 'You' : nameFor(dm.senderPubkey, snapshot.users)}</strong>
+                          <time>{new Date(dm.createdAt * 1000).toLocaleTimeString([], {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })}</time>
+                        </div>
+                        <p>{dm.content}</p>
+                      </article>
+                    )
+                  })}
+                  <div ref={dmMessagesEndRef} />
+                </div>
+
+                <form className="composer" onSubmit={sendDirectMessage}>
+                  <label htmlFor="dm-message">Direct message</label>
+                  <div className="input-row">
+                    <input
+                      id="dm-message"
+                      value={dmMessage}
+                      onChange={(event) => setDmMessage(event.target.value)}
+                      placeholder="Send a NIP-17 DM"
+                    />
+                    <button type="submit" aria-label="Send direct message">
+                      <Send size={18} />
+                    </button>
+                  </div>
+                </form>
+              </>
+            ) : (
+              <div className="dm-list" role="list" aria-label="Direct message threads">
+                {dmThreads.map((thread) => {
+                  const user = snapshot.users.find((candidate) => candidate.pubkey === thread.pubkey)
+                  return (
+                    <button
+                      key={thread.pubkey}
+                      type="button"
+                      role="listitem"
+                      className="dm-thread"
+                      onClick={() => setActiveDmPubkey(thread.pubkey)}
+                    >
+                      <span className="avatar-stack">
+                        <AvatarChip pubkey={thread.pubkey} user={user} />
+                        <span
+                          className={`presence-dot ${isOnline(thread.pubkey) ? 'online' : 'offline'}`}
+                          title={isOnline(thread.pubkey) ? 'Online' : 'Offline'}
+                        />
+                      </span>
+                      <span>
+                        <strong>{nameFor(thread.pubkey, snapshot.users)}</strong>
+                        <small>{thread.preview || shortNpub(thread.pubkey)}</small>
+                      </span>
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+          </>
+        )}
       </aside>
     </main>
   )

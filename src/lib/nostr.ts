@@ -26,6 +26,13 @@ export const OFFICE_KINDS = {
   callHangup: 25053,
 } as const
 
+export const DM_KINDS = {
+  seal: 13,
+  directMessage: 14,
+  inboxRelays: 10050,
+  giftWrap: 1059,
+} as const
+
 export type NostrTag = string[]
 
 export interface NestrEvent {
@@ -44,8 +51,21 @@ export interface NestrSigner {
   pubkey: string
   label: string
   signEvent: (event: NestrEventTemplate) => Promise<NestrEvent>
+  nip44Encrypt?: (pubkey: string, plaintext: string) => Promise<string>
+  nip44Decrypt?: (pubkey: string, ciphertext: string) => Promise<string>
   ping?: () => Promise<void>
   close?: () => void | Promise<void>
+}
+
+export interface NestrDirectMessage {
+  id: string
+  eventId?: string
+  counterparty: string
+  senderPubkey: string
+  recipientPubkey: string
+  content: string
+  createdAt: number
+  protocol: 'nip17' | 'mock'
 }
 
 export function tagValue(event: Pick<NestrEvent, 'tags'>, name: string) {
