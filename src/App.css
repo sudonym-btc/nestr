@@ -227,6 +227,16 @@ input:focus {
   line-height: 1.35;
 }
 
+.app-shell[data-auth-state="reconnecting"] .auth-status {
+  border-color: #e0bd6f;
+  background: #fff9e8;
+}
+
+.app-shell[data-auth-state="disconnected"] .auth-status {
+  border-color: #efb5aa;
+  background: #fff6f3;
+}
+
 .auth-actions {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -235,6 +245,7 @@ input:focus {
 
 .connect-card {
   display: grid;
+  justify-items: center;
   gap: 8px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -255,18 +266,6 @@ input:focus {
   font-size: 13px;
   font-weight: 800;
   text-align: center;
-}
-
-.connect-card textarea {
-  width: 100%;
-  min-height: 76px;
-  resize: vertical;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  color: var(--ink);
-  font-family: var(--mono);
-  font-size: 11px;
-  padding: 8px;
 }
 
 .admin-panel {

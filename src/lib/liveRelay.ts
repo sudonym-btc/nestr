@@ -178,6 +178,12 @@ export class LiveNip29Relay {
     await this.authenticateAndRefetch()
   }
 
+  clearSigner() {
+    this.signer = undefined
+    this.connectionMessage = 'signer disconnected'
+    this.emit()
+  }
+
   joinWithNpub(value: string) {
     const pubkey = placeholderPubkey(`watch:${value}`)
     const user = userFromPubkey(pubkey, 'watching')

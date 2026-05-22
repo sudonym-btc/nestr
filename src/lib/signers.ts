@@ -57,6 +57,10 @@ export async function connectNip07Signer(): Promise<NestrSigner> {
     pubkey,
     label: 'NIP-07',
     signEvent: (event) => window.nostr!.signEvent(event),
+    ping: async () => {
+      const current = await window.nostr!.getPublicKey()
+      if (current !== pubkey) throw new Error('NIP-07 signer switched accounts')
+    },
   }
 }
 
@@ -97,6 +101,8 @@ function signerAdapter(signer: BunkerSigner, pubkey: string): NestrSigner {
     pubkey,
     label: 'NIP-46',
     signEvent: (event) => signer.signEvent(event),
+    ping: () => signer.ping(),
+    close: () => signer.close(),
   }
 }
 

@@ -44,6 +44,8 @@ export interface NestrSigner {
   pubkey: string
   label: string
   signEvent: (event: NestrEventTemplate) => Promise<NestrEvent>
+  ping?: () => Promise<void>
+  close?: () => void | Promise<void>
 }
 
 export function tagValue(event: Pick<NestrEvent, 'tags'>, name: string) {

@@ -6,16 +6,16 @@ import {
   Check,
   DoorOpen,
   Edit3,
-  KeyRound,
   LockKeyhole,
   LogIn,
+  LogOut,
   Maximize2,
   MessageCircle,
   Mic,
   MicOff,
-  QrCode,
   Minimize2,
   Radio,
+  RefreshCcw,
   Send,
   ShieldCheck,
   Ticket,
@@ -87,6 +87,22 @@ function randomInviteCode() {
   const bytes = new Uint8Array(4)
   crypto.getRandomValues(bytes)
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string) {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(message)), timeoutMs)
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer)
+        resolve(value)
+      },
+      (error) => {
+        window.clearTimeout(timer)
+        reject(error)
+      },
+    )
+  })
 }
 
 interface AvatarChipProps {
@@ -185,6 +201,8 @@ interface StreamTileProps {
   muted?: boolean
 }
 
+type AuthState = 'mock' | 'idle' | 'connecting' | 'reconnecting' | 'connected' | 'disconnected'
+
 function StreamTile({ label, sublabel, stream, muted = false }: StreamTileProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null)
 
@@ -222,10 +240,14 @@ function App() {
   const [cameraEnabled, setCameraEnabled] = useState(true)
   const [micEnabled, setMicEnabled] = useState(true)
   const [callExpanded, setCallExpanded] = useState(false)
-  const [authBusy, setAuthBusy] = useState(false)
+  const [authState, setAuthState] = useState<AuthState>(() => (launch.mode === 'live' ? 'idle' : 'mock'))
   const [authStatus, setAuthStatus] = useState(() =>
     launch.mode === 'live' ? 'opening live NIP-29 room' : 'local mock relay',
   )
+  const [authDetail, setAuthDetail] = useState(() =>
+    launch.mode === 'live' ? 'waiting for signer' : 'local mock relay',
+  )
+  const [activeSigner, setActiveSigner] = useState<NestrSigner | null>(null)
   const [adminStatus, setAdminStatus] = useState('NIP-29 controls ready')
   const [joinReason, setJoinReason] = useState('')
   const [joinCode, setJoinCode] = useState('')
@@ -239,6 +261,9 @@ function App() {
   const callStageRef = useRef<HTMLDivElement | null>(null)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
   const autoAuthAttemptedRef = useRef(false)
+  const authAttemptRef = useRef(0)
+  const activeSignerRef = useRef<NestrSigner | null>(null)
+  const connectSessionRef = useRef<NostrConnectSession | null>(null)
   const remoteVideosRef = useRef<MockPeerVideo[]>([])
 
   const activeCount = Math.max(snapshot.positions.length, snapshot.users.length)
@@ -252,8 +277,10 @@ function App() {
   const metadataName = tagValue(snapshot.group.metadata, 'name') ?? 'NIP-29 office'
   const groupAbout = tagValue(snapshot.group.metadata, 'about') ?? ''
   const connectionStatus = snapshot.connectionStatus ?? relay.mode
-  const connectionMessage = snapshot.connectionMessage ?? authStatus
+  const connectionMessage = authDetail || snapshot.connectionMessage || authStatus
   const currentUser = snapshot.users.find((user) => user.pubkey === selfPubkey)
+  const isSignedIn = relay.mode === 'mock' || authState === 'connected'
+  const showMesh = isSignedIn && nearby.length > 0
   const groupMemberPubkeys = useMemo(() => memberPubkeys(snapshot.group.members), [snapshot.group.members])
   const groupMemberSet = useMemo(() => new Set(groupMemberPubkeys), [groupMemberPubkeys])
   const currentRoles = rolesForPubkey(snapshot, selfPubkey)
@@ -337,55 +364,78 @@ function App() {
     messagesEndRef.current?.scrollIntoView({ block: 'end' })
   }, [snapshot.messages.length, snapshot.group.id])
 
+  const clearConnectSession = useCallback(() => {
+    connectSessionRef.current?.abort()
+    connectSessionRef.current = null
+    setConnectSession(null)
+    setNostrConnectQr(null)
+  }, [])
+
   const applySigner = useCallback(
     async (signer: NestrSigner) => {
       if (relay.mode !== 'live') return
 
       const spawn = spawnForPubkey(officeMap, signer.pubkey, snapshot.users.length)
       await relay.setSigner(signer)
+      activeSignerRef.current = signer
+      setActiveSigner(signer)
+      setAuthState('connected')
       setSelfPubkey(signer.pubkey)
       setNpubInput(npubForPubkey(signer.pubkey))
       setCallStarted(false)
       stopRemoteVideos()
       setCallExpanded(false)
-      setNostrConnectQr(null)
-      setConnectSession(null)
       setAuthStatus(`${signer.label} connected as ${shortNpub(signer.pubkey)}`)
+      setAuthDetail('signer online')
+      clearConnectSession()
 
       const result = await relay.publishPosition(signer.pubkey, spawn.x, spawn.y, 0, 0)
       if (!result.ok && result.reason !== 'throttled') {
-        setAuthStatus(`${signer.label} connected; position publish failed: ${result.reason}`)
+        setAuthDetail(`position publish failed: ${result.reason}`)
       }
     },
-    [officeMap, relay, snapshot.users.length],
+    [clearConnectSession, officeMap, relay, snapshot.users.length],
   )
 
-  const connectBrowserSigner = useCallback(
-    async (isAutoAttempt = false) => {
-      if (relay.mode !== 'live') return
-
-      setAuthBusy(true)
-      setAuthStatus(isAutoAttempt ? 'asking NIP-07 signer' : 'opening NIP-07 signer')
-      try {
-        const signer = await connectNip07Signer()
-        await applySigner(signer)
-      } catch (error) {
-        setAuthStatus(errorMessage(error))
-      } finally {
-        setAuthBusy(false)
-      }
+  const markSignerDisconnected = useCallback(
+    (detail: string) => {
+      activeSignerRef.current = null
+      setActiveSigner(null)
+      setAuthState('disconnected')
+      setAuthStatus('signer disconnected')
+      setAuthDetail(detail)
+      if (relay.mode === 'live') relay.clearSigner()
     },
-    [applySigner, relay],
+    [relay],
   )
 
-  const connectRemoteSigner = useCallback(async () => {
+  const completeAuthAttempt = useCallback(
+    async (attempt: number, signer: NestrSigner, storedSession?: Awaited<ReturnType<typeof readStoredNostrConnectSession>>) => {
+      if (attempt !== authAttemptRef.current) {
+        await signer.close?.()
+        return
+      }
+
+      if (storedSession) await writeStoredNostrConnectSession(storedSession)
+      await applySigner(signer)
+    },
+    [applySigner],
+  )
+
+  const beginLogin = useCallback(async () => {
     if (relay.mode !== 'live') return
 
-    connectSession?.abort()
-    setAuthBusy(true)
-    setAuthStatus('waiting for Nostr Connect signer')
+    const attempt = authAttemptRef.current + 1
+    authAttemptRef.current = attempt
+    activeSignerRef.current = null
+    setActiveSigner(null)
+    setAuthState('connecting')
+    setAuthStatus(window.nostr ? 'asking NIP-07 signer' : 'waiting for Nostr Connect')
+    setAuthDetail(window.nostr ? 'NIP-07 prompt open; QR also ready' : 'scan the QR with your signer')
+    clearConnectSession()
 
     const session = startNostrConnect(relay.relayUrl)
+    connectSessionRef.current = session
     setConnectSession(session)
 
     try {
@@ -402,48 +452,84 @@ function App() {
       setNostrConnectQr(null)
     }
 
-    try {
-      const result = await session.waitForSigner
-      await writeStoredNostrConnectSession(result.storedSession)
-      await applySigner(result.signer)
-    } catch (error) {
-      setAuthStatus(errorMessage(error))
-    } finally {
-      setAuthBusy(false)
+    session.waitForSigner
+      .then((result) => completeAuthAttempt(attempt, result.signer, result.storedSession))
+      .catch((error) => {
+        if (attempt !== authAttemptRef.current) return
+        setAuthDetail(`Nostr Connect unavailable: ${errorMessage(error)}`)
+      })
+
+    if (window.nostr) {
+      connectNip07Signer()
+        .then((signer) => completeAuthAttempt(attempt, signer))
+        .catch((error) => {
+          if (attempt !== authAttemptRef.current) return
+          setAuthStatus('waiting for Nostr Connect')
+          setAuthDetail(`NIP-07 unavailable: ${errorMessage(error)}`)
+        })
     }
-  }, [applySigner, connectSession, relay])
+  }, [clearConnectSession, completeAuthAttempt, relay])
 
   const beginAutoAuth = useCallback(async () => {
     if (relay.mode !== 'live') return
 
+    const attempt = authAttemptRef.current + 1
+    authAttemptRef.current = attempt
+    clearConnectSession()
     const storedSession = await readStoredNostrConnectSession()
+
+    if (attempt !== authAttemptRef.current) return
+
     if (storedSession) {
-      setAuthBusy(true)
-      setAuthStatus('restoring Nostr Connect session')
+      setAuthState('reconnecting')
+      setAuthStatus('reconnecting signer')
+      setAuthDetail(`restoring ${shortNpub(storedSession.userPubkey)}`)
       try {
-        const signer = await restoreNostrConnectSigner(storedSession)
-        await applySigner(signer)
-        setAuthStatus(`NIP-46 restored as ${shortNpub(signer.pubkey)}`)
+        const signer = await withTimeout(
+          restoreNostrConnectSigner(storedSession),
+          9_000,
+          'signer reconnect timed out',
+        )
+        await completeAuthAttempt(attempt, signer, storedSession)
         return
       } catch (error) {
-        await clearStoredNostrConnectSession()
-        setAuthStatus(`saved signer unavailable: ${errorMessage(error)}`)
-      } finally {
-        setAuthBusy(false)
+        if (attempt !== authAttemptRef.current) return
+        markSignerDisconnected(`could not reconnect: ${errorMessage(error)}`)
+        return
       }
     }
 
-    if (window.nostr) {
-      await connectBrowserSigner(true)
-      return
-    }
-
-    await connectRemoteSigner()
-  }, [applySigner, connectBrowserSigner, connectRemoteSigner, relay])
+    await beginLogin()
+  }, [beginLogin, clearConnectSession, completeAuthAttempt, markSignerDisconnected, relay])
 
   useEffect(() => {
-    return () => connectSession?.abort()
-  }, [connectSession])
+    activeSignerRef.current = activeSigner
+  }, [activeSigner])
+
+  useEffect(() => {
+    return () => {
+      connectSessionRef.current?.abort()
+      void activeSignerRef.current?.close?.()
+    }
+  }, [])
+
+  useEffect(() => {
+    if (relay.mode !== 'live' || authState !== 'connected' || !activeSigner?.ping) return undefined
+
+    const pingSigner = async () => {
+      try {
+        await withTimeout(activeSigner.ping?.() ?? Promise.resolve(), 8_000, 'signer ping timed out')
+      } catch (error) {
+        markSignerDisconnected(errorMessage(error))
+      }
+    }
+
+    const timer = window.setInterval(() => {
+      void pingSigner()
+    }, 20_000)
+
+    return () => window.clearInterval(timer)
+  }, [activeSigner, authState, markSignerDisconnected, relay.mode])
 
   useEffect(() => {
     if (relay.mode !== 'live' || autoAuthAttemptedRef.current) return
@@ -457,6 +543,30 @@ function App() {
 
     return () => window.clearTimeout(timer)
   }, [beginAutoAuth, relay])
+
+  async function retrySigner() {
+    if (relay.mode !== 'live') return
+    setAuthDetail('retrying signer connection')
+    await beginAutoAuth()
+  }
+
+  async function logoutSigner() {
+    authAttemptRef.current += 1
+    clearConnectSession()
+    await activeSignerRef.current?.close?.()
+    activeSignerRef.current = null
+    setActiveSigner(null)
+    if (relay.mode === 'live') relay.clearSigner()
+    await clearStoredNostrConnectSession()
+    setSelfPubkey(seededPubkey('live-viewer'))
+    setCallStarted(false)
+    stopRemoteVideos()
+    setCallExpanded(false)
+    setAuthState('idle')
+    setAuthStatus('logged out')
+    setAuthDetail('new Nostr Connect QR ready')
+    await beginLogin()
+  }
 
   const handleMove = useCallback(
     (position: { x: number; y: number; vx: number; vy: number }) => {
@@ -714,7 +824,7 @@ function App() {
   }
 
   return (
-    <main className="app-shell">
+    <main className="app-shell" data-auth-state={authState}>
       <aside className="side-panel left-panel" aria-label="Office">
         <div className="brand-row">
           <div>
@@ -770,31 +880,22 @@ function App() {
                 <span>{connectionMessage}</span>
               </div>
             </div>
-            <div className="auth-actions">
-              <button
-                type="button"
-                className="secondary-action"
-                disabled={authBusy}
-                onClick={() => void connectBrowserSigner(false)}
-              >
-                <KeyRound size={17} />
-                NIP-07
-              </button>
-              <button
-                type="button"
-                className="secondary-action"
-                disabled={authBusy}
-                onClick={() => void connectRemoteSigner()}
-              >
-                <QrCode size={17} />
-                Nostr Connect
-              </button>
-            </div>
-            {connectSession && (
+            {authState === 'disconnected' && (
+              <div className="auth-actions">
+                <button type="button" className="secondary-action" onClick={() => void retrySigner()}>
+                  <RefreshCcw size={16} />
+                  Retry
+                </button>
+                <button type="button" className="secondary-action danger" onClick={() => void logoutSigner()}>
+                  <LogOut size={16} />
+                  Logout
+                </button>
+              </div>
+            )}
+            {connectSession && nostrConnectQr && authState === 'connecting' && (
               <div className="connect-card">
-                {nostrConnectQr && <img src={nostrConnectQr} alt="Nostr Connect QR" />}
+                <img src={nostrConnectQr} alt="Nostr Connect QR" />
                 <a href={connectSession.uri}>Open Nostr Connect</a>
-                <textarea readOnly value={connectSession.uri} aria-label="Nostr Connect URI" />
               </div>
             )}
           </section>
@@ -992,35 +1093,36 @@ function App() {
           </div>
         </section>
 
-        <section className="panel-section">
-          <div className="section-title">
-            <span>Nearby mesh</span>
-            <span className={`mesh-pill ${health}`}>{mesh.participants}</span>
-          </div>
-          <div className="mesh-card">
-            <div>
-              <strong>{callStarted ? 'P2P live' : nearby.length ? 'P2P ready' : 'Idle'}</strong>
-              <p>{displayedMesh.connections} links · {displayedMesh.estimatedUploadMbps} Mbps uplink</p>
+        {showMesh && (
+          <section className="panel-section">
+            <div className="section-title">
+              <span>Nearby mesh</span>
+              <span className={`mesh-pill ${health}`}>{mesh.participants}</span>
             </div>
-            <button
-              type="button"
-              className="primary-action"
-              disabled={callPeers.length === 0}
-              onClick={toggleCall}
-              aria-label={callStarted ? 'Leave call' : 'Start call'}
-            >
-              {callStarted ? <Mic size={18} /> : <Video size={18} />}
-              {callStarted ? 'Leave' : 'Start'}
-            </button>
-          </div>
-          <div className="nearby-list">
-            {nearby.slice(0, 3).map((peer) => (
-              <span key={peer.pubkey}>{nameFor(peer.pubkey, snapshot.users)}</span>
-            ))}
-            {nearby.length === 0 && <span>Open space</span>}
-          </div>
-          {callStarted && <p className="call-note">{remoteVideos.length} mock peers streaming test video</p>}
-        </section>
+            <div className="mesh-card">
+              <div>
+                <strong>{callStarted ? 'P2P live' : 'P2P ready'}</strong>
+                <p>{displayedMesh.connections} links · {displayedMesh.estimatedUploadMbps} Mbps uplink</p>
+              </div>
+              <button
+                type="button"
+                className="primary-action"
+                disabled={callPeers.length === 0}
+                onClick={toggleCall}
+                aria-label={callStarted ? 'Leave call' : 'Start call'}
+              >
+                {callStarted ? <Mic size={18} /> : <Video size={18} />}
+                {callStarted ? 'Leave' : 'Start'}
+              </button>
+            </div>
+            <div className="nearby-list">
+              {nearby.slice(0, 3).map((peer) => (
+                <span key={peer.pubkey}>{nameFor(peer.pubkey, snapshot.users)}</span>
+              ))}
+            </div>
+            {callStarted && <p className="call-note">{remoteVideos.length} mock peers streaming test video</p>}
+          </section>
+        )}
 
         <section className="panel-section people-list">
           <div className="section-title">
