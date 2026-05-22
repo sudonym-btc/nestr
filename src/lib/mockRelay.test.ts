@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
+import { seededPubkey } from './avatar'
 import { createMockRelay } from './mockRelay'
 import { OFFICE_KINDS } from './nostr'
+import { memberPubkeys } from './nip29'
 import { buildOfficeMap } from './world'
 
 describe('mock NIP-29 relay', () => {
@@ -68,5 +70,64 @@ describe('mock NIP-29 relay', () => {
     expect(afterFrozen?.x).toBe(beforeFrozen?.x)
     expect(afterFrozen?.y).toBe(beforeFrozen?.y)
     expect(afterMoving?.x).not.toBe(beforeMoving?.x)
+  })
+
+  it('supports NIP-29 join requests and admin acceptance with put-user', () => {
+    const relay = createMockRelay()
+    const admin = relay.snapshot().users[0]
+    const guestPubkey = seededPubkey('join-requester')
+
+    const request = relay.publishJoinRequest(guestPubkey, 'let me in')
+    expect(request.ok).toBe(true)
+    expect(relay.snapshot().joinRequests.map((event) => event.pubkey)).toContain(guestPubkey)
+
+    const accept = relay.publishPutUser(admin.pubkey, guestPubkey, [], 'accepted')
+    const snapshot = relay.snapshot()
+
+    expect(accept.ok).toBe(true)
+    expect(snapshot.joinRequests.map((event) => event.pubkey)).not.toContain(guestPubkey)
+    expect(memberPubkeys(snapshot.group.members)).toContain(guestPubkey)
+  })
+
+  it('creates invite codes that can preauthorize NIP-29 join requests', () => {
+    const relay = createMockRelay()
+    const admin = relay.snapshot().users[0]
+    const guestPubkey = seededPubkey('invited-user')
+
+    expect(relay.publishCreateInvite(admin.pubkey, 'desk-42').ok).toBe(true)
+    expect(relay.publishJoinRequest(guestPubkey, 'invite', 'desk-42').ok).toBe(true)
+
+    const snapshot = relay.snapshot()
+    expect(snapshot.invites.length).toBe(1)
+    expect(snapshot.joinRequests.map((event) => event.pubkey)).not.toContain(guestPubkey)
+    expect(memberPubkeys(snapshot.group.members)).toContain(guestPubkey)
+  })
+
+  it('supports remove-user, edit-metadata, and delete-event moderation', () => {
+    const relay = createMockRelay()
+    const admin = relay.snapshot().users[0]
+    const member = relay.snapshot().users[2]
+    const message = relay.snapshot().messages[0]
+
+    expect(relay.publishRemoveUser(admin.pubkey, member.pubkey, 'kick').ok).toBe(true)
+    expect(memberPubkeys(relay.snapshot().group.members)).not.toContain(member.pubkey)
+
+    expect(
+      relay.publishEditMetadata(admin.pubkey, {
+        name: 'Renamed Office',
+        about: 'Updated by test',
+        picture: '',
+        private: true,
+        restricted: true,
+        closed: true,
+        hidden: false,
+      }).ok,
+    ).toBe(true)
+    expect(relay.snapshot().group.metadata.tags).toContainEqual(['name', 'Renamed Office'])
+    expect(relay.snapshot().group.metadata.tags).toContainEqual(['closed'])
+
+    expect(relay.publishDeleteEvent(admin.pubkey, message.id, 'delete').ok).toBe(true)
+    expect(relay.snapshot().messages.map((event) => event.id)).not.toContain(message.id)
+    expect(relay.snapshot().deletedEventIds).toContain(message.id)
   })
 })

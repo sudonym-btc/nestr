@@ -14,6 +14,18 @@ import {
 } from './nostr'
 import { npubForPubkey, resolvePubkey, seededSecret, shortNpub } from './avatar'
 import {
+  groupMetadataDraft,
+  isNip29ModerationKind,
+  memberPubkeys,
+  metadataTags,
+  pendingJoinRequests,
+  targetEventId,
+  targetPubkey,
+  targetRoles,
+  type Nip29MetadataDraft,
+  type Nip29Result,
+} from './nip29'
+import {
   buildOfficeMap,
   spawnForPubkey,
   type OfficeMap,
@@ -49,6 +61,10 @@ export interface RelaySnapshot {
   group: Nip29Group
   users: MockUser[]
   messages: NestrEvent[]
+  joinRequests: NestrEvent[]
+  moderationEvents: NestrEvent[]
+  invites: NestrEvent[]
+  deletedEventIds: string[]
   positions: WorldPosition[]
   eventCount: number
 }
@@ -107,10 +123,16 @@ export class MockNip29Relay {
   private readonly events: NestrEvent[] = []
   private readonly users = new Map<string, MockUser>()
   private readonly positions = new Map<string, WorldPosition>()
+  private readonly memberPubkeys = new Set<string>()
+  private readonly adminRoles = new Map<string, string[]>()
+  private readonly deletedEventIds = new Set<string>()
   private group: Nip29Group
 
   constructor() {
     this.relayPubkey = getPublicKey(this.relaySecret)
+    demoUsers.forEach((user) => this.memberPubkeys.add(user.pubkey))
+    this.adminRoles.set(demoUsers[0].pubkey, ['admin'])
+    this.adminRoles.set(demoUsers[1].pubkey, ['moderator'])
     this.group = this.createGroup()
     demoUsers.forEach((user, index) => this.addSeedUser(user, index))
     this.seedMessages()
@@ -119,7 +141,12 @@ export class MockNip29Relay {
   snapshot(): RelaySnapshot {
     const messages = this.events
       .filter((event) => event.kind === NIP29_KINDS.chatMessage)
+      .filter((event) => !this.deletedEventIds.has(event.id))
       .sort((a, b) => a.created_at - b.created_at)
+    const moderationEvents = this.events
+      .filter((event) => isNip29ModerationKind(event.kind))
+      .sort((a, b) => b.created_at - a.created_at)
+    const members = new Set(memberPubkeys(this.group.members))
 
     return {
       mode: this.mode,
@@ -128,6 +155,10 @@ export class MockNip29Relay {
       group: this.group,
       users: Array.from(this.users.values()),
       messages,
+      joinRequests: pendingJoinRequests(this.events, members),
+      moderationEvents,
+      invites: this.events.filter((event) => event.kind === NIP29_KINDS.createInvite),
+      deletedEventIds: Array.from(this.deletedEventIds),
       positions: Array.from(this.positions.values()),
       eventCount: this.events.length,
     }
@@ -155,7 +186,8 @@ export class MockNip29Relay {
     }
 
     this.users.set(pubkey, user)
-    this.refreshMembersEvent()
+    this.memberPubkeys.add(pubkey)
+    this.refreshGroupStateEvents()
     const map = buildOfficeMap(this.groupId, this.users.size)
     const spawn = spawnForPubkey(map, pubkey, this.users.size)
     this.publishPosition(pubkey, spawn.x, spawn.y, 0, 0)
@@ -210,9 +242,79 @@ export class MockNip29Relay {
     return this.publish(event)
   }
 
+  publishJoinRequest(pubkey: string, content = '', code = ''): Nip29Result {
+    this.ensureKnownUser(pubkey)
+    if (this.memberPubkeys.has(pubkey)) return { ok: false, reason: 'duplicate: already a member' }
+
+    const event = this.signUserEvent(pubkey, NIP29_KINDS.joinRequest, [
+      groupTag(this.groupId),
+      ...(code.trim() ? [['code', code.trim()]] : []),
+      ['client', 'nestr'],
+    ], content.trim())
+    const result = this.publish(event)
+    if (!result.ok) return result
+
+    if (code.trim() && this.hasInviteCode(code.trim())) {
+      this.publishRelayModeration(NIP29_KINDS.putUser, [['p', pubkey]], 'invite code accepted')
+    }
+
+    return result
+  }
+
+  publishLeaveRequest(pubkey: string, content = ''): Nip29Result {
+    if (!this.users.has(pubkey)) return { ok: false, reason: 'unknown-user' }
+    const event = this.signUserEvent(pubkey, NIP29_KINDS.leaveRequest, [
+      groupTag(this.groupId),
+      ['client', 'nestr'],
+    ], content.trim())
+    const result = this.publish(event)
+    if (!result.ok) return result
+
+    this.publishRelayModeration(NIP29_KINDS.removeUser, [['p', pubkey]], 'leave request accepted')
+    return result
+  }
+
+  publishPutUser(pubkey: string, target: string, roles: string[] = [], content = '') {
+    return this.publishAdminEvent(pubkey, NIP29_KINDS.putUser, [['p', target, ...roles]], content)
+  }
+
+  publishRemoveUser(pubkey: string, target: string, content = '') {
+    return this.publishAdminEvent(pubkey, NIP29_KINDS.removeUser, [['p', target]], content)
+  }
+
+  publishEditMetadata(pubkey: string, draft: Nip29MetadataDraft, content = '') {
+    return this.publishAdminEvent(pubkey, NIP29_KINDS.editMetadata, metadataTags(this.groupId, draft).slice(1), content)
+  }
+
+  publishDeleteEvent(pubkey: string, eventId: string, content = '') {
+    return this.publishAdminEvent(pubkey, NIP29_KINDS.deleteEvent, [['e', eventId]], content)
+  }
+
+  publishCreateGroup(pubkey: string, content = '') {
+    return this.publishAdminEvent(pubkey, NIP29_KINDS.createGroup, [], content)
+  }
+
+  publishDeleteGroup(pubkey: string, content = '') {
+    return this.publishAdminEvent(pubkey, NIP29_KINDS.deleteGroup, [], content)
+  }
+
+  publishCreateInvite(pubkey: string, code: string, content = '') {
+    const trimmed = code.trim()
+    if (!trimmed) return { ok: false, reason: 'invite-code-required' }
+    return this.publishAdminEvent(pubkey, NIP29_KINDS.createInvite, [['code', trimmed]], content)
+  }
+
   publish(event: NestrEvent) {
     if (tagValue(event, 'h') !== this.groupId && event.kind !== NIP29_KINDS.groupMetadata) {
       return { ok: false, reason: 'missing-nip29-h-tag' }
+    }
+
+    if (event.kind === NIP29_KINDS.joinRequest && this.memberPubkeys.has(event.pubkey)) {
+      return { ok: false, reason: 'duplicate: already a member' }
+    }
+
+    if (isNip29ModerationKind(event.kind) && !this.canModerate(event.pubkey, event.kind)) {
+      return { ok: false, reason: 'restricted: signer cannot perform this NIP-29 action' }
     }
 
     if (event.kind === OFFICE_KINDS.avatarPosition) {
@@ -229,6 +331,10 @@ export class MockNip29Relay {
         eventId: event.id,
         sequence: payload.seq,
       })
+    }
+
+    if (isNip29ModerationKind(event.kind)) {
+      this.applyModerationEvent(event)
     }
 
     if (!isEphemeralKind(event.kind)) {
@@ -280,6 +386,130 @@ export class MockNip29Relay {
     })
   }
 
+  private ensureKnownUser(pubkey: string) {
+    if (this.users.has(pubkey)) return this.users.get(pubkey)!
+    const user: MockUser = {
+      pubkey,
+      npub: npubForPubkey(pubkey),
+      name: shortNpub(pubkey),
+      role: this.memberPubkeys.has(pubkey) ? 'member' : 'participant',
+    }
+    this.users.set(pubkey, user)
+    return user
+  }
+
+  private signUserEvent(pubkey: string, kind: number, tags: string[][], content = '') {
+    const user = this.ensureKnownUser(pubkey)
+    const template = {
+      kind,
+      pubkey,
+      created_at: now(),
+      tags,
+      content,
+    }
+
+    return user.secretKey ? sign(template, user.secretKey) : mockSignature(template)
+  }
+
+  private publishAdminEvent(pubkey: string, kind: number, tags: string[][], content = '') {
+    return this.publish(this.signUserEvent(pubkey, kind, [groupTag(this.groupId), ...tags, ['client', 'nestr']], content.trim()))
+  }
+
+  private publishRelayModeration(kind: number, tags: string[][], content = '') {
+    return this.publish(
+      sign(
+        {
+          kind,
+          pubkey: this.relayPubkey,
+          created_at: now(),
+          tags: [groupTag(this.groupId), ...tags],
+          content,
+        },
+        this.relaySecret,
+      ),
+    )
+  }
+
+  private canModerate(pubkey: string, kind: number) {
+    if (pubkey === this.relayPubkey) return true
+    const roles = this.adminRoles.get(pubkey) ?? []
+    if (roles.includes('admin')) return true
+    if (roles.includes('moderator')) {
+      return kind === NIP29_KINDS.removeUser || kind === NIP29_KINDS.deleteEvent
+    }
+    return false
+  }
+
+  private hasInviteCode(code: string) {
+    return this.events.some(
+      (event) => event.kind === NIP29_KINDS.createInvite && tagValue(event, 'code') === code,
+    )
+  }
+
+  private applyModerationEvent(event: NestrEvent) {
+    if (event.kind === NIP29_KINDS.putUser) {
+      const pubkey = targetPubkey(event)
+      if (!pubkey) return
+      const roles = targetRoles(event)
+      const user = this.ensureKnownUser(pubkey)
+      this.memberPubkeys.add(pubkey)
+      if (roles.length > 0) this.adminRoles.set(pubkey, roles)
+      else this.adminRoles.delete(pubkey)
+      user.role = roles.length > 0 ? `admin: ${roles.join(', ')}` : 'member'
+      if (!this.positions.has(pubkey)) {
+        const map = buildOfficeMap(this.groupId, this.users.size)
+        const spawn = spawnForPubkey(map, pubkey, this.users.size)
+        this.positions.set(pubkey, {
+          pubkey,
+          x: spawn.x,
+          y: spawn.y,
+          vx: 0,
+          vy: 0,
+          facing: 'south',
+          updatedAt: Date.now(),
+        })
+      }
+      this.refreshGroupStateEvents()
+    }
+
+    if (event.kind === NIP29_KINDS.removeUser) {
+      const pubkey = targetPubkey(event)
+      if (!pubkey) return
+      this.memberPubkeys.delete(pubkey)
+      this.adminRoles.delete(pubkey)
+      this.positions.delete(pubkey)
+      const user = this.users.get(pubkey)
+      if (user) user.role = 'participant'
+      this.refreshGroupStateEvents()
+    }
+
+    if (event.kind === NIP29_KINDS.editMetadata) {
+      const draft = groupMetadataDraft({ tags: event.tags })
+      this.group = {
+        ...this.group,
+        metadata: sign(
+          {
+            kind: NIP29_KINDS.groupMetadata,
+            pubkey: this.relayPubkey,
+            created_at: now(),
+            tags: [
+              ...metadataTags(this.groupId, draft, 'd'),
+              ['office', '1'],
+              ['office-map', 'nostr-office-v1'],
+            ],
+            content: '',
+          },
+          this.relaySecret,
+        ),
+      }
+    }
+
+    if (event.kind === NIP29_KINDS.deleteEvent) {
+      const eventId = targetEventId(event)
+      if (eventId) this.deletedEventIds.add(eventId)
+    }
+  }
+
   private createGroup(): Nip29Group {
     const metadata = sign(
       {
@@ -287,11 +517,19 @@ export class MockNip29Relay {
         pubkey: this.relayPubkey,
         created_at: now(),
         tags: [
-          dTag(this.groupId),
-          ['name', 'Nestr Design Office'],
-          ['about', 'A relay-native spatial room'],
-          ['picture', 'https://placehold.co/128x128/f4f1e9/171922?text=N'],
-          ['restricted'],
+          ...metadataTags(
+            this.groupId,
+            {
+              name: 'Nestr Design Office',
+              about: 'A relay-native spatial room',
+              picture: 'https://placehold.co/128x128/f4f1e9/171922?text=N',
+              private: false,
+              restricted: true,
+              closed: false,
+              hidden: false,
+            },
+            'd',
+          ),
           ['office', '1'],
           ['office-map', 'nostr-office-v1'],
         ],
@@ -305,7 +543,10 @@ export class MockNip29Relay {
         kind: NIP29_KINDS.groupAdmins,
         pubkey: this.relayPubkey,
         created_at: now(),
-        tags: [dTag(this.groupId), ['p', demoUsers[0].pubkey, 'admin'], ['p', demoUsers[1].pubkey, 'moderator']],
+        tags: [
+          dTag(this.groupId),
+          ...Array.from(this.adminRoles.entries()).map(([pubkey, roles]) => ['p', pubkey, ...roles]),
+        ],
         content: 'relay-generated admins',
       },
       this.relaySecret,
@@ -316,7 +557,7 @@ export class MockNip29Relay {
         kind: NIP29_KINDS.groupMembers,
         pubkey: this.relayPubkey,
         created_at: now(),
-        tags: [dTag(this.groupId), ...demoUsers.map((user) => ['p', user.pubkey])],
+        tags: [dTag(this.groupId), ...Array.from(this.memberPubkeys).map((pubkey) => ['p', pubkey])],
         content: 'relay-generated members',
       },
       this.relaySecret,
@@ -341,15 +582,28 @@ export class MockNip29Relay {
     return { id: this.groupId, relay: this.relayUrl, metadata, admins, members, roles }
   }
 
-  private refreshMembersEvent() {
+  private refreshGroupStateEvents() {
     this.group = {
       ...this.group,
+      admins: sign(
+        {
+          kind: NIP29_KINDS.groupAdmins,
+          pubkey: this.relayPubkey,
+          created_at: now(),
+          tags: [
+            dTag(this.groupId),
+            ...Array.from(this.adminRoles.entries()).map(([pubkey, roles]) => ['p', pubkey, ...roles]),
+          ],
+          content: 'relay-generated admins',
+        },
+        this.relaySecret,
+      ),
       members: sign(
         {
           kind: NIP29_KINDS.groupMembers,
           pubkey: this.relayPubkey,
           created_at: now(),
-          tags: [dTag(this.groupId), ...Array.from(this.users.values()).map((user) => ['p', user.pubkey])],
+          tags: [dTag(this.groupId), ...Array.from(this.memberPubkeys).map((pubkey) => ['p', pubkey])],
           content: 'relay-generated members',
         },
         this.relaySecret,

@@ -31,6 +31,22 @@ function randomHex(bytes = 16) {
   return bytesToHex(buffer)
 }
 
+export const NESTR_NIP46_PERMISSIONS = [
+  'get_public_key',
+  'sign_event:9',
+  'sign_event:9000',
+  'sign_event:9001',
+  'sign_event:9002',
+  'sign_event:9005',
+  'sign_event:9007',
+  'sign_event:9008',
+  'sign_event:9009',
+  'sign_event:9021',
+  'sign_event:9022',
+  'sign_event:25029',
+  'sign_event:22242',
+]
+
 export async function connectNip07Signer(): Promise<NestrSigner> {
   if (!window.nostr) {
     throw new Error('No NIP-07 browser signer found')
@@ -95,7 +111,7 @@ export function startNostrConnect(relayUrl: string): NostrConnectSession {
     clientPubkey,
     relays: [relayUrl],
     secret: connectionSecret,
-    perms: ['get_public_key', 'sign_event:9', 'sign_event:25029', 'sign_event:22242'],
+    perms: NESTR_NIP46_PERMISSIONS,
     ...appMetadata,
   })
 

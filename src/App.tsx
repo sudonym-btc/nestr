@@ -3,6 +3,9 @@ import * as QRCode from 'qrcode'
 import {
   Camera,
   CameraOff,
+  Check,
+  DoorOpen,
+  Edit3,
   KeyRound,
   LockKeyhole,
   LogIn,
@@ -14,16 +17,28 @@ import {
   Minimize2,
   Radio,
   Send,
+  ShieldCheck,
+  Ticket,
+  Trash2,
+  UserMinus,
+  UserPlus,
   Users,
   Video,
 } from 'lucide-react'
 import './App.css'
 import { PhaserOffice } from './game/PhaserOffice'
-import { avatarCss, npubForPubkey, seededPubkey, shortNpub } from './lib/avatar'
+import { avatarCss, npubForPubkey, resolvePubkey, seededPubkey, shortNpub } from './lib/avatar'
 import { parseLaunch } from './lib/launch'
 import { createLiveRelay } from './lib/liveRelay'
 import { createMockRelay, type MockUser, type RelaySnapshot } from './lib/mockRelay'
 import { hasTag, tagValue, type NestrEvent, type NestrSigner } from './lib/nostr'
+import {
+  groupMetadataDraft,
+  memberPubkeys,
+  moderationSummary,
+  supportedRoleTags,
+  type Nip29MetadataDraft,
+} from './lib/nip29'
 import { createMockPeerVideo, type MockPeerVideo } from './lib/mockVideo'
 import { parseNostrReferences, type EntityPart } from './lib/nostrReferences'
 import {
@@ -53,6 +68,25 @@ function groupTagLabel(snapshot: RelaySnapshot) {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
+}
+
+function rolesForPubkey(snapshot: RelaySnapshot, pubkey: string) {
+  return snapshot.group.admins.tags
+    .filter((tag) => tag[0] === 'p' && tag[1] === pubkey)
+    .flatMap((tag) => tag.slice(2).filter(Boolean))
+}
+
+function roleList(value: string) {
+  return value
+    .split(',')
+    .map((role) => role.trim())
+    .filter(Boolean)
+}
+
+function randomInviteCode() {
+  const bytes = new Uint8Array(4)
+  crypto.getRandomValues(bytes)
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
 interface AvatarChipProps {
@@ -192,6 +226,14 @@ function App() {
   const [authStatus, setAuthStatus] = useState(() =>
     launch.mode === 'live' ? 'opening live NIP-29 room' : 'local mock relay',
   )
+  const [adminStatus, setAdminStatus] = useState('NIP-29 controls ready')
+  const [joinReason, setJoinReason] = useState('')
+  const [joinCode, setJoinCode] = useState('')
+  const [targetInput, setTargetInput] = useState('')
+  const [targetRoles, setTargetRoles] = useState('')
+  const [eventIdInput, setEventIdInput] = useState('')
+  const [inviteCode, setInviteCode] = useState(() => randomInviteCode())
+  const [metadataEdits, setMetadataEdits] = useState<Partial<Nip29MetadataDraft>>({})
   const [connectSession, setConnectSession] = useState<NostrConnectSession | null>(null)
   const [nostrConnectQr, setNostrConnectQr] = useState<string | null>(null)
   const callStageRef = useRef<HTMLDivElement | null>(null)
@@ -212,6 +254,21 @@ function App() {
   const connectionStatus = snapshot.connectionStatus ?? relay.mode
   const connectionMessage = snapshot.connectionMessage ?? authStatus
   const currentUser = snapshot.users.find((user) => user.pubkey === selfPubkey)
+  const groupMemberPubkeys = useMemo(() => memberPubkeys(snapshot.group.members), [snapshot.group.members])
+  const groupMemberSet = useMemo(() => new Set(groupMemberPubkeys), [groupMemberPubkeys])
+  const currentRoles = rolesForPubkey(snapshot, selfPubkey)
+  const currentIsMember = groupMemberSet.has(selfPubkey)
+  const canManageGroup = currentRoles.length > 0 || currentUser?.role === 'admin' || currentUser?.role === 'moderator'
+  const supportedRoles = supportedRoleTags(snapshot.group.roles)
+  const visiblePeople = snapshot.users.filter((user) => groupMemberSet.has(user.pubkey) || user.pubkey === selfPubkey)
+  const metadataBaseDraft = useMemo(
+    () => groupMetadataDraft(snapshot.group.metadata),
+    [snapshot.group.metadata],
+  )
+  const metadataDraft = useMemo(
+    () => ({ ...metadataBaseDraft, ...metadataEdits }),
+    [metadataBaseDraft, metadataEdits],
+  )
   const callPeers = useMemo(() => {
     const nearbyPubkeys = nearby.map((peer) => peer.pubkey)
     const fallbackPubkeys = snapshot.users
@@ -432,6 +489,105 @@ function App() {
     setMessage('')
   }
 
+  async function runNip29Action(label: string, action: () => Promise<{ ok: boolean; reason?: string }> | { ok: boolean; reason?: string }) {
+    setAdminStatus(`${label}...`)
+    try {
+      const result = await action()
+      setAdminStatus(result.ok ? `${label} published` : `${label} failed: ${result.reason}`)
+      return result.ok
+    } catch (error) {
+      setAdminStatus(`${label} failed: ${errorMessage(error)}`)
+      return false
+    }
+  }
+
+  function targetPubkeyFromInput() {
+    try {
+      return resolvePubkey(targetInput)
+    } catch (error) {
+      setAdminStatus(errorMessage(error))
+      return null
+    }
+  }
+
+  async function requestJoin(event: FormEvent) {
+    event.preventDefault()
+    await runNip29Action('join request', () => relay.publishJoinRequest(selfPubkey, joinReason, joinCode))
+  }
+
+  async function leaveGroup() {
+    const ok = await runNip29Action('leave request', () =>
+      relay.publishLeaveRequest(selfPubkey, 'leaving from nestr'),
+    )
+    if (ok) {
+      setCallStarted(false)
+      stopRemoteVideos()
+      setCallExpanded(false)
+    }
+  }
+
+  async function putUser(event: FormEvent) {
+    event.preventDefault()
+    const target = targetPubkeyFromInput()
+    if (!target) return
+
+    await runNip29Action('put-user', () =>
+      relay.publishPutUser(selfPubkey, target, roleList(targetRoles), 'updated from nestr'),
+    )
+  }
+
+  async function removeUser() {
+    const target = targetPubkeyFromInput()
+    if (!target) return
+
+    await runNip29Action('remove-user', () => relay.publishRemoveUser(selfPubkey, target, 'removed from nestr'))
+  }
+
+  async function acceptJoin(pubkey: string) {
+    await runNip29Action('accept join', () => relay.publishPutUser(selfPubkey, pubkey, [], 'join accepted'))
+  }
+
+  async function rejectJoin(pubkey: string) {
+    await runNip29Action('reject join', () => relay.publishRemoveUser(selfPubkey, pubkey, 'join rejected'))
+  }
+
+  async function editMetadata(event: FormEvent) {
+    event.preventDefault()
+    const ok = await runNip29Action('edit-metadata', () =>
+      relay.publishEditMetadata(selfPubkey, metadataDraft, 'metadata updated from nestr'),
+    )
+    if (ok) setMetadataEdits({})
+  }
+
+  async function deleteEvent(eventId = eventIdInput) {
+    const trimmed = eventId.trim()
+    if (!/^[0-9a-f]{64}$/i.test(trimmed)) {
+      setAdminStatus('Enter a 64-character event id')
+      return
+    }
+
+    const ok = await runNip29Action('delete-event', () =>
+      relay.publishDeleteEvent(selfPubkey, trimmed, 'deleted from nestr'),
+    )
+    if (ok) setEventIdInput('')
+  }
+
+  async function createInvite(event: FormEvent) {
+    event.preventDefault()
+    const ok = await runNip29Action('create-invite', () =>
+      relay.publishCreateInvite(selfPubkey, inviteCode, 'invite created from nestr'),
+    )
+    if (ok) setInviteCode(randomInviteCode())
+  }
+
+  async function createGroup() {
+    await runNip29Action('create-group', () => relay.publishCreateGroup(selfPubkey, 'group created from nestr'))
+  }
+
+  async function deleteGroup() {
+    await runNip29Action('delete-group', () => relay.publishDeleteGroup(selfPubkey, 'group deleted from nestr'))
+  }
+
   function reconcileMockVideos(peerKey: string) {
     const peers = peerKey
       .split('|')
@@ -577,7 +733,7 @@ function App() {
           </span>
           <span>
             <Users size={15} />
-            {snapshot.users.length} members
+            {groupMemberPubkeys.length} members
           </span>
           <span>
             <Radio size={15} />
@@ -644,6 +800,198 @@ function App() {
           </section>
         )}
 
+        <section className="panel-section admin-panel" aria-label="NIP-29 controls">
+          <div className="section-title">
+            <span>NIP-29 controls</span>
+            <span>{canManageGroup ? 'admin' : currentIsMember ? 'member' : 'visitor'}</span>
+          </div>
+          <div className="admin-card">
+            <div className="admin-status">
+              <ShieldCheck size={16} />
+              <span>{adminStatus}</span>
+            </div>
+
+            {!currentIsMember ? (
+              <form className="admin-form" onSubmit={requestJoin}>
+                <label htmlFor="join-reason">Join request</label>
+                <input
+                  id="join-reason"
+                  value={joinReason}
+                  onChange={(event) => setJoinReason(event.target.value)}
+                  placeholder="Reason"
+                />
+                <input
+                  value={joinCode}
+                  onChange={(event) => setJoinCode(event.target.value)}
+                  placeholder="Invite code"
+                  aria-label="Invite code"
+                />
+                <button type="submit" className="secondary-action">
+                  <DoorOpen size={16} />
+                  Request
+                </button>
+              </form>
+            ) : (
+              <button type="button" className="secondary-action admin-wide" onClick={() => void leaveGroup()}>
+                <DoorOpen size={16} />
+                Leave group
+              </button>
+            )}
+
+            {canManageGroup && (
+              <>
+                {snapshot.joinRequests.length > 0 && (
+                  <div className="admin-stack">
+                    <label>Pending joins</label>
+                    {snapshot.joinRequests.slice(0, 4).map((request) => (
+                      <div className="join-request" key={request.id}>
+                        <AvatarChip
+                          pubkey={request.pubkey}
+                          user={snapshot.users.find((user) => user.pubkey === request.pubkey)}
+                          small
+                        />
+                        <span>{nameFor(request.pubkey, snapshot.users)}</span>
+                        <button
+                          type="button"
+                          className="icon-soft"
+                          onClick={() => void acceptJoin(request.pubkey)}
+                          aria-label={`Accept ${nameFor(request.pubkey, snapshot.users)}`}
+                        >
+                          <Check size={15} />
+                        </button>
+                        <button
+                          type="button"
+                          className="icon-soft danger"
+                          onClick={() => void rejectJoin(request.pubkey)}
+                          aria-label={`Reject ${nameFor(request.pubkey, snapshot.users)}`}
+                        >
+                          <UserMinus size={15} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <form className="admin-form" onSubmit={putUser}>
+                  <label htmlFor="admin-target">Member</label>
+                  <input
+                    id="admin-target"
+                    value={targetInput}
+                    onChange={(event) => setTargetInput(event.target.value)}
+                    placeholder="npub or hex pubkey"
+                    spellCheck={false}
+                  />
+                  <input
+                    value={targetRoles}
+                    onChange={(event) => setTargetRoles(event.target.value)}
+                    placeholder={supportedRoles.length ? supportedRoles.map((role) => role.name).join(', ') : 'roles'}
+                    aria-label="Roles"
+                  />
+                  <div className="admin-row">
+                    <button type="submit" className="secondary-action">
+                      <UserPlus size={16} />
+                      Add
+                    </button>
+                    <button type="button" className="secondary-action danger" onClick={() => void removeUser()}>
+                      <UserMinus size={16} />
+                      Remove
+                    </button>
+                  </div>
+                </form>
+
+                <form className="admin-form" onSubmit={createInvite}>
+                  <label htmlFor="invite-code">Invite</label>
+                  <div className="input-row">
+                    <input
+                      id="invite-code"
+                      value={inviteCode}
+                      onChange={(event) => setInviteCode(event.target.value)}
+                      spellCheck={false}
+                    />
+                    <button type="submit" aria-label="Create invite">
+                      <Ticket size={16} />
+                    </button>
+                  </div>
+                </form>
+
+                <form className="admin-form" onSubmit={editMetadata}>
+                  <label htmlFor="group-name">Metadata</label>
+                  <input
+                    id="group-name"
+                    value={metadataDraft.name}
+                    onChange={(event) => setMetadataEdits((edits) => ({ ...edits, name: event.target.value }))}
+                    placeholder="Group name"
+                  />
+                  <input
+                    value={metadataDraft.about}
+                    onChange={(event) => setMetadataEdits((edits) => ({ ...edits, about: event.target.value }))}
+                    placeholder="About"
+                    aria-label="Group about"
+                  />
+                  <input
+                    value={metadataDraft.picture}
+                    onChange={(event) => setMetadataEdits((edits) => ({ ...edits, picture: event.target.value }))}
+                    placeholder="Picture URL"
+                    aria-label="Group picture URL"
+                  />
+                  <div className="flag-grid">
+                    {(['private', 'restricted', 'closed', 'hidden'] as const).map((flag) => (
+                      <label key={flag} className="flag-toggle">
+                        <input
+                          type="checkbox"
+                          checked={metadataDraft[flag]}
+                          onChange={(event) =>
+                            setMetadataEdits((edits) => ({ ...edits, [flag]: event.target.checked }))
+                          }
+                        />
+                        {flag}
+                      </label>
+                    ))}
+                  </div>
+                  <button type="submit" className="secondary-action admin-wide">
+                    <Edit3 size={16} />
+                    Save metadata
+                  </button>
+                </form>
+
+                <div className="admin-form">
+                  <label htmlFor="delete-event">Moderation</label>
+                  <input
+                    id="delete-event"
+                    value={eventIdInput}
+                    onChange={(event) => setEventIdInput(event.target.value)}
+                    placeholder="event id to delete"
+                    spellCheck={false}
+                  />
+                  <div className="admin-row">
+                    <button type="button" className="secondary-action danger" onClick={() => void deleteEvent()}>
+                      <Trash2 size={16} />
+                      Delete event
+                    </button>
+                  </div>
+                  <div className="admin-row">
+                    <button type="button" className="secondary-action" onClick={() => void createGroup()}>
+                      Create group
+                    </button>
+                    <button type="button" className="secondary-action danger" onClick={() => void deleteGroup()}>
+                      Delete group
+                    </button>
+                  </div>
+                </div>
+
+                {snapshot.moderationEvents.length > 0 && (
+                  <div className="admin-stack">
+                    <label>Recent actions</label>
+                    {snapshot.moderationEvents.slice(0, 3).map((event) => (
+                      <span className="admin-log" key={event.id}>{moderationSummary(event)}</span>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </section>
+
         <section className="panel-section">
           <div className="section-title">
             <span>Nearby mesh</span>
@@ -679,7 +1027,7 @@ function App() {
             <span>Members</span>
             <span>{mapCapacityLabel(activeCount)}</span>
           </div>
-          {snapshot.users.map((user) => (
+          {visiblePeople.map((user) => (
             <button
               type="button"
               key={user.pubkey}
@@ -808,6 +1156,16 @@ function App() {
                     hour: '2-digit',
                     minute: '2-digit',
                   })}</time>
+                  {canManageGroup && (
+                    <button
+                      type="button"
+                      className="message-delete"
+                      onClick={() => void deleteEvent(event.id)}
+                      aria-label={`Delete message from ${nameFor(event.pubkey, snapshot.users)}`}
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  )}
                 </div>
                 <MessageContent event={event} users={snapshot.users} />
               </article>

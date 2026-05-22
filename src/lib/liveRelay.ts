@@ -17,6 +17,16 @@ import {
   type NestrSigner,
 } from './nostr'
 import type { MockUser, Nip29Group, RelaySnapshot } from './mockRelay'
+import {
+  groupMetadataDraft,
+  isNip29ModerationKind,
+  metadataTags,
+  pendingJoinRequests,
+  targetEventId,
+  targetPubkey,
+  targetRoles,
+  type Nip29MetadataDraft,
+} from './nip29'
 import { profilePubkeysFromReferences } from './nostrReferences'
 import {
   blossomServersFromTags,
@@ -94,6 +104,7 @@ export class LiveNip29Relay {
   private readonly blossomServers = new Map<string, string[]>()
   private readonly memberPubkeys = new Set<string>()
   private readonly adminRoles = new Map<string, string[]>()
+  private readonly deletedEventIds = new Set<string>()
   private readonly profileQueue = new Set<string>()
   private readonly timelineRefs: string[] = []
   private relay?: Relay
@@ -128,9 +139,14 @@ export class LiveNip29Relay {
   }
 
   snapshot(): RelaySnapshot {
-    const messages = Array.from(this.events.values())
+    const events = Array.from(this.events.values())
+    const messages = events
       .filter((event) => GROUP_CHAT_KINDS.has(event.kind))
+      .filter((event) => !this.deletedEventIds.has(event.id))
       .sort((a, b) => a.created_at - b.created_at)
+    const moderationEvents = events
+      .filter((event) => isNip29ModerationKind(event.kind))
+      .sort((a, b) => b.created_at - a.created_at)
 
     return {
       mode: this.mode,
@@ -139,6 +155,10 @@ export class LiveNip29Relay {
       group: this.group,
       users: Array.from(this.users.values()),
       messages,
+      joinRequests: pendingJoinRequests(events, this.memberPubkeys),
+      moderationEvents,
+      invites: events.filter((event) => event.kind === NIP29_KINDS.createInvite),
+      deletedEventIds: Array.from(this.deletedEventIds),
       positions: Array.from(this.positions.values()),
       eventCount: this.events.size,
     }
@@ -232,6 +252,51 @@ export class LiveNip29Relay {
     return this.publishSigned(event)
   }
 
+  async publishJoinRequest(pubkey: string, content = '', code = '') {
+    const tags = code.trim() ? [['code', code.trim()]] : []
+    return this.publishNip29Event(pubkey, NIP29_KINDS.joinRequest, tags, content, false)
+  }
+
+  async publishLeaveRequest(pubkey: string, content = '') {
+    return this.publishNip29Event(pubkey, NIP29_KINDS.leaveRequest, [], content, false)
+  }
+
+  async publishPutUser(pubkey: string, target: string, roles: string[] = [], content = '') {
+    return this.publishNip29Event(pubkey, NIP29_KINDS.putUser, [['p', target, ...roles]], content, false)
+  }
+
+  async publishRemoveUser(pubkey: string, target: string, content = '') {
+    return this.publishNip29Event(pubkey, NIP29_KINDS.removeUser, [['p', target]], content, false)
+  }
+
+  async publishEditMetadata(pubkey: string, draft: Nip29MetadataDraft, content = '') {
+    return this.publishNip29Event(
+      pubkey,
+      NIP29_KINDS.editMetadata,
+      metadataTags(this.groupId, draft).slice(1),
+      content,
+      false,
+    )
+  }
+
+  async publishDeleteEvent(pubkey: string, eventId: string, content = '') {
+    return this.publishNip29Event(pubkey, NIP29_KINDS.deleteEvent, [['e', eventId]], content, false)
+  }
+
+  async publishCreateGroup(pubkey: string, content = '') {
+    return this.publishNip29Event(pubkey, NIP29_KINDS.createGroup, [], content, false)
+  }
+
+  async publishDeleteGroup(pubkey: string, content = '') {
+    return this.publishNip29Event(pubkey, NIP29_KINDS.deleteGroup, [], content, false)
+  }
+
+  async publishCreateInvite(pubkey: string, code: string, content = '') {
+    const trimmed = code.trim()
+    if (!trimmed) return { ok: false, reason: 'invite-code-required' }
+    return this.publishNip29Event(pubkey, NIP29_KINDS.createInvite, [['code', trimmed]], content, false)
+  }
+
   tickBots() {
     // Live relays supply movement; the client does not fabricate people in live mode.
   }
@@ -314,8 +379,8 @@ export class LiveNip29Relay {
     this.emit()
   }
 
-  private async publishSigned(event: NestrEvent) {
-    this.receive(event)
+  private async publishSigned(event: NestrEvent, optimistic = true) {
+    if (optimistic) this.receive(event)
     const isPositionEvent = event.kind === OFFICE_KINDS.avatarPosition
     try {
       const reason = await this.relay!.publish(event)
@@ -344,6 +409,34 @@ export class LiveNip29Relay {
     }
   }
 
+  private async publishNip29Event(
+    pubkey: string,
+    kind: number,
+    tags: string[][],
+    content = '',
+    optimistic = true,
+  ) {
+    if (!this.signer || this.signer.pubkey !== pubkey || !this.relay) {
+      return { ok: false, reason: 'live-signer-required' }
+    }
+
+    let event: NestrEvent
+    try {
+      event = await this.signer.signEvent({
+        kind,
+        created_at: now(),
+        tags: [groupTag(this.groupId), ...this.previousTags(), ...tags, ['client', 'nestr']],
+        content: content.trim(),
+      })
+    } catch (error) {
+      this.connectionMessage = error instanceof Error ? error.message : String(error)
+      this.emit()
+      return { ok: false, reason: this.connectionMessage }
+    }
+
+    return this.publishSigned(event, optimistic)
+  }
+
   private receive(event: NestrEvent) {
     if (tagValue(event, 'd') === this.groupId) {
       this.receiveGroupEvent(event)
@@ -358,6 +451,10 @@ export class LiveNip29Relay {
     }
     this.upsertUser(event.pubkey)
     this.queueProfileFetch([event.pubkey, ...profilePubkeysFromReferences(event.content, event.tags)])
+
+    if (isNip29ModerationKind(event.kind)) {
+      this.applyModerationEvent(event)
+    }
 
     if (event.kind === OFFICE_KINDS.avatarPosition) {
       try {
@@ -394,6 +491,47 @@ export class LiveNip29Relay {
     }
 
     this.emit(event)
+  }
+
+  private applyModerationEvent(event: NestrEvent) {
+    if (event.kind === NIP29_KINDS.putUser) {
+      const pubkey = targetPubkey(event)
+      if (!pubkey) return
+      const roles = targetRoles(event)
+      this.memberPubkeys.add(pubkey)
+      if (roles.length > 0) this.adminRoles.set(pubkey, roles)
+      else this.adminRoles.delete(pubkey)
+      this.upsertUser(pubkey)
+      this.queueProfileFetch([pubkey])
+    }
+
+    if (event.kind === NIP29_KINDS.removeUser) {
+      const pubkey = targetPubkey(event)
+      if (!pubkey) return
+      this.memberPubkeys.delete(pubkey)
+      this.adminRoles.delete(pubkey)
+      this.positions.delete(pubkey)
+      this.users.delete(pubkey)
+    }
+
+    if (event.kind === NIP29_KINDS.editMetadata) {
+      const draft = groupMetadataDraft({ tags: event.tags })
+      const preserved = this.group.metadata.tags.filter((tag) => tag[0]?.startsWith('office'))
+      this.group = {
+        ...this.group,
+        metadata: placeholderEvent(
+          NIP29_KINDS.groupMetadata,
+          this.group.metadata.pubkey,
+          [...metadataTags(this.groupId, draft, 'd'), ...preserved],
+          this.group.metadata.content,
+        ),
+      }
+    }
+
+    if (event.kind === NIP29_KINDS.deleteEvent) {
+      const eventId = targetEventId(event)
+      if (eventId) this.deletedEventIds.add(eventId)
+    }
   }
 
   private receiveGroupEvent(event: NestrEvent) {

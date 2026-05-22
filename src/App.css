@@ -269,6 +269,136 @@ input:focus {
   padding: 8px;
 }
 
+.admin-panel {
+  gap: 9px;
+}
+
+.admin-card {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fff;
+  padding: 11px;
+}
+
+.admin-status,
+.join-request,
+.admin-row,
+.flag-toggle,
+.admin-log {
+  display: flex;
+  align-items: center;
+}
+
+.admin-status {
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.admin-form,
+.admin-stack {
+  display: grid;
+  gap: 8px;
+}
+
+.admin-form input {
+  height: 36px;
+}
+
+.admin-row {
+  gap: 8px;
+}
+
+.admin-row > button,
+.admin-wide {
+  width: 100%;
+}
+
+.secondary-action.danger {
+  color: #af3e30;
+}
+
+.join-request {
+  min-width: 0;
+  gap: 7px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  padding: 7px;
+}
+
+.join-request span {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.icon-soft,
+.message-delete {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fff;
+  color: var(--ink);
+}
+
+.icon-soft.danger,
+.message-delete {
+  color: #af3e30;
+}
+
+.flag-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 7px;
+}
+
+.flag-toggle {
+  gap: 7px;
+  min-height: 30px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  color: #3f453f;
+  font-size: 12px;
+  font-weight: 800;
+  padding: 0 8px;
+  text-transform: none;
+}
+
+.flag-toggle input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--blue);
+}
+
+.admin-log {
+  min-height: 28px;
+  border-radius: 999px;
+  background: var(--panel-soft);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  overflow: hidden;
+  padding: 0 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .panel-section {
   display: grid;
   gap: 10px;
@@ -685,6 +815,12 @@ input:focus {
   color: var(--muted);
   font-family: var(--mono);
   font-size: 11px;
+}
+
+.message-delete {
+  width: 26px;
+  height: 26px;
+  margin-left: 4px;
 }
 
 .message p {

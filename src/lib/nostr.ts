@@ -7,8 +7,14 @@ export const NIP29_KINDS = {
   groupMembers: 39002,
   groupRoles: 39003,
   putUser: 9000,
+  removeUser: 9001,
+  editMetadata: 9002,
+  deleteEvent: 9005,
+  createGroup: 9007,
+  deleteGroup: 9008,
   createInvite: 9009,
   joinRequest: 9021,
+  leaveRequest: 9022,
   chatMessage: 1,
 } as const
 
