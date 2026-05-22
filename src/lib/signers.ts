@@ -64,6 +64,14 @@ export interface NostrConnectResult {
   storedSession: NostrConnectStoredSession
 }
 
+export function nostrConnectAppMetadata(origin: string) {
+  return {
+    name: 'Nestr',
+    url: origin,
+    image: new URL('/favicon.svg', origin).toString(),
+  }
+}
+
 function openAuthUrl(url: string) {
   window.open(url, '_blank', 'noopener,noreferrer')
 }
@@ -82,13 +90,13 @@ export function startNostrConnect(relayUrl: string): NostrConnectSession {
   const clientPubkey = getPublicKey(clientSecretKey)
   const controller = new AbortController()
   const connectionSecret = randomHex(16)
+  const appMetadata = nostrConnectAppMetadata(window.location.origin)
   const uri = createNostrConnectURI({
     clientPubkey,
     relays: [relayUrl],
     secret: connectionSecret,
     perms: ['get_public_key', 'sign_event:9', 'sign_event:25029', 'sign_event:22242'],
-    name: 'Nestr',
-    url: window.location.origin,
+    ...appMetadata,
   })
 
   const waitForSigner = BunkerSigner.fromURI(

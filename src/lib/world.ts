@@ -41,6 +41,9 @@ export interface WorldPosition {
   vy: number
   facing: 'north' | 'south' | 'east' | 'west'
   updatedAt: number
+  eventTime?: number
+  eventId?: string
+  sequence?: number
 }
 
 function hashSeed(value: string) {

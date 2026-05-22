@@ -19,6 +19,7 @@ import {
   type OfficeMap,
   type WorldPosition,
 } from './world'
+import { facingFromVelocity, parsePositionPayload, positionEventTime } from './positionEvents'
 
 const encoder = new TextEncoder()
 
@@ -193,13 +194,13 @@ export class MockNip29Relay {
     const user = this.users.get(pubkey)
     if (!user) return { ok: false, reason: 'unknown-user' }
 
-    const facing = Math.abs(vx) > Math.abs(vy) ? (vx >= 0 ? 'east' : 'west') : vy < 0 ? 'north' : 'south'
+    const facing = facingFromVelocity(vx, vy)
     const template = {
       kind: OFFICE_KINDS.avatarPosition,
       pubkey,
       created_at: Math.floor(createdAt / 1000),
       tags: [groupTag(this.groupId), ['relay', this.relayUrl]],
-      content: JSON.stringify({ x, y, vx, vy, facing }),
+      content: JSON.stringify({ x, y, vx, vy, facing, sentAt: createdAt }),
     }
 
     const event = user.secretKey
@@ -215,7 +216,7 @@ export class MockNip29Relay {
     }
 
     if (event.kind === OFFICE_KINDS.avatarPosition) {
-      const payload = JSON.parse(event.content) as Omit<WorldPosition, 'pubkey' | 'updatedAt'>
+      const payload = parsePositionPayload(event.content)
       this.positions.set(event.pubkey, {
         pubkey: event.pubkey,
         x: payload.x,
@@ -224,6 +225,9 @@ export class MockNip29Relay {
         vy: payload.vy,
         facing: payload.facing,
         updatedAt: Date.now(),
+        eventTime: positionEventTime(event, payload),
+        eventId: event.id,
+        sequence: payload.seq,
       })
     }
 

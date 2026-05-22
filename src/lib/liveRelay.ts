@@ -24,11 +24,18 @@ import {
   profileNameFromContent,
   profilePictureFromContent,
 } from './profileImages'
+import {
+  facingFromVelocity,
+  parsePositionPayload,
+  positionEventTime,
+  shouldApplyPositionUpdate,
+} from './positionEvents'
 import type { WorldPosition } from './world'
 
 const encoder = new TextEncoder()
 const GROUP_CHAT_KINDS = new Set([1, 9])
 const PROFILE_RELAYS = ['wss://purplepag.es', 'wss://relay.nostr.band', 'wss://relay.damus.io']
+const POSITION_PUBLISH_INTERVAL_MS = 140
 
 function now() {
   return Math.floor(Date.now() / 1000)
@@ -97,6 +104,7 @@ export class LiveNip29Relay {
   private connectionStatus: RelaySnapshot['connectionStatus'] = 'connecting'
   private connectionMessage = 'connecting to live relay'
   private lastPositionPublish = 0
+  private positionSequence = 0
 
   constructor(groupId: string, relayUrl: string) {
     this.groupId = groupId
@@ -186,18 +194,40 @@ export class LiveNip29Relay {
       return { ok: false, reason: 'live-signer-required' }
     }
 
-    if (createdAt - this.lastPositionPublish < 320) {
+    if (createdAt - this.lastPositionPublish < POSITION_PUBLISH_INTERVAL_MS) {
       return { ok: false, reason: 'throttled' }
     }
     this.lastPositionPublish = createdAt
 
-    const facing = Math.abs(vx) > Math.abs(vy) ? (vx >= 0 ? 'east' : 'west') : vy < 0 ? 'north' : 'south'
-    const event = await this.signer.signEvent({
-      kind: OFFICE_KINDS.avatarPosition,
-      created_at: Math.floor(createdAt / 1000),
-      tags: [groupTag(this.groupId), ['relay', this.relayUrl]],
-      content: JSON.stringify({ x, y, vx, vy, facing }),
+    const sequence = this.positionSequence + 1
+    this.positionSequence = sequence
+    const facing = facingFromVelocity(vx, vy)
+    this.positions.set(pubkey, {
+      pubkey,
+      x,
+      y,
+      vx,
+      vy,
+      facing,
+      updatedAt: createdAt,
+      eventTime: createdAt,
+      sequence,
     })
+    this.emit()
+
+    let event: NestrEvent
+    try {
+      event = await this.signer.signEvent({
+        kind: OFFICE_KINDS.avatarPosition,
+        created_at: Math.floor(createdAt / 1000),
+        tags: [groupTag(this.groupId), ['relay', this.relayUrl]],
+        content: JSON.stringify({ x, y, vx, vy, facing, sentAt: createdAt, seq: sequence }),
+      })
+    } catch (error) {
+      this.connectionMessage = error instanceof Error ? error.message : String(error)
+      this.emit()
+      return { ok: false, reason: this.connectionMessage }
+    }
 
     return this.publishSigned(event)
   }
@@ -286,10 +316,11 @@ export class LiveNip29Relay {
 
   private async publishSigned(event: NestrEvent) {
     this.receive(event)
+    const isPositionEvent = event.kind === OFFICE_KINDS.avatarPosition
     try {
       const reason = await this.relay!.publish(event)
       this.connectionMessage = reason || 'published to relay'
-      this.emit(event)
+      if (!isPositionEvent) this.emit(event)
       return { ok: true, event }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -298,7 +329,7 @@ export class LiveNip29Relay {
         try {
           const reason = await this.relay!.publish(event)
           this.connectionMessage = reason || 'published to relay'
-          this.emit(event)
+          if (!isPositionEvent) this.emit(event)
           return { ok: true, event }
         } catch (retryError) {
           this.connectionMessage = retryError instanceof Error ? retryError.message : String(retryError)
@@ -330,7 +361,21 @@ export class LiveNip29Relay {
 
     if (event.kind === OFFICE_KINDS.avatarPosition) {
       try {
-        const payload = JSON.parse(event.content) as Omit<WorldPosition, 'pubkey' | 'updatedAt'>
+        const payload = parsePositionPayload(event.content)
+        const eventTime = positionEventTime(event, payload)
+        const sequence = payload.seq
+        const current = this.positions.get(event.pubkey)
+        const shouldApply = shouldApplyPositionUpdate(current, {
+          eventTime,
+          eventId: event.id,
+          sequence,
+          isSelf: event.pubkey === this.signer?.pubkey,
+        })
+
+        if (!shouldApply) {
+          return
+        }
+
         this.positions.set(event.pubkey, {
           pubkey: event.pubkey,
           x: payload.x,
@@ -339,6 +384,9 @@ export class LiveNip29Relay {
           vy: payload.vy,
           facing: payload.facing,
           updatedAt: Date.now(),
+          eventTime,
+          eventId: event.id,
+          sequence,
         })
       } catch {
         // Ignore malformed live movement.

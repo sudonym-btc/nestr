@@ -50,6 +50,7 @@ export class OfficeScene extends Phaser.Scene {
   private loadingProfileTextures = new Set<string>()
   private lastEmit = 0
   private lastViewportKey = ''
+  private localSelfMoveAt = 0
 
   constructor(onMove?: MoveHandler) {
     super('OfficeScene')
@@ -96,9 +97,12 @@ export class OfficeScene extends Phaser.Scene {
     const selfAvatar = this.avatars.get(this.snapshot.selfPubkey)
     if (!selfPosition || !selfAvatar) return
 
-    const speed = 0.17 * delta
+    const keyboardStep = 0.17 * delta
+    const clickStep = keyboardStep * 2
+    let step = keyboardStep
     let vx = 0
     let vy = 0
+    let reachedTarget = false
 
     if (this.keys) {
       vx += this.keys.D.isDown || this.keys.RIGHT.isDown ? 1 : 0
@@ -116,9 +120,12 @@ export class OfficeScene extends Phaser.Scene {
       const dx = this.target.x - selfPosition.x
       const dy = this.target.y - selfPosition.y
       const distance = Math.hypot(dx, dy)
-      if (distance > 4) {
+      const arrivalRadius = 6
+      if (distance > arrivalRadius) {
         vx = dx / distance
         vy = dy / distance
+        step = Math.min(clickStep, distance)
+        reachedTarget = step >= distance - arrivalRadius
       } else {
         this.target = undefined
       }
@@ -126,18 +133,20 @@ export class OfficeScene extends Phaser.Scene {
 
     if (vx === 0 && vy === 0) return
 
-    const nextX = selfPosition.x + vx * speed
-    const nextY = selfPosition.y + vy * speed
+    const nextX = selfPosition.x + vx * step
+    const nextY = selfPosition.y + vy * step
 
     selfPosition.x = nextX
     selfPosition.y = nextY
     selfPosition.vx = vx
     selfPosition.vy = vy
     selfPosition.updatedAt = Date.now()
+    this.localSelfMoveAt = selfPosition.updatedAt
     selfAvatar.container.setPosition(nextX, nextY)
     selfAvatar.container.setDepth(nextY)
+    if (reachedTarget) this.target = undefined
 
-    if (time - this.lastEmit > 90) {
+    if (reachedTarget || time - this.lastEmit > 90) {
       this.lastEmit = time
       this.onMove?.({ x: nextX, y: nextY, vx, vy })
     }
@@ -316,8 +325,10 @@ export class OfficeScene extends Phaser.Scene {
 
         if (position.pubkey === this.snapshot?.selfPubkey) {
           existing.tween?.stop()
-          existing.container.setPosition(position.x, position.y)
-          existing.container.setDepth(position.y)
+          if (position.updatedAt >= this.localSelfMoveAt) {
+            existing.container.setPosition(position.x, position.y)
+            existing.container.setDepth(position.y)
+          }
         } else {
           const jump = Phaser.Math.Distance.Between(
             existing.container.x,
