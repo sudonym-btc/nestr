@@ -1,0 +1,20 @@
+import { describe, expect, it } from 'vitest'
+import { normalizeRelayUrl, parseLaunch } from './launch'
+
+describe('launch URL parsing', () => {
+  it('uses mock mode without group and relay params', () => {
+    expect(parseLaunch('')).toEqual({ mode: 'mock' })
+  })
+
+  it('switches to live NIP-29 mode from obelisk-style params', () => {
+    expect(parseLaunch('?c=abc123&relay=groups.0xchat.com')).toEqual({
+      mode: 'live',
+      groupId: 'abc123',
+      relayUrl: 'wss://groups.0xchat.com',
+    })
+  })
+
+  it('normalizes HTTP relay hints to WebSocket URLs', () => {
+    expect(normalizeRelayUrl('https://relay.example/')).toBe('wss://relay.example')
+  })
+})

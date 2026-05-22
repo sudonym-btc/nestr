@@ -40,6 +40,9 @@ export interface Nip29Group {
 }
 
 export interface RelaySnapshot {
+  mode?: 'mock' | 'live'
+  connectionStatus?: 'mock' | 'connecting' | 'connected' | 'authenticated' | 'disconnected' | 'error'
+  connectionMessage?: string
   group: Nip29Group
   users: MockUser[]
   messages: NestrEvent[]
@@ -91,6 +94,7 @@ const demoUsers = [
 ]
 
 export class MockNip29Relay {
+  readonly mode = 'mock' as const
   readonly relayUrl = MOCK_RELAY_URL
   readonly relayPubkey: string
 
@@ -115,6 +119,9 @@ export class MockNip29Relay {
       .sort((a, b) => a.created_at - b.created_at)
 
     return {
+      mode: this.mode,
+      connectionStatus: 'mock',
+      connectionMessage: 'local mock relay',
       group: this.group,
       users: Array.from(this.users.values()),
       messages,

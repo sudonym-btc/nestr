@@ -32,6 +32,14 @@ export interface NestrEvent {
   sig: string
 }
 
+export type NestrEventTemplate = Pick<NestrEvent, 'kind' | 'tags' | 'content' | 'created_at'>
+
+export interface NestrSigner {
+  pubkey: string
+  label: string
+  signEvent: (event: NestrEventTemplate) => Promise<NestrEvent>
+}
+
 export function tagValue(event: Pick<NestrEvent, 'tags'>, name: string) {
   return event.tags.find((tag) => tag[0] === name)?.[1]
 }

@@ -1,13 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
+import * as QRCode from 'qrcode'
 import {
   Camera,
   CameraOff,
+  KeyRound,
   LockKeyhole,
   LogIn,
   Maximize2,
   MessageCircle,
   Mic,
   MicOff,
+  QrCode,
   Minimize2,
   Radio,
   Send,
@@ -16,19 +19,39 @@ import {
 } from 'lucide-react'
 import './App.css'
 import { PhaserOffice } from './game/PhaserOffice'
-import { avatarCss, npubForPubkey, shortNpub } from './lib/avatar'
+import { avatarCss, npubForPubkey, seededPubkey, shortNpub } from './lib/avatar'
+import { parseLaunch } from './lib/launch'
+import { createLiveRelay } from './lib/liveRelay'
 import { createMockRelay, type MockUser, type RelaySnapshot } from './lib/mockRelay'
-import { hasTag, tagValue } from './lib/nostr'
+import { hasTag, tagValue, type NestrSigner } from './lib/nostr'
 import { createMockPeerVideo, type MockPeerVideo } from './lib/mockVideo'
+import {
+  connectNip07Signer,
+  restoreNostrConnectSigner,
+  startNostrConnect,
+  type NostrConnectSession,
+} from './lib/signers'
+import {
+  clearStoredNostrConnectSession,
+  readStoredNostrConnectSession,
+  writeStoredNostrConnectSession,
+} from './lib/secureSession'
 import { estimateWebRtcMesh, meshHealth, nearbyPeers } from './lib/videoMesh'
-import { buildOfficeMap, mapCapacityLabel } from './lib/world'
+import { buildOfficeMap, mapCapacityLabel, spawnForPubkey } from './lib/world'
 
 function nameFor(pubkey: string, users: MockUser[]) {
   return users.find((user) => user.pubkey === pubkey)?.name ?? shortNpub(pubkey)
 }
 
-function groupTagLabel(snapshot: RelaySnapshot, tag: string) {
-  return hasTag(snapshot.group.metadata, tag) ? tag : `open ${tag}`
+function groupTagLabel(snapshot: RelaySnapshot) {
+  const tags = ['private', 'public', 'restricted', 'closed', 'hidden'].filter((tag) =>
+    hasTag(snapshot.group.metadata, tag),
+  )
+  return tags.length > 0 ? tags.join(' ') : 'open group'
+}
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
 }
 
 interface StreamTileProps {
@@ -59,10 +82,14 @@ function StreamTile({ label, sublabel, stream, muted = false }: StreamTileProps)
 }
 
 function App() {
-  const relay = useMemo(() => createMockRelay(), [])
+  const launch = useMemo(() => parseLaunch(), [])
+  const relay = useMemo(
+    () => (launch.mode === 'live' ? createLiveRelay(launch.groupId, launch.relayUrl) : createMockRelay()),
+    [launch],
+  )
   const [snapshot, setSnapshot] = useState(() => relay.snapshot())
-  const [selfPubkey, setSelfPubkey] = useState(() => snapshot.users[0].pubkey)
-  const [npubInput, setNpubInput] = useState<string>(() => npubForPubkey(snapshot.users[0].pubkey))
+  const [selfPubkey, setSelfPubkey] = useState(() => snapshot.users[0]?.pubkey ?? seededPubkey('live-viewer'))
+  const [npubInput, setNpubInput] = useState<string>(() => npubForPubkey(snapshot.users[0]?.pubkey ?? selfPubkey))
   const [message, setMessage] = useState('')
   const [callStarted, setCallStarted] = useState(false)
   const [mediaState, setMediaState] = useState<'idle' | 'requesting' | 'live' | 'blocked'>('idle')
@@ -71,7 +98,15 @@ function App() {
   const [cameraEnabled, setCameraEnabled] = useState(true)
   const [micEnabled, setMicEnabled] = useState(true)
   const [callExpanded, setCallExpanded] = useState(false)
+  const [authBusy, setAuthBusy] = useState(false)
+  const [authStatus, setAuthStatus] = useState(() =>
+    launch.mode === 'live' ? 'opening live NIP-29 room' : 'local mock relay',
+  )
+  const [connectSession, setConnectSession] = useState<NostrConnectSession | null>(null)
+  const [nostrConnectQr, setNostrConnectQr] = useState<string | null>(null)
   const callStageRef = useRef<HTMLDivElement | null>(null)
+  const messagesEndRef = useRef<HTMLDivElement | null>(null)
+  const autoAuthAttemptedRef = useRef(false)
   const remoteVideosRef = useRef<MockPeerVideo[]>([])
 
   const activeCount = Math.max(snapshot.positions.length, snapshot.users.length)
@@ -84,6 +119,8 @@ function App() {
   const health = meshHealth(mesh.participants)
   const metadataName = tagValue(snapshot.group.metadata, 'name') ?? 'NIP-29 office'
   const groupAbout = tagValue(snapshot.group.metadata, 'about') ?? ''
+  const connectionStatus = snapshot.connectionStatus ?? relay.mode
+  const connectionMessage = snapshot.connectionMessage ?? authStatus
   const currentUser = snapshot.users.find((user) => user.pubkey === selfPubkey)
   const callPeers = useMemo(() => {
     const nearbyPubkeys = nearby.map((peer) => peer.pubkey)
@@ -102,9 +139,17 @@ function App() {
   const displayedMesh = estimateWebRtcMesh((callStarted ? callPeers.length : nearby.length) + 1)
   const frozenPeerPubkeys = remoteVideos.map((video) => video.pubkey).join('|')
 
-  useEffect(() => relay.subscribe((next) => setSnapshot(next)), [relay])
+  useEffect(() => {
+    const unsubscribe = relay.subscribe((next) => setSnapshot(next))
+    return () => {
+      unsubscribe()
+      if (relay.mode === 'live') relay.close()
+    }
+  }, [relay])
 
   useEffect(() => {
+    if (relay.mode !== 'mock') return undefined
+
     const timer = window.setInterval(() => {
       relay.tickBots(selfPubkey, officeMap, frozenPeerPubkeys.split('|').filter(Boolean))
     }, 560)
@@ -141,6 +186,131 @@ function App() {
     return () => document.removeEventListener('fullscreenchange', handleFullscreenChange)
   }, [])
 
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ block: 'end' })
+  }, [snapshot.messages.length, snapshot.group.id])
+
+  const applySigner = useCallback(
+    async (signer: NestrSigner) => {
+      if (relay.mode !== 'live') return
+
+      const spawn = spawnForPubkey(officeMap, signer.pubkey, snapshot.users.length)
+      await relay.setSigner(signer)
+      setSelfPubkey(signer.pubkey)
+      setNpubInput(npubForPubkey(signer.pubkey))
+      setCallStarted(false)
+      stopRemoteVideos()
+      setCallExpanded(false)
+      setNostrConnectQr(null)
+      setConnectSession(null)
+      setAuthStatus(`${signer.label} connected as ${shortNpub(signer.pubkey)}`)
+
+      const result = await relay.publishPosition(signer.pubkey, spawn.x, spawn.y, 0, 0)
+      if (!result.ok && result.reason !== 'throttled') {
+        setAuthStatus(`${signer.label} connected; position publish failed: ${result.reason}`)
+      }
+    },
+    [officeMap, relay, snapshot.users.length],
+  )
+
+  const connectBrowserSigner = useCallback(
+    async (isAutoAttempt = false) => {
+      if (relay.mode !== 'live') return
+
+      setAuthBusy(true)
+      setAuthStatus(isAutoAttempt ? 'asking NIP-07 signer' : 'opening NIP-07 signer')
+      try {
+        const signer = await connectNip07Signer()
+        await applySigner(signer)
+      } catch (error) {
+        setAuthStatus(errorMessage(error))
+      } finally {
+        setAuthBusy(false)
+      }
+    },
+    [applySigner, relay],
+  )
+
+  const connectRemoteSigner = useCallback(async () => {
+    if (relay.mode !== 'live') return
+
+    connectSession?.abort()
+    setAuthBusy(true)
+    setAuthStatus('waiting for Nostr Connect signer')
+
+    const session = startNostrConnect(relay.relayUrl)
+    setConnectSession(session)
+
+    try {
+      const dataUrl = await QRCode.toDataURL(session.uri, {
+        margin: 1,
+        width: 180,
+        color: {
+          dark: '#171922',
+          light: '#fffdf8',
+        },
+      })
+      setNostrConnectQr(dataUrl)
+    } catch {
+      setNostrConnectQr(null)
+    }
+
+    try {
+      const result = await session.waitForSigner
+      await writeStoredNostrConnectSession(result.storedSession)
+      await applySigner(result.signer)
+    } catch (error) {
+      setAuthStatus(errorMessage(error))
+    } finally {
+      setAuthBusy(false)
+    }
+  }, [applySigner, connectSession, relay])
+
+  const beginAutoAuth = useCallback(async () => {
+    if (relay.mode !== 'live') return
+
+    const storedSession = await readStoredNostrConnectSession()
+    if (storedSession) {
+      setAuthBusy(true)
+      setAuthStatus('restoring Nostr Connect session')
+      try {
+        const signer = await restoreNostrConnectSigner(storedSession)
+        await applySigner(signer)
+        setAuthStatus(`NIP-46 restored as ${shortNpub(signer.pubkey)}`)
+        return
+      } catch (error) {
+        await clearStoredNostrConnectSession()
+        setAuthStatus(`saved signer unavailable: ${errorMessage(error)}`)
+      } finally {
+        setAuthBusy(false)
+      }
+    }
+
+    if (window.nostr) {
+      await connectBrowserSigner(true)
+      return
+    }
+
+    await connectRemoteSigner()
+  }, [applySigner, connectBrowserSigner, connectRemoteSigner, relay])
+
+  useEffect(() => {
+    return () => connectSession?.abort()
+  }, [connectSession])
+
+  useEffect(() => {
+    if (relay.mode !== 'live' || autoAuthAttemptedRef.current) return
+
+    const timer = window.setTimeout(() => {
+      if (autoAuthAttemptedRef.current) return
+
+      autoAuthAttemptedRef.current = true
+      void beginAutoAuth()
+    }, 0)
+
+    return () => window.clearTimeout(timer)
+  }, [beginAutoAuth, relay])
+
   const handleMove = useCallback(
     (position: { x: number; y: number; vx: number; vy: number }) => {
       relay.publishPosition(selfPubkey, position.x, position.y, position.vx, position.vy)
@@ -158,9 +328,17 @@ function App() {
     setCallExpanded(false)
   }
 
-  function sendMessage(event: FormEvent) {
+  async function sendMessage(event: FormEvent) {
     event.preventDefault()
-    relay.publishGroupMessage(selfPubkey, message)
+    const result = await relay.publishGroupMessage(selfPubkey, message)
+    if (!result.ok) {
+      setAuthStatus(
+        result.reason === 'live-signer-required'
+          ? 'connect a signer to write to this live room'
+          : String(result.reason),
+      )
+      return
+    }
     setMessage('')
   }
 
@@ -297,7 +475,7 @@ function App() {
             <p className="eyebrow">nestr</p>
             <h1>{metadataName}</h1>
           </div>
-          <span className="relay-dot" />
+          <span className="relay-dot" data-status={connectionStatus} />
         </div>
 
         <p className="about">{groupAbout}</p>
@@ -305,7 +483,7 @@ function App() {
         <div className="status-grid">
           <span>
             <LockKeyhole size={15} />
-            {groupTagLabel(snapshot, 'restricted')}
+            {groupTagLabel(snapshot)}
           </span>
           <span>
             <Users size={15} />
@@ -313,7 +491,7 @@ function App() {
           </span>
           <span>
             <Radio size={15} />
-            {snapshot.eventCount} events
+            {connectionStatus}
           </span>
           <span>
             <MessageCircle size={15} />
@@ -321,20 +499,60 @@ function App() {
           </span>
         </div>
 
-        <form className="signin" onSubmit={joinOffice}>
-          <label htmlFor="npub">npub</label>
-          <div className="input-row">
-            <input
-              id="npub"
-              value={npubInput}
-              onChange={(event) => setNpubInput(event.target.value)}
-              spellCheck={false}
-            />
-            <button type="submit" aria-label="Join office">
-              <LogIn size={18} />
-            </button>
-          </div>
-        </form>
+        {relay.mode === 'mock' ? (
+          <form className="signin" onSubmit={joinOffice}>
+            <label htmlFor="npub">npub</label>
+            <div className="input-row">
+              <input
+                id="npub"
+                value={npubInput}
+                onChange={(event) => setNpubInput(event.target.value)}
+                spellCheck={false}
+              />
+              <button type="submit" aria-label="Join office">
+                <LogIn size={18} />
+              </button>
+            </div>
+          </form>
+        ) : (
+          <section className="signin live-auth" aria-label="Nostr auth">
+            <label>nostr auth</label>
+            <div className="auth-status">
+              <span className="avatar-chip small" style={avatarCss(selfPubkey)} />
+              <div>
+                <strong>{authStatus}</strong>
+                <span>{connectionMessage}</span>
+              </div>
+            </div>
+            <div className="auth-actions">
+              <button
+                type="button"
+                className="secondary-action"
+                disabled={authBusy}
+                onClick={() => void connectBrowserSigner(false)}
+              >
+                <KeyRound size={17} />
+                NIP-07
+              </button>
+              <button
+                type="button"
+                className="secondary-action"
+                disabled={authBusy}
+                onClick={() => void connectRemoteSigner()}
+              >
+                <QrCode size={17} />
+                Nostr Connect
+              </button>
+            </div>
+            {connectSession && (
+              <div className="connect-card">
+                {nostrConnectQr && <img src={nostrConnectQr} alt="Nostr Connect QR" />}
+                <a href={connectSession.uri}>Open Nostr Connect</a>
+                <textarea readOnly value={connectSession.uri} aria-label="Nostr Connect URI" />
+              </div>
+            )}
+          </section>
+        )}
 
         <section className="panel-section">
           <div className="section-title">
@@ -376,7 +594,9 @@ function App() {
               type="button"
               key={user.pubkey}
               className={`person ${user.pubkey === selfPubkey ? 'active' : ''}`}
+              disabled={relay.mode === 'live' && user.pubkey !== selfPubkey}
               onClick={() => {
+                if (relay.mode !== 'mock') return
                 setSelfPubkey(user.pubkey)
                 setNpubInput(user.npub)
                 setCallStarted(false)
@@ -422,11 +642,11 @@ function App() {
           <section
             ref={callStageRef}
             className={`call-stage ${callExpanded ? 'expanded' : ''}`}
-            aria-label="Mock WebRTC call"
+            aria-label={relay.mode === 'mock' ? 'Mock WebRTC call' : 'WebRTC call'}
           >
             <div className="call-stage-bar">
               <div>
-                <strong>Mock WebRTC mesh</strong>
+                <strong>{relay.mode === 'mock' ? 'Mock WebRTC mesh' : 'WebRTC mesh'}</strong>
                 <span>{displayedMesh.participants} participants · Nostr-signaled proximity call</span>
               </div>
               <button
@@ -509,6 +729,7 @@ function App() {
               <p>{event.content}</p>
             </article>
           ))}
+          <div ref={messagesEndRef} />
         </div>
 
         <form className="composer" onSubmit={sendMessage}>
