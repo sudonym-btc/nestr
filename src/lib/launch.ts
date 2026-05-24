@@ -2,12 +2,14 @@ export interface LandingLaunch {
   mode: 'landing'
 }
 
+export type LaunchView = 'relay' | 'group' | 'dm'
+
 export interface MockLaunch {
   mode: 'mock'
   groupId?: string
   relayUrl: string
   authRequired: boolean
-  initialView: 'relay' | 'group'
+  initialView: LaunchView
 }
 
 export interface LiveLaunch {
@@ -15,7 +17,7 @@ export interface LiveLaunch {
   groupId?: string
   relayUrl: string
   nostrConnectRelays: string[]
-  initialView: 'relay' | 'group'
+  initialView: LaunchView
 }
 
 export type LaunchConfig = LandingLaunch | MockLaunch | LiveLaunch
@@ -76,6 +78,8 @@ export function parseLaunch(search = globalThis.location?.search ?? ''): LaunchC
   const params = new URLSearchParams(search)
   const groupId = params.get('c') ?? params.get('group') ?? params.get('h')
   const relay = params.get('relay')
+  const view = params.get('view') === 'dm' ? 'dm' : params.get('view') === 'relay' ? 'relay' : undefined
+  const initialView = view ?? (groupId ? 'group' : 'relay')
   const nostrConnectRelays = relayListParams(params, [
     'connectRelay',
     'connect_relay',
@@ -93,7 +97,7 @@ export function parseLaunch(search = globalThis.location?.search ?? ''): LaunchC
         groupId: groupId ?? undefined,
         relayUrl: normalizeRelayUrl(relay),
         authRequired: developmentRelay.authRequired,
-        initialView: groupId ? 'group' : 'relay',
+        initialView,
       }
     }
 
@@ -102,7 +106,7 @@ export function parseLaunch(search = globalThis.location?.search ?? ''): LaunchC
       groupId: groupId ?? undefined,
       relayUrl: normalizeRelayUrl(relay),
       nostrConnectRelays,
-      initialView: groupId ? 'group' : 'relay',
+      initialView,
     }
   }
 

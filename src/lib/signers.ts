@@ -5,6 +5,7 @@ import { decrypt, getConversationKey } from 'nostr-tools/nip44'
 import { generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import { Relay } from 'nostr-tools/relay'
 import type { NestrSigner } from './nostr'
+import { debugDuration, debugError, debugLog, debugWarn, shortId } from './debugLog'
 
 declare global {
   interface Window {
@@ -28,6 +29,9 @@ declare global {
         encrypt: (pubkey: string, plaintext: string) => Promise<string>
         decrypt: (pubkey: string, ciphertext: string) => Promise<string>
       }
+      nip04?: {
+        decrypt: (pubkey: string, ciphertext: string) => Promise<string>
+      }
     }
   }
 }
@@ -41,6 +45,7 @@ function randomHex(bytes = 16) {
 export const NESTR_NIP46_PERMISSIONS = [
   'get_public_key',
   'ping',
+  'nip04_decrypt',
   'nip44_encrypt',
   'nip44_decrypt',
   'sign_event:13',
@@ -54,6 +59,11 @@ export const NESTR_NIP46_PERMISSIONS = [
   'sign_event:9009',
   'sign_event:9021',
   'sign_event:9022',
+  'sign_event:25050',
+  'sign_event:25051',
+  'sign_event:25052',
+  'sign_event:25053',
+  'sign_event:25055',
   'sign_event:25029',
   'sign_event:22242',
   'sign_event:24242',
@@ -63,13 +73,23 @@ export const DEFAULT_NOSTR_CONNECT_RELAYS = [
   'wss://relay.nsec.app',
 ] as const
 
+const RESTORE_PROBE_TIMEOUT_MS = 2_500
+const RESTORE_PROBE_RETRY_DELAY_MS = 650
+const RESTORE_PROBE_ATTEMPTS = 2
+
 function normalizeRelayUrl(value: string) {
-  const withScheme = value.includes('://') ? value : `wss://${value}`
-  const url = new URL(withScheme)
-  if (url.protocol === 'https:') url.protocol = 'wss:'
-  if (url.protocol === 'http:') url.protocol = 'ws:'
-  url.hash = ''
-  return url.toString().replace(/\/$/, '')
+  const trimmed = value.trim()
+  if (!trimmed) return ''
+  try {
+    const withScheme = trimmed.includes('://') ? trimmed : `wss://${trimmed}`
+    const url = new URL(withScheme)
+    if (url.protocol === 'https:') url.protocol = 'wss:'
+    if (url.protocol === 'http:') url.protocol = 'ws:'
+    url.hash = ''
+    return url.toString().replace(/\/$/, '')
+  } catch {
+    return trimmed.replace(/\/$/, '')
+  }
 }
 
 export function nostrConnectRelayHints(roomRelayUrl: string, explicitRelays: string[] = []) {
@@ -89,6 +109,9 @@ export async function connectNip07Signer(): Promise<NestrSigner> {
     pubkey,
     label: 'NIP-07',
     signEvent: (event) => window.nostr!.signEvent(event),
+    nip04Decrypt: window.nostr.nip04?.decrypt
+      ? (thirdPartyPubkey, ciphertext) => window.nostr!.nip04!.decrypt(thirdPartyPubkey, ciphertext)
+      : undefined,
     nip44Encrypt: window.nostr.nip44?.encrypt
       ? (thirdPartyPubkey, plaintext) => window.nostr!.nip44!.encrypt(thirdPartyPubkey, plaintext)
       : undefined,
@@ -137,8 +160,115 @@ export function nostrConnectAppMetadata(origin: string) {
   }
 }
 
+export function nostrConnectStoredRelayHints(storedSession: NostrConnectStoredSession | null | undefined) {
+  if (!storedSession) return []
+
+  const relayUrls = Array.isArray(storedSession.relayUrls) ? storedSession.relayUrls : []
+  const pointerRelays = Array.isArray(storedSession.bunkerPointer?.relays)
+    ? storedSession.bunkerPointer.relays
+    : []
+  return Array.from(
+    new Set(
+      [...relayUrls, storedSession.relayUrl, ...pointerRelays]
+        .filter((relayUrl): relayUrl is string => typeof relayUrl === 'string')
+        .map(normalizeRelayUrl)
+        .filter(Boolean),
+    ),
+  )
+}
+
+export function normalizeStoredNostrConnectSession(storedSession: NostrConnectStoredSession) {
+  const relayHints = nostrConnectStoredRelayHints(storedSession)
+  const relays = relayHints.length > 0 ? relayHints : [...DEFAULT_NOSTR_CONNECT_RELAYS]
+
+  return {
+    ...storedSession,
+    relayUrl: relays[0],
+    relayUrls: relays,
+    bunkerPointer: {
+      ...storedSession.bunkerPointer,
+      relays,
+    },
+  }
+}
+
 function openAuthUrl(url: string) {
   window.open(url, '_blank', 'noopener,noreferrer')
+}
+
+function isHexPubkey(value: string) {
+  return /^[0-9a-f]{64}$/i.test(value)
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => globalThis.setTimeout(resolve, ms))
+}
+
+function requestWithTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string) {
+  let timer: ReturnType<typeof globalThis.setTimeout> | undefined
+  const timeout = new Promise<T>((_, reject) => {
+    timer = globalThis.setTimeout(() => reject(new Error(message)), timeoutMs)
+  })
+
+  return Promise.race([
+    promise.finally(() => {
+      if (timer) globalThis.clearTimeout(timer)
+    }),
+    timeout,
+  ])
+}
+
+async function probeRestoredSigner(signer: BunkerSigner, storedPubkey: string) {
+  const canUseStoredPubkey = isHexPubkey(storedPubkey)
+  let lastError: unknown
+
+  for (let attempt = 0; attempt < RESTORE_PROBE_ATTEMPTS; attempt += 1) {
+    if (attempt > 0) await delay(RESTORE_PROBE_RETRY_DELAY_MS)
+    const startedAt = performance.now()
+
+    try {
+      if (canUseStoredPubkey) {
+        debugLog('nip46', 'restore probe ping start', {
+          attempt: attempt + 1,
+          pubkey: shortId(storedPubkey),
+          timeoutMs: RESTORE_PROBE_TIMEOUT_MS,
+        })
+        await requestWithTimeout(signer.ping(), RESTORE_PROBE_TIMEOUT_MS, 'signer ping timed out')
+        debugLog('nip46', 'restore probe ping ok', {
+          attempt: attempt + 1,
+          pubkey: shortId(storedPubkey),
+          elapsedMs: debugDuration(startedAt),
+        })
+        return storedPubkey
+      }
+
+      debugLog('nip46', 'restore probe getPublicKey start', {
+        attempt: attempt + 1,
+        timeoutMs: RESTORE_PROBE_TIMEOUT_MS,
+      })
+      const pubkey = await requestWithTimeout(
+        signer.getPublicKey(),
+        RESTORE_PROBE_TIMEOUT_MS,
+        'signer public key fetch timed out',
+      )
+      debugLog('nip46', 'restore probe getPublicKey ok', {
+        attempt: attempt + 1,
+        pubkey: shortId(pubkey),
+        elapsedMs: debugDuration(startedAt),
+      })
+      return pubkey
+    } catch (error) {
+      lastError = error
+      debugWarn('nip46', 'restore probe attempt failed', {
+        attempt: attempt + 1,
+        pubkey: shortId(storedPubkey),
+        elapsedMs: debugDuration(startedAt),
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error('signer reconnect probe failed')
 }
 
 function abortError() {
@@ -159,6 +289,11 @@ function waitForNostrConnectBunker(
 ) {
   const clientPubkey = getPublicKey(clientSecretKey)
   const since = Math.floor(Date.now() / 1000) - 600
+  debugLog('nip46', 'waiting for Nostr Connect bunker', {
+    clientPubkey: shortId(clientPubkey),
+    relays,
+    since,
+  })
   const relayConnections: Relay[] = []
   const subscriptions: ReturnType<Relay['subscribe']>[] = []
   let settled = false
@@ -197,11 +332,16 @@ function waitForNostrConnectBunker(
 
     Promise.allSettled(
       relays.map(async (relayUrl) => {
+        debugLog('nip46', 'connecting Nostr Connect relay', { relayUrl })
         const relay = await Relay.connect(relayUrl, { enableReconnect: true })
         if (signal.aborted) throw abortError()
 
         relayConnections.push(relay)
         activeSubscriptions += 1
+        debugLog('nip46', 'subscribing for bunker response', {
+          relayUrl,
+          clientPubkey: shortId(clientPubkey),
+        })
         const subscription = relay.subscribe(
           [
             {
@@ -215,6 +355,10 @@ function waitForNostrConnectBunker(
             onevent: (event) => {
               try {
                 if (parseConnectResponse(clientSecretKey, event, secret)) {
+                  debugLog('nip46', 'bunker response matched', {
+                    relayUrl,
+                    bunkerPubkey: shortId(event.pubkey),
+                  })
                   signal.removeEventListener('abort', onAbort)
                   resolveOnce({ pubkey: event.pubkey, relays, secret })
                 }
@@ -224,6 +368,7 @@ function waitForNostrConnectBunker(
             },
             onclose: (reason) => {
               activeSubscriptions -= 1
+              debugWarn('nip46', 'bunker listener closed', { relayUrl, reason })
               if (activeSubscriptions <= 0 && !settled) {
                 rejectOnce(new Error(reason || 'Nostr Connect listener closed'))
               }
@@ -243,11 +388,13 @@ function waitForNostrConnectBunker(
           .filter(Boolean)
           .join('; ')
         const error = new Error(reason || 'Could not connect to Nostr Connect relay')
+        debugError('nip46', 'failed to connect Nostr Connect relays', { relays, reason })
         rejectReady(error)
         rejectOnce(error)
         return
       }
 
+      debugLog('nip46', 'Nostr Connect listener ready', { relays })
       resolveReady()
     })
   })
@@ -262,6 +409,7 @@ function signerAdapter(signer: BunkerSigner, pubkey: string): NestrSigner {
     pubkey,
     label: 'NIP-46',
     signEvent: (event) => signer.signEvent(event),
+    nip04Decrypt: (thirdPartyPubkey, ciphertext) => signer.nip04Decrypt(thirdPartyPubkey, ciphertext),
     nip44Encrypt: (thirdPartyPubkey, plaintext) => signer.nip44Encrypt(thirdPartyPubkey, plaintext),
     nip44Decrypt: (thirdPartyPubkey, ciphertext) => signer.nip44Decrypt(thirdPartyPubkey, ciphertext),
     ping: () => signer.ping(),
@@ -282,6 +430,11 @@ export function startNostrConnect(options: NostrConnectStartOptions): NostrConne
   const connectionSecret = randomHex(16)
   const appMetadata = nostrConnectAppMetadata(window.location.origin)
   const relays = nostrConnectRelayHints(options.roomRelayUrl, options.nostrConnectRelays)
+  debugLog('nip46', 'startNostrConnect', {
+    clientPubkey: shortId(clientPubkey),
+    relays,
+    roomRelayUrl: options.roomRelayUrl,
+  })
   const uri = createNostrConnectURI({
     clientPubkey,
     relays,
@@ -292,6 +445,11 @@ export function startNostrConnect(options: NostrConnectStartOptions): NostrConne
   const listener = waitForNostrConnectBunker(clientSecretKey, relays, connectionSecret, controller.signal)
 
   const waitForSigner = listener.waitForBunker.then(async (bunkerPointer) => {
+    const startedAt = performance.now()
+    debugLog('nip46', 'creating signer from bunker', {
+      bunkerPubkey: shortId(bunkerPointer.pubkey),
+      relays: bunkerPointer.relays,
+    })
     const signer = BunkerSigner.fromBunker(clientSecretKey, bunkerPointer, {
       onauth: openAuthUrl,
       skipSwitchRelays: true,
@@ -302,7 +460,12 @@ export function startNostrConnect(options: NostrConnectStartOptions): NostrConne
     controller.signal.addEventListener('abort', onAbort, { once: true })
 
     try {
+      debugLog('nip46', 'initial getPublicKey start', { bunkerPubkey: shortId(bunkerPointer.pubkey) })
       const pubkey = await signer.getPublicKey()
+      debugLog('nip46', 'initial getPublicKey ok', {
+        pubkey: shortId(pubkey),
+        elapsedMs: debugDuration(startedAt),
+      })
       return {
         signer: signerAdapter(signer, pubkey),
         storedSession: {
@@ -329,11 +492,36 @@ export function startNostrConnect(options: NostrConnectStartOptions): NostrConne
   }
 }
 
-export async function restoreNostrConnectSigner(storedSession: NostrConnectStoredSession) {
-  const signer = BunkerSigner.fromBunker(hexToBytes(storedSession.clientSecretKey), storedSession.bunkerPointer, {
+export async function restoreNostrConnectSigner(storedSession: NostrConnectStoredSession): Promise<NostrConnectResult> {
+  const normalizedSession = normalizeStoredNostrConnectSession(storedSession)
+  debugLog('nip46', 'restoreNostrConnectSigner start', {
+    userPubkey: shortId(normalizedSession.userPubkey),
+    bunkerPubkey: shortId(normalizedSession.bunkerPointer.pubkey),
+    relays: nostrConnectStoredRelayHints(normalizedSession),
+  })
+  const signer = BunkerSigner.fromBunker(hexToBytes(normalizedSession.clientSecretKey), normalizedSession.bunkerPointer, {
     onauth: openAuthUrl,
     skipSwitchRelays: true,
   })
-  const pubkey = await signer.getPublicKey()
-  return signerAdapter(signer, pubkey)
+  let pubkey: string
+
+  try {
+    pubkey = await probeRestoredSigner(signer, normalizedSession.userPubkey)
+  } catch (error) {
+    debugError('nip46', 'restore probe failed; closing signer', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    await signer.close().catch(() => undefined)
+    throw error
+  }
+
+  const refreshedSession = normalizeStoredNostrConnectSession({
+    ...normalizedSession,
+    bunkerPointer: signer.bp,
+    userPubkey: pubkey,
+  })
+  return {
+    signer: signerAdapter(signer, pubkey),
+    storedSession: refreshedSession,
+  }
 }

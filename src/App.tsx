@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent } from 'react'
 import * as QRCode from 'qrcode'
 import {
   Camera,
@@ -17,10 +17,13 @@ import {
   MicOff,
   Minimize2,
   Monitor,
+  PhoneOff,
   Download,
   File as FileIcon,
   Image,
+  Info,
   Paperclip,
+  Plus,
   Radio,
   RefreshCcw,
   Search,
@@ -51,10 +54,20 @@ import { Label } from '@/components/ui/label'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { OfficeRenderer } from './game/OfficeRenderer'
 import { avatarCss, npubForPubkey, resolvePubkey, seededPubkey, shortNpub } from './lib/avatar'
-import { DEVELOPMENT_RELAYS, parseLaunch, type LiveLaunch, type MockLaunch } from './lib/launch'
+import { DEVELOPMENT_RELAYS, parseLaunch, type LaunchConfig, type LiveLaunch, type MockLaunch } from './lib/launch'
 import { createLiveRelay } from './lib/liveRelay'
 import { createMockRelay, type MockUser, type RelaySnapshot } from './lib/mockRelay'
 import { NIP29_KINDS, OFFICE_KINDS, hasTag, tagValue, type NestrAttachment, type NestrEvent, type NestrSigner } from './lib/nostr'
+import {
+  normalizeRelayUrl,
+  readSavedRelayUrls,
+  relayUrlFromGroupEvent,
+  sameRelayUrl,
+  uniqueRelayUrls,
+  writeSavedRelayUrls,
+} from './lib/relayDiscovery'
+import { fetchRelayInfo, relayIconCandidates, type RelayInfo } from './lib/relayInfo'
+import { filterFailedImages, markImageFailed } from './lib/imageFailures'
 import {
   attachmentsFromEvent,
   contentWithoutAttachmentUrls,
@@ -69,13 +82,25 @@ import {
 } from './lib/nip29'
 import { createMockPeerVideo, type MockPeerVideo } from './lib/mockVideo'
 import { parseNostrReferences, type EntityPart } from './lib/nostrReferences'
-import { playMessageSound, primeMessageSound } from './lib/messageSound'
+import { playCallJoinSound, playMessageSound, primeMessageSound } from './lib/messageSound'
 import { isOnlineFromActivity } from './lib/presence'
 import {
+  contentSummary,
+  debugDuration,
+  debugError,
+  debugLog,
+  debugWarn,
+  eventTagSummary,
+  shortId,
+} from './lib/debugLog'
+import {
   connectNip07Signer,
+  normalizeStoredNostrConnectSession,
+  nostrConnectStoredRelayHints,
   restoreNostrConnectSigner,
   startNostrConnect,
   type NostrConnectSession,
+  type NostrConnectStoredSession,
 } from './lib/signers'
 import {
   clearStoredNostrConnectSession,
@@ -85,9 +110,52 @@ import {
 import { BLOSSOM_FALLBACK_SERVERS } from './lib/profileImages'
 import { estimateWebRtcMesh, nearbyPeers } from './lib/videoMesh'
 import { buildOfficeMap, spawnForPubkey } from './lib/world'
+import {
+  isPositionFresh,
+  POSITION_REBROADCAST_INTERVAL_MS,
+  type PositionMovement,
+} from './lib/positionEvents'
+
+const PEOPLE_RENDER_STEP = 80
 
 function nameFor(pubkey: string, users: MockUser[]) {
   return users.find((user) => user.pubkey === pubkey)?.name ?? shortNpub(pubkey)
+}
+
+function appPath(url: URL) {
+  return `${url.pathname}${url.search}${url.hash}`
+}
+
+function navigateInApp(target: string | URL) {
+  const url = typeof target === 'string' ? new URL(target, window.location.href) : target
+  if (url.origin !== window.location.origin) {
+    window.location.href = url.toString()
+    return
+  }
+
+  const nextPath = appPath(url)
+  if (nextPath !== appPath(new URL(window.location.href))) {
+    window.history.pushState(null, '', nextPath)
+  }
+  window.dispatchEvent(new Event('popstate'))
+}
+
+function handleInternalLink(event: MouseEvent<HTMLAnchorElement>) {
+  if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.altKey || event.ctrlKey || event.shiftKey) {
+    return
+  }
+  event.preventDefault()
+  navigateInApp(event.currentTarget.href)
+}
+
+function launchKey(launch: LaunchConfig) {
+  if (launch.mode === 'landing') return 'landing'
+  if (launch.mode === 'live') return 'live'
+  return [launch.mode, launch.relayUrl, launch.groupId ?? ''].join(':')
+}
+
+function groupNameHintKey(relayUrl: string, groupId: string) {
+  return `${normalizeRelayUrl(relayUrl)}:${groupId}`
 }
 
 function groupTagLabel(snapshot: RelaySnapshot) {
@@ -99,6 +167,11 @@ function groupTagLabel(snapshot: RelaySnapshot) {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
+}
+
+function isTimeoutError(error: unknown) {
+  const message = errorMessage(error).toLowerCase()
+  return message.includes('timeout') || message.includes('timed out')
 }
 
 function messageDate(seconds: number) {
@@ -159,16 +232,27 @@ function relayGroupSearchText(groupEvent: NestrEvent, fallbackGroupId: string) {
   const groupId = tagValue(groupEvent, 'd') ?? fallbackGroupId
   const name = tagValue(groupEvent, 'name') ?? ''
   const about = tagValue(groupEvent, 'about') ?? ''
-  return `${groupId} ${name} ${about}`.toLowerCase()
+  const relay = tagValue(groupEvent, 'relay') ?? ''
+  return `${groupId} ${name} ${about} ${relay}`.toLowerCase()
 }
+
+const SIGNER_PENDING_DEFAULT_DELAY_MS = 5_000
+const SIGNER_PENDING_CALL_DELAY_MS = 2_000
+const SIGNER_PING_TIMEOUT_MS = 4_000
+const SIGNER_PING_RETRY_DELAY_MS = 800
 
 function isOfficeCallSignalKind(kind: number) {
   return (
     kind === OFFICE_KINDS.callOffer ||
     kind === OFFICE_KINDS.callAnswer ||
     kind === OFFICE_KINDS.iceCandidate ||
-    kind === OFFICE_KINDS.callHangup
+    kind === OFFICE_KINDS.callHangup ||
+    kind === OFFICE_KINDS.callRenegotiate
   )
+}
+
+function signerPendingDelayMs(kind: number) {
+  return isOfficeCallSignalKind(kind) ? SIGNER_PENDING_CALL_DELAY_MS : SIGNER_PENDING_DEFAULT_DELAY_MS
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string) {
@@ -194,7 +278,8 @@ interface AvatarChipProps {
 }
 
 function AvatarChip({ pubkey, user, small = false }: AvatarChipProps) {
-  const candidates = user?.pictureCandidates?.length ? user.pictureCandidates : user?.pictureUrl ? [user.pictureUrl] : []
+  const rawCandidates = user?.pictureCandidates?.length ? user.pictureCandidates : user?.pictureUrl ? [user.pictureUrl] : []
+  const candidates = filterFailedImages(rawCandidates)
   const candidatesKey = candidates.join('|')
   const [failed, setFailed] = useState({ key: '', index: 0 })
   const candidateIndex = failed.key === candidatesKey ? failed.index : 0
@@ -210,14 +295,84 @@ function AvatarChip({ pubkey, user, small = false }: AvatarChipProps) {
         <AvatarImage
           src={src}
           alt=""
+          loading="lazy"
+          decoding="async"
           referrerPolicy="no-referrer"
           onLoadingStatusChange={(status) => {
-            if (status === 'error') setFailed({ key: candidatesKey, index: candidateIndex + 1 })
+            if (status === 'error') {
+              markImageFailed(src)
+              setFailed({ key: candidatesKey, index: candidateIndex + 1 })
+            }
           }}
         />
       )}
       <AvatarFallback />
     </Avatar>
+  )
+}
+
+function relayInitials(relayUrl: string) {
+  const host = relayHostLabel(relayUrl).replace(/^www\./, '')
+  const parts = host.split('.').filter(Boolean)
+  const source = parts.length > 1 ? parts.slice(0, -1) : parts
+  const letters = source
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase() ?? '')
+    .join('')
+  return letters || 'R'
+}
+
+interface RelayRailButtonProps {
+  relayUrl: string
+  active: boolean
+  onClick: () => void
+}
+
+function RelayRailButton({ relayUrl, active, onClick }: RelayRailButtonProps) {
+  const host = relayHostLabel(relayUrl)
+  const [info, setInfo] = useState<RelayInfo | null>(null)
+  const [iconIndex, setIconIndex] = useState(0)
+
+  useEffect(() => {
+    let cancelled = false
+    void fetchRelayInfo(relayUrl).then((next) => {
+      if (!cancelled) {
+        if (next?.icon) setIconIndex(0)
+        setInfo(next)
+      }
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [relayUrl])
+
+  const iconCandidates = filterFailedImages(relayIconCandidates(relayUrl, info))
+  const iconUrl = iconCandidates[iconIndex] ?? null
+  const label = info?.name || host
+
+  return (
+    <Button
+      type="button"
+      className={`rail-button relay ${active ? 'active' : ''} ${iconUrl ? 'has-logo' : ''}`}
+      onClick={onClick}
+      aria-label={`Relay ${label}`}
+      title={label}
+    >
+      {iconUrl ? (
+        <img
+          className="relay-logo"
+          src={iconUrl}
+          alt=""
+          referrerPolicy="no-referrer"
+          onError={() => {
+            markImageFailed(iconUrl)
+            setIconIndex((index) => Math.min(index + 1, iconCandidates.length))
+          }}
+        />
+      ) : (
+        <span className="relay-initials" aria-hidden="true">{relayInitials(relayUrl)}</span>
+      )}
+    </Button>
   )
 }
 
@@ -449,8 +604,9 @@ function DirectMessageContent({ message, users }: { message: { content: string; 
 
 interface StreamTileProps {
   label: string
-  sublabel: string
+  sublabel?: string
   stream: MediaStream | null
+  showVideo?: boolean
   muted?: boolean
   micMuted?: boolean
   status?: 'local' | 'remote' | 'screen'
@@ -466,6 +622,20 @@ interface AuthPrompt {
   title: string
   detail: string
 }
+
+interface SignerPendingPrompt {
+  id: string
+  signerLabel: string
+  eventKind: number
+}
+
+interface CallMediaState {
+  audio?: boolean
+  video?: boolean
+  screen?: boolean
+}
+
+type StoredPositionMovement = PositionMovement & { sentAt: number }
 
 function signerRequired(reason?: string) {
   const value = String(reason ?? '').toLowerCase()
@@ -497,8 +667,71 @@ function unsupportedActionMessage(kind: number, label: string) {
   return `${label} is not supported by this relay.`
 }
 
-function StreamTile({ label, sublabel, stream, muted = false, micMuted = false, status = 'remote' }: StreamTileProps) {
+function directMessageErrorMessage(reason: unknown, recipientName: string) {
+  if (reason === 'recipient-nip17-relays-missing') {
+    return `${recipientName} has not published NIP-17 DM relays yet, so Nestr cannot send them a private reply.`
+  }
+  return String(reason)
+}
+
+function signerEventDescription(kind: number) {
+  if (kind === OFFICE_KINDS.avatarPosition) return 'office movement'
+  if (kind === OFFICE_KINDS.callOffer) return 'call offer'
+  if (kind === OFFICE_KINDS.callAnswer) return 'call answer'
+  if (kind === OFFICE_KINDS.iceCandidate) return 'call connection candidate'
+  if (kind === OFFICE_KINDS.callHangup) return 'call hangup'
+  if (kind === OFFICE_KINDS.callRenegotiate) return 'call media update'
+  if (kind === NIP29_KINDS.chatMessage) return 'chat message'
+  if (kind === NIP29_KINDS.joinRequest) return 'join request'
+  if (kind === NIP29_KINDS.putUser) return 'member update'
+  if (kind === NIP29_KINDS.removeUser) return 'member removal'
+  if (kind === NIP29_KINDS.editMetadata) return 'group edit'
+  if (kind === NIP29_KINDS.deleteEvent) return 'message deletion'
+  if (kind === NIP29_KINDS.createGroup) return 'group creation'
+  if (kind === NIP29_KINDS.deleteGroup) return 'group deletion'
+  if (kind === NIP29_KINDS.createInvite) return 'invite creation'
+  return `kind ${kind}`
+}
+
+function remoteStreamHasLiveVideo(stream: MediaStream) {
+  return stream.getVideoTracks().some((track) => track.readyState === 'live' && !track.muted && track.enabled)
+}
+
+function remoteStreamMicMuted(stream: MediaStream) {
+  const audioTracks = stream.getAudioTracks()
+  if (audioTracks.length === 0) return true
+  return audioTracks.every((track) => track.readyState !== 'live' || track.muted || !track.enabled)
+}
+
+function callSignalMedia(payload: unknown): CallMediaState | null {
+  if (!payload || typeof payload !== 'object') return null
+  const media = (payload as { media?: unknown }).media
+  if (!media || typeof media !== 'object') return null
+  const candidate = media as Record<string, unknown>
+  const audio = typeof candidate.audio === 'boolean' ? candidate.audio : undefined
+  const video = typeof candidate.video === 'boolean' ? candidate.video : undefined
+  const screen = typeof candidate.screen === 'boolean' ? candidate.screen : undefined
+  return audio === undefined && video === undefined && screen === undefined ? null : { audio, video, screen }
+}
+
+function callSignalParticipants(payload: unknown) {
+  if (!payload || typeof payload !== 'object') return []
+  const participants = (payload as { participants?: unknown }).participants
+  if (!Array.isArray(participants)) return []
+  return Array.from(new Set(participants.filter((pubkey): pubkey is string => typeof pubkey === 'string' && pubkey.length > 0)))
+}
+
+function StreamTile({
+  label,
+  sublabel,
+  stream,
+  showVideo = Boolean(stream),
+  muted = false,
+  micMuted = false,
+  status = 'remote',
+}: StreamTileProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null)
+  const videoVisible = Boolean(stream && showVideo)
 
   useEffect(() => {
     if (videoRef.current) {
@@ -507,11 +740,20 @@ function StreamTile({ label, sublabel, stream, muted = false, micMuted = false, 
   }, [stream])
 
   return (
-    <Card className={`stream-tile ${stream ? '' : 'empty'} ${status}`} size="sm">
-      {stream ? <video ref={videoRef} autoPlay muted={muted} playsInline /> : <div className="stream-empty" />}
+    <Card className={`stream-tile ${videoVisible ? '' : 'empty'} ${status}`} size="sm">
+      {stream && (
+        <video
+          ref={videoRef}
+          autoPlay
+          muted={muted}
+          playsInline
+          className={videoVisible ? undefined : 'stream-video-hidden'}
+        />
+      )}
+      {!videoVisible && <div className="stream-empty" />}
       <div className="stream-label">
         <strong>{label}</strong>
-        <span>{sublabel}</span>
+        {!videoVisible ? <span>{sublabel ?? 'no video'}</span> : sublabel ? <span>{sublabel}</span> : null}
       </div>
       <span className={`stream-mic ${micMuted ? 'muted' : ''}`} aria-label={micMuted ? `${label} muted` : `${label} unmuted`}>
         {micMuted ? <MicOff size={14} /> : <Mic size={14} />}
@@ -521,17 +763,23 @@ function StreamTile({ label, sublabel, stream, muted = false, micMuted = false, 
 }
 
 function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
+  const relayAuthRequired = launch.mode === 'mock' ? launch.authRequired : false
+  const groupNameHintsRef = useRef(new Map<string, string>())
+  const groupNameHint =
+    launch.mode === 'live' && launch.groupId
+      ? groupNameHintsRef.current.get(groupNameHintKey(launch.relayUrl, launch.groupId))
+      : undefined
   const relay = useMemo(
     () =>
       launch.mode === 'live'
-        ? createLiveRelay(launch.groupId, launch.relayUrl)
+        ? createLiveRelay(launch.groupId, launch.relayUrl, groupNameHint)
         : createMockRelay({
             relayUrl: launch.relayUrl,
             groupId: launch.groupId,
             persist: true,
-            authRequired: launch.authRequired,
+            authRequired: relayAuthRequired,
           }),
-    [launch],
+    [groupNameHint, launch.groupId, launch.mode, launch.relayUrl, relayAuthRequired],
   )
   const [snapshot, setSnapshot] = useState(() => relay.snapshot())
   const [selfPubkey, setSelfPubkey] = useState(() => snapshot.users[0]?.pubkey ?? seededPubkey('live-viewer'))
@@ -539,9 +787,17 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   const [message, setMessage] = useState('')
   const [messageFiles, setMessageFiles] = useState<File[]>([])
   const [relaySearch, setRelaySearch] = useState('')
-  const [appView, setAppView] = useState<AppView>(() =>
-    launch.initialView,
+  const routeViewKey = `${launch.relayUrl}:${launch.groupId ?? ''}:${launch.initialView}`
+  const [appViewState, setAppViewState] = useState<{ key: string; view: AppView }>(() => ({
+    key: routeViewKey,
+    view: launch.initialView,
+  }))
+  const appView = appViewState.key === routeViewKey ? appViewState.view : launch.initialView
+  const setAppView = useCallback(
+    (view: AppView) => setAppViewState({ key: routeViewKey, view }),
+    [routeViewKey],
   )
+  const [peopleRenderState, setPeopleRenderState] = useState({ key: '', limit: PEOPLE_RENDER_STEP })
   const [activeDmPubkey, setActiveDmPubkey] = useState<string | null>(null)
   const [dmMessage, setDmMessage] = useState('')
   const [dmFiles, setDmFiles] = useState<File[]>([])
@@ -550,6 +806,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   const [localStream, setLocalStream] = useState<MediaStream | null>(null)
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null)
   const [remoteVideos, setRemoteVideos] = useState<MockPeerVideo[]>([])
+  const [liveCallPeers, setLiveCallPeers] = useState<Array<{ pubkey: string; name: string }>>([])
   const [cameraEnabled, setCameraEnabled] = useState(true)
   const [micEnabled, setMicEnabled] = useState(true)
   const [callExpanded, setCallExpanded] = useState(false)
@@ -570,17 +827,27 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   const [inviteCode, setInviteCode] = useState(() => randomInviteCode())
   const [newGroupName, setNewGroupName] = useState('')
   const [newGroupId, setNewGroupId] = useState(() => randomGroupId())
+  const [relayUrlInput, setRelayUrlInput] = useState('')
   const [metadataEdits, setMetadataEdits] = useState<Partial<Nip29MetadataDraft>>({})
   const [connectSession, setConnectSession] = useState<NostrConnectSession | null>(null)
+  const [storedConnectSession, setStoredConnectSession] = useState<NostrConnectStoredSession | null>(null)
   const [nostrConnectQr, setNostrConnectQr] = useState<string | null>(null)
   const [authPrompt, setAuthPrompt] = useState<AuthPrompt | null>(null)
   const [showAccountDialog, setShowAccountDialog] = useState(false)
   const [showCreateGroupDialog, setShowCreateGroupDialog] = useState(false)
+  const [showAddRelayDialog, setShowAddRelayDialog] = useState(false)
   const [adminDialog, setAdminDialog] = useState<AdminDialog>(null)
+  const [signerPendingPrompt, setSignerPendingPrompt] = useState<SignerPendingPrompt | null>(null)
+  const [mobileChatOpen, setMobileChatOpen] = useState(false)
+  const [mobileDetailsOpen, setMobileDetailsOpen] = useState(false)
+  const [seenChatCount, setSeenChatCount] = useState(() => snapshot.messages.length)
   const [signerPillDismissed, setSignerPillDismissed] = useState(false)
   const [blockedAdminKinds, setBlockedAdminKinds] = useState<Set<number>>(() => new Set())
   const [lastSignerPingAt, setLastSignerPingAt] = useState<number | null>(() => (launch.mode === 'live' ? null : Date.now()))
   const [nowMs, setNowMs] = useState(() => Date.now())
+  const [storedRelayUrls, setStoredRelayUrls] = useState<string[]>(() =>
+    launch.mode === 'live' ? uniqueRelayUrls([...readSavedRelayUrls(), launch.relayUrl]) : [launch.relayUrl],
+  )
   const [uploadStatus, setUploadStatus] = useState('')
   const callStageRef = useRef<HTMLDivElement | null>(null)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
@@ -590,26 +857,51 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   const authAttemptRef = useRef(0)
   const lastRelayAuthPromptRef = useRef('')
   const activeSignerRef = useRef<NestrSigner | null>(null)
+  const appliedSignerRelayRef = useRef<{ relay: typeof relay; signer: NestrSigner } | null>(null)
   const connectSessionRef = useRef<NostrConnectSession | null>(null)
   const localStreamRef = useRef<MediaStream | null>(null)
+  const screenStreamRef = useRef<MediaStream | null>(null)
+  const cameraEnabledRef = useRef(cameraEnabled)
+  const micEnabledRef = useRef(micEnabled)
+  const previousRelayRef = useRef(relay)
   const remoteVideosRef = useRef<MockPeerVideo[]>([])
+  const liveCallPeersRef = useRef<Array<{ pubkey: string; name: string }>>([])
+  const remoteMediaStatesRef = useRef<Map<string, CallMediaState>>(new Map())
   const livePeerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map())
+  const liveVideoSendersRef = useRef<Map<string, RTCRtpSender>>(new Map())
   const pendingIceCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map())
   const callPeersRef = useRef<Array<{ pubkey: string; name: string }>>([])
+  const liveParticipantAnnouncementTimerRef = useRef<number | null>(null)
+  const lastOwnPositionRef = useRef<StoredPositionMovement | null>(null)
+  const latestPositionsRef = useRef<RelaySnapshot['positions']>(snapshot.positions)
+  const canEnterOfficeRef = useRef(false)
+  const positionRefreshRef = useRef<() => void>(() => undefined)
+  const positionRefreshFallbackInFlightRef = useRef(false)
   const callStartedRef = useRef(false)
   const autoCallKeyRef = useRef('')
   const spawnPublishKeyRef = useRef('')
+  const roomLoginPromptedRef = useRef('')
+  const signerPingInFlightRef = useRef<{ pubkey: string; startedAt: number } | null>(null)
   const toggleCallRef = useRef<() => Promise<void>>(async () => undefined)
   const liveCallSignalRef = useRef<(event: NestrEvent) => void>(() => undefined)
+  const startLivePeerConnectionsRef = useRef<(stream: MediaStream | null) => Promise<void>>(async () => undefined)
 
-  const activeCount = Math.max(snapshot.positions.length, snapshot.users.length)
   const officeMap = useMemo(
-    () => buildOfficeMap(snapshot.group.id, activeCount),
-    [snapshot.group.id, activeCount],
+    () => buildOfficeMap(snapshot.group.id, 0),
+    [snapshot.group.id],
   )
   const metadataName = tagValue(snapshot.group.metadata, 'name') ?? 'Chatroom'
   const groupAbout = tagValue(snapshot.group.metadata, 'about') ?? ''
   const relayHost = relayHostLabel(snapshot.group.relay)
+  const snapshotRelayUrls = useMemo(
+    () => snapshot.relayUrls ?? [snapshot.group.relay],
+    [snapshot.group.relay, snapshot.relayUrls],
+  )
+  const savedRelayUrls = useMemo(
+    () => uniqueRelayUrls([...storedRelayUrls, ...snapshotRelayUrls, snapshot.group.relay]),
+    [snapshot.group.relay, snapshotRelayUrls, storedRelayUrls],
+  )
+  const savedRelayUrlsKey = savedRelayUrls.join('|')
   const hasSelectedGroup = relay.mode === 'mock' || (launch.mode === 'live' && Boolean(launch.groupId))
   const relayGroups = useMemo(
     () => (snapshot.relayGroups.length > 0 || !hasSelectedGroup ? snapshot.relayGroups : [snapshot.group.metadata]),
@@ -658,28 +950,37 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   const accountWriteRelays = currentUser?.writeRelays?.length
     ? currentUser.writeRelays
     : [snapshot.group.relay]
+  const accountSignerRelays = useMemo(
+    () => uniqueRelayUrls([...(connectSession?.relays ?? []), ...nostrConnectStoredRelayHints(storedConnectSession)]),
+    [connectSession, storedConnectSession],
+  )
   const groupMemberPubkeys = useMemo(() => memberPubkeys(snapshot.group.members), [snapshot.group.members])
   const groupMemberSet = useMemo(() => new Set(groupMemberPubkeys), [groupMemberPubkeys])
   const currentRoles = rolesForPubkey(snapshot, selfPubkey)
   const currentIsMember = groupMemberSet.has(selfPubkey) || currentRoles.length > 0
   const groupIsPrivate = hasTag(snapshot.group.metadata, 'private')
-  const groupIsRestricted = hasTag(snapshot.group.metadata, 'restricted')
   const groupIsClosed = hasTag(snapshot.group.metadata, 'closed')
   const roomAccessPending = relay.mode === 'live' && roomAccessStatus === 'unknown'
   const relayDeniedRead = roomAccessStatus === 'blocked' || roomAccessStatus === 'auth-required'
   const canReadGroup = !roomAccessPending && !relayDeniedRead && (!groupIsPrivate || currentIsMember)
-  const canWriteGroupChat = canReadGroup && !roomAccessPending && (!groupIsRestricted || currentIsMember)
+  const canWriteGroupChat = canReadGroup && (relay.mode === 'mock' || currentIsMember)
   const canEnterOffice = canWriteGroupChat
   const officeUsers = useMemo(
     () => (canEnterOffice ? snapshot.users : snapshot.users.filter((user) => user.pubkey !== selfPubkey)),
     [canEnterOffice, selfPubkey, snapshot.users],
   )
   const officePositions = useMemo(
-    () =>
-      canEnterOffice
-        ? snapshot.positions
-        : snapshot.positions.filter((position) => position.pubkey !== selfPubkey),
-    [canEnterOffice, selfPubkey, snapshot.positions],
+    () => {
+      const freshPositions =
+        relay.mode === 'live'
+          ? snapshot.positions.filter((position) => isPositionFresh(position, nowMs))
+          : snapshot.positions
+
+      return canEnterOffice
+        ? freshPositions
+        : freshPositions.filter((position) => position.pubkey !== selfPubkey)
+    },
+    [canEnterOffice, nowMs, relay.mode, selfPubkey, snapshot.positions],
   )
   const nearby = useMemo(
     () => (canEnterOffice ? nearbyPeers(selfPubkey, officePositions, 136) : []),
@@ -711,14 +1012,38 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
         ? `Nestr - ${metadataName}`
         : `Nestr - ${trimRelayProtocol(snapshot.group.relay)}`
   }, [appView, hasSelectedGroup, metadataName, snapshot.group.relay])
+
+  useEffect(() => {
+    if (relay.mode !== 'live') return undefined
+    const timeout = window.setTimeout(() => {
+      setStoredRelayUrls((current) => (current.join('|') === savedRelayUrlsKey ? current : savedRelayUrls))
+      writeSavedRelayUrls(savedRelayUrls)
+    }, 0)
+    return () => window.clearTimeout(timeout)
+  }, [relay.mode, savedRelayUrls, savedRelayUrlsKey])
   const supportedRoles = supportedRoleTags(snapshot.group.roles)
-  const visiblePeople = snapshot.users.filter(
-    (user) => groupMemberSet.has(user.pubkey) || (canEnterOffice && user.pubkey === selfPubkey),
+  const peopleListKey = `${appView}:${snapshot.group.relay}:${snapshot.group.id}`
+  const peopleRenderLimit = peopleRenderState.key === peopleListKey ? peopleRenderState.limit : PEOPLE_RENDER_STEP
+  const visiblePeople = useMemo(
+    () => snapshot.users.filter(
+      (user) => groupMemberSet.has(user.pubkey) || (canEnterOffice && user.pubkey === selfPubkey),
+    ),
+    [canEnterOffice, groupMemberSet, selfPubkey, snapshot.users],
   )
+  const renderedPeople = useMemo(
+    () => visiblePeople.slice(0, peopleRenderLimit),
+    [peopleRenderLimit, visiblePeople],
+  )
+  const hiddenPeopleCount = Math.max(0, visiblePeople.length - renderedPeople.length)
   const isOnline = useCallback(
     (pubkey: string) => isOnlineFromActivity(pubkey, snapshot.presence, snapshot.positions),
     [snapshot.positions, snapshot.presence],
   )
+  const officePresenceLabel = useMemo(() => {
+    const onlineCount = visiblePeople.filter((user) => isOnline(user.pubkey)).length
+    const officeCount = new Set(officePositions.map((position) => position.pubkey)).size
+    return `${onlineCount} online / ${officeCount} in office`
+  }, [isOnline, officePositions, visiblePeople])
   const dmThreads = useMemo(() => {
     const byPeer = new Map<string, { pubkey: string; lastAt: number; preview: string }>()
 
@@ -773,32 +1098,99 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
       name: nameFor(pubkey, snapshot.users),
     }))
   }, [nearby, selfPubkey, snapshot.users])
-  const callPeerKey = callPeers.map((peer) => `${peer.pubkey}:${peer.name}`).join('|')
-  const displayedMesh = estimateWebRtcMesh((callStarted ? callPeers.length : nearby.length) + 1)
+  const displayedCallPeers = relay.mode === 'live' && callStarted ? liveCallPeers : callPeers
+  const callPeerKey = displayedCallPeers.map((peer) => `${peer.pubkey}:${peer.name}`).join('|')
+  const liveCallPeerKey = displayedCallPeers.map((peer) => peer.pubkey).join('|')
+  const displayedMesh = estimateWebRtcMesh((callStarted ? displayedCallPeers.length : nearby.length) + 1)
   const frozenPeerPubkeys = remoteVideos.map((video) => video.pubkey).join('|')
+  const remoteVideoPubkeys = useMemo(() => new Set(remoteVideos.map((video) => video.pubkey)), [remoteVideos])
   const canScreenShare = Boolean(navigator.mediaDevices?.getDisplayMedia)
+  const localCallStream = screenStream ?? (cameraEnabled ? localStream : null)
+  const unreadChatCount = Math.max(0, snapshot.messages.length - seenChatCount)
 
   useEffect(() => {
     localStreamRef.current = localStream
   }, [localStream])
 
   useEffect(() => {
+    screenStreamRef.current = screenStream
+  }, [screenStream])
+
+  useEffect(() => {
+    cameraEnabledRef.current = cameraEnabled
+  }, [cameraEnabled])
+
+  useEffect(() => {
+    micEnabledRef.current = micEnabled
+  }, [micEnabled])
+
+  useEffect(() => {
     callStartedRef.current = callStarted
   }, [callStarted])
 
   useEffect(() => {
-    callPeersRef.current = callPeers
-  }, [callPeers])
+    callPeersRef.current = displayedCallPeers
+  }, [displayedCallPeers])
+
+  useEffect(() => {
+    liveCallPeersRef.current = liveCallPeers
+  }, [liveCallPeers])
+
+  useEffect(() => {
+    if (appView === 'group') return undefined
+    const timeout = window.setTimeout(() => {
+      setMobileChatOpen(false)
+      setMobileDetailsOpen(false)
+    }, 0)
+    return () => window.clearTimeout(timeout)
+  }, [appView])
+
+  useEffect(() => {
+    if (appView !== 'group' || !mobileChatOpen) return undefined
+    const timeout = window.setTimeout(() => {
+      setSeenChatCount(snapshot.messages.length)
+    }, 0)
+    return () => window.clearTimeout(timeout)
+  }, [appView, mobileChatOpen, snapshot.messages.length])
 
   useEffect(() => {
     const unsubscribe = relay.subscribe((next, event) => {
       setSnapshot(next)
       if (event) liveCallSignalRef.current(event)
     })
+    if (relay.mode === 'live') relay.start()
     return () => {
       unsubscribe()
       if (relay.mode === 'live') relay.close()
     }
+  }, [relay])
+
+  useEffect(() => {
+    if (previousRelayRef.current === relay) return
+    previousRelayRef.current = relay
+    setCallStarted(false)
+    setLiveCallPeers([])
+    liveCallPeersRef.current = []
+    setCallExpanded(false)
+    setMediaState('idle')
+    if (liveParticipantAnnouncementTimerRef.current !== null) {
+      window.clearTimeout(liveParticipantAnnouncementTimerRef.current)
+      liveParticipantAnnouncementTimerRef.current = null
+    }
+    livePeerConnectionsRef.current.forEach((connection) => connection.close())
+    livePeerConnectionsRef.current.clear()
+    liveVideoSendersRef.current.clear()
+    pendingIceCandidatesRef.current.clear()
+    localStreamRef.current?.getTracks().forEach((track) => track.stop())
+    screenStreamRef.current?.getTracks().forEach((track) => track.stop())
+    localStreamRef.current = null
+    screenStreamRef.current = null
+    setLocalStream(null)
+    setScreenStream(null)
+    remoteVideosRef.current.forEach((video) => video.stop())
+    remoteVideosRef.current = []
+    remoteMediaStatesRef.current.clear()
+    setRemoteVideos([])
   }, [relay])
 
   useEffect(() => {
@@ -834,14 +1226,20 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   }, [])
 
   useEffect(() => {
-    if (!callStarted) return undefined
+    if (!callStarted || relay.mode !== 'mock') return undefined
 
     const timer = window.setTimeout(() => {
       replaceRemoteVideos(reconcileMockVideos(callPeerKey))
     }, 0)
 
     return () => window.clearTimeout(timer)
-  }, [callPeerKey, callStarted])
+  }, [callPeerKey, callStarted, relay.mode])
+
+  useEffect(() => {
+    if (!callStarted || relay.mode !== 'live' || !localStream) return undefined
+    void startLivePeerConnectionsRef.current(localStream)
+    return undefined
+  }, [callStarted, liveCallPeerKey, localStream, relay.mode])
 
   useEffect(() => {
     const handleFullscreenChange = () => {
@@ -904,13 +1302,84 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     setNostrConnectQr(null)
   }, [])
 
+  const signerWithPendingPrompt = useCallback((signer: NestrSigner): NestrSigner => ({
+    ...signer,
+    signEvent: async (event) => {
+      const promptId = `${Date.now()}:${Math.random().toString(16).slice(2)}`
+      const startedAt = performance.now()
+      const pendingDelay = signerPendingDelayMs(event.kind)
+      let pending = true
+      debugLog('signer', 'signEvent requested', {
+        promptId,
+        signer: signer.label,
+        kind: event.kind,
+        createdAt: event.created_at,
+        tags: eventTagSummary(event.tags),
+        content: contentSummary(event.kind, event.content),
+        pendingDelayMs: pendingDelay,
+      })
+      const timer = window.setTimeout(() => {
+        if (!pending) return
+        debugWarn('signer', 'pending modal shown', {
+          promptId,
+          signer: signer.label,
+          kind: event.kind,
+          elapsedMs: debugDuration(startedAt),
+        })
+        setSignerPendingPrompt({
+          id: promptId,
+          signerLabel: signer.label,
+          eventKind: event.kind,
+        })
+      }, pendingDelay)
+
+      try {
+        const signed = await signer.signEvent(event)
+        debugLog('signer', 'signEvent resolved', {
+          promptId,
+          signer: signer.label,
+          kind: event.kind,
+          id: shortId(signed.id),
+          pubkey: shortId(signed.pubkey),
+          elapsedMs: debugDuration(startedAt),
+        })
+        return signed
+      } catch (error) {
+        debugError('signer', 'signEvent rejected', {
+          promptId,
+          signer: signer.label,
+          kind: event.kind,
+          elapsedMs: debugDuration(startedAt),
+          error: errorMessage(error),
+        })
+        throw error
+      } finally {
+        pending = false
+        window.clearTimeout(timer)
+        debugLog('signer', 'pending modal cleared', {
+          promptId,
+          kind: event.kind,
+          elapsedMs: debugDuration(startedAt),
+        })
+        setSignerPendingPrompt((current) => (current?.id === promptId ? null : current))
+      }
+    },
+  }), [])
+
   const applySigner = useCallback(
     async (signer: NestrSigner) => {
       if (relay.mode !== 'live') return
 
-      await relay.setSigner(signer)
-      activeSignerRef.current = signer
-      setActiveSigner(signer)
+      debugLog('auth', 'applySigner start', {
+        pubkey: shortId(signer.pubkey),
+        label: signer.label,
+        relay: relay.relayUrl,
+      })
+      const pendingAwareSigner = signerWithPendingPrompt(signer)
+      await relay.setSigner(pendingAwareSigner)
+      appliedSignerRelayRef.current = { relay, signer: pendingAwareSigner }
+      activeSignerRef.current = pendingAwareSigner
+      setActiveSigner(pendingAwareSigner)
       setSignerPillDismissed(false)
       setAuthState('connected')
       setSelfPubkey(signer.pubkey)
@@ -918,9 +1387,11 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
       setCallStarted(false)
       livePeerConnectionsRef.current.forEach((connection) => connection.close())
       livePeerConnectionsRef.current.clear()
+      liveVideoSendersRef.current.clear()
       pendingIceCandidatesRef.current.clear()
       remoteVideosRef.current.forEach((video) => video.stop())
       remoteVideosRef.current = []
+      remoteMediaStatesRef.current.clear()
       setRemoteVideos([])
       setCallExpanded(false)
       setAuthStatus(`Account connected as ${shortNpub(signer.pubkey)}`)
@@ -928,13 +1399,19 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
       setLastSignerPingAt(Date.now())
       setAuthPrompt(null)
       clearConnectSession()
+      debugLog('auth', 'applySigner complete', {
+        pubkey: shortId(signer.pubkey),
+        label: signer.label,
+      })
     },
-    [clearConnectSession, relay],
+    [clearConnectSession, relay, signerWithPendingPrompt],
   )
 
   const markSignerDisconnected = useCallback(
     (detail: string) => {
+      debugWarn('auth', 'signer disconnected', { detail })
       activeSignerRef.current = null
+      appliedSignerRelayRef.current = null
       setActiveSigner(null)
       setAuthState('disconnected')
       setAuthStatus('signer disconnected')
@@ -950,18 +1427,45 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   )
 
   const completeAuthAttempt = useCallback(
-    async (attempt: number, signer: NestrSigner, storedSession?: Awaited<ReturnType<typeof readStoredNostrConnectSession>>) => {
+    async (attempt: number, signer: NestrSigner, storedSession?: NostrConnectStoredSession | null) => {
+      debugLog('auth', 'completeAuthAttempt start', {
+        attempt,
+        currentAttempt: authAttemptRef.current,
+        pubkey: shortId(signer.pubkey),
+        label: signer.label,
+        hasStoredSession: Boolean(storedSession),
+      })
       if (attempt !== authAttemptRef.current) {
+        debugWarn('auth', 'completeAuthAttempt ignored stale attempt', {
+          attempt,
+          currentAttempt: authAttemptRef.current,
+        })
         await signer.close?.()
         return
       }
       if (activeSignerRef.current) {
+        debugWarn('auth', 'completeAuthAttempt ignored because signer already active', {
+          activePubkey: shortId(activeSignerRef.current.pubkey),
+          incomingPubkey: shortId(signer.pubkey),
+        })
         await signer.close?.()
         return
       }
 
-      if (storedSession) await writeStoredNostrConnectSession(storedSession)
+      if (storedSession) {
+        const normalizedSession = normalizeStoredNostrConnectSession(storedSession)
+        debugLog('auth', 'writing stored Nostr Connect session', {
+          pubkey: shortId(normalizedSession.userPubkey),
+          relays: nostrConnectStoredRelayHints(normalizedSession),
+        })
+        await writeStoredNostrConnectSession(normalizedSession)
+        setStoredConnectSession(normalizedSession)
+      }
       await applySigner(signer)
+      debugLog('auth', 'completeAuthAttempt done', {
+        attempt,
+        pubkey: shortId(signer.pubkey),
+      })
     },
     [applySigner],
   )
@@ -985,45 +1489,75 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     setAuthDetail(window.nostr ? 'signer prompt open; QR also ready' : 'scan the QR with your signer')
     clearConnectSession()
 
-    const session = startNostrConnect({
-      roomRelayUrl: relay.relayUrl,
-      nostrConnectRelays: launch.mode === 'live' ? launch.nostrConnectRelays : undefined,
-    })
-    connectSessionRef.current = session
-    setConnectSession(session)
-    setNostrConnectQr(null)
-    setAuthDetail(`opening listener on ${session.relays.map(relayHostLabel).join(', ')}`)
+    const startNostrConnectListener = (restartReason?: string) => {
+      clearConnectSession()
+      const session = startNostrConnect({
+        roomRelayUrl: relay.relayUrl,
+        nostrConnectRelays: launch.mode === 'live' ? launch.nostrConnectRelays : undefined,
+      })
+      const relayList = session.relays.map(relayHostLabel).join(', ')
+      let restartQueued = false
+      connectSessionRef.current = session
+      setConnectSession(session)
+      setNostrConnectQr(null)
+      setAuthStatus('waiting for Nostr Connect')
+      setAuthDetail(
+        restartReason
+          ? `${restartReason}; opening fresh listener on ${relayList}`
+          : `opening listener on ${relayList}`,
+      )
 
-    session.ready
-      .then(async () => {
-        if (attempt !== authAttemptRef.current || activeSignerRef.current) return
-        setAuthDetail(`scan QR; listening on ${session.relays.map(relayHostLabel).join(', ')}`)
-        try {
-          const dataUrl = await QRCode.toDataURL(session.uri, {
-            margin: 1,
-            width: 180,
-            color: {
-              dark: '#171922',
-              light: '#fffdf8',
-            },
-          })
-          if (attempt === authAttemptRef.current) setNostrConnectQr(dataUrl)
-        } catch {
-          if (attempt === authAttemptRef.current) setNostrConnectQr(null)
-        }
-      })
-      .catch((error) => {
-        if (attempt !== authAttemptRef.current || activeSignerRef.current) return
-        setAuthStatus('Nostr Connect listener failed')
-        setAuthDetail(errorMessage(error))
-      })
+      const shouldIgnoreSession = () =>
+        attempt !== authAttemptRef.current || activeSignerRef.current || connectSessionRef.current !== session
 
-    session.waitForSigner
-      .then((result) => completeAuthAttempt(attempt, result.signer, result.storedSession))
-      .catch((error) => {
-        if (attempt !== authAttemptRef.current || activeSignerRef.current) return
-        setAuthDetail(`Nostr Connect unavailable: ${errorMessage(error)}`)
-      })
+      const restartAfterTimeout = (error: unknown) => {
+        if (shouldIgnoreSession() || restartQueued || !isTimeoutError(error)) return false
+        restartQueued = true
+        setAuthStatus('waiting for Nostr Connect')
+        setAuthDetail(`Nostr Connect timed out; restarting listener on ${relayList}`)
+        window.setTimeout(() => {
+          if (!shouldIgnoreSession()) startNostrConnectListener('Nostr Connect restarted after timeout')
+        }, 0)
+        return true
+      }
+
+      session.ready
+        .then(async () => {
+          if (shouldIgnoreSession()) return
+          setAuthDetail(`scan QR; listening on ${relayList}`)
+          try {
+            const svg = await QRCode.toString(session.uri, {
+              type: 'svg',
+              margin: 4,
+              errorCorrectionLevel: 'M',
+              color: {
+                dark: '#000000',
+                light: '#ffffff',
+              },
+            })
+            const dataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`
+            if (!shouldIgnoreSession()) setNostrConnectQr(dataUrl)
+          } catch {
+            if (!shouldIgnoreSession()) setNostrConnectQr(null)
+          }
+        })
+        .catch((error) => {
+          if (shouldIgnoreSession() || restartAfterTimeout(error)) return
+          setAuthStatus('Nostr Connect listener failed')
+          setAuthDetail(errorMessage(error))
+        })
+
+      session.waitForSigner
+        .then((result) => completeAuthAttempt(attempt, result.signer, result.storedSession))
+        .catch((error) => {
+          if (shouldIgnoreSession() || restartAfterTimeout(error)) return
+          setAuthDetail(`Nostr Connect unavailable: ${errorMessage(error)}`)
+        })
+
+      return session
+    }
+
+    const session = startNostrConnectListener()
 
     const waitForNip07 = async () => {
       const startedAt = Date.now()
@@ -1041,6 +1575,10 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
         .then((signer) => completeAuthAttempt(attempt, signer))
         .catch((error) => {
           if (attempt !== authAttemptRef.current || activeSignerRef.current) return
+          if (isTimeoutError(error) && connectSessionRef.current === session) {
+            startNostrConnectListener('browser signer timed out')
+            return
+          }
           setAuthStatus('waiting for Nostr Connect')
           setAuthDetail(`browser signer unavailable: ${errorMessage(error)}`)
         })
@@ -1053,24 +1591,52 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     const attempt = authAttemptRef.current + 1
     authAttemptRef.current = attempt
     clearConnectSession()
+    debugLog('auth', 'beginAutoAuth start', { attempt, interactiveFallback, relay: relay.relayUrl })
     const storedSession = await readStoredNostrConnectSession()
+    const normalizedStoredSession = storedSession ? normalizeStoredNostrConnectSession(storedSession) : null
 
     if (attempt !== authAttemptRef.current) return
+    setStoredConnectSession(normalizedStoredSession)
+    debugLog('auth', 'stored Nostr Connect session read', {
+      attempt,
+      found: Boolean(normalizedStoredSession),
+      pubkey: shortId(normalizedStoredSession?.userPubkey),
+      relays: nostrConnectStoredRelayHints(normalizedStoredSession),
+    })
 
-    if (storedSession) {
+    if (normalizedStoredSession) {
+      const restoreRelays = nostrConnectStoredRelayHints(normalizedStoredSession).map(relayHostLabel).join(', ')
+      const restoreStartedAt = performance.now()
       setAuthState('reconnecting')
       setAuthStatus('reconnecting signer')
-      setAuthDetail(`restoring ${shortNpub(storedSession.userPubkey)}`)
+      setAuthDetail(
+        `restoring ${shortNpub(normalizedStoredSession.userPubkey)}${restoreRelays ? ` via ${restoreRelays}` : ''}`,
+      )
       try {
-        const signer = await withTimeout(
-          restoreNostrConnectSigner(storedSession),
+        debugLog('auth', 'restore signer probe start', {
+          attempt,
+          pubkey: shortId(normalizedStoredSession.userPubkey),
+          relays: nostrConnectStoredRelayHints(normalizedStoredSession),
+        })
+        const result = await withTimeout(
+          restoreNostrConnectSigner(normalizedStoredSession),
           9_000,
           'signer reconnect timed out',
         )
-        await completeAuthAttempt(attempt, signer, storedSession)
+        debugLog('auth', 'restore signer probe success', {
+          attempt,
+          pubkey: shortId(result.signer.pubkey),
+          elapsedMs: debugDuration(restoreStartedAt),
+        })
+        await completeAuthAttempt(attempt, result.signer, result.storedSession)
         return
       } catch (error) {
         if (attempt !== authAttemptRef.current) return
+        debugError('auth', 'restore signer probe failed', {
+          attempt,
+          elapsedMs: debugDuration(restoreStartedAt),
+          error: errorMessage(error),
+        })
         markSignerDisconnected(`could not reconnect: ${errorMessage(error)}`)
         return
       }
@@ -1095,6 +1661,17 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   }, [activeSigner])
 
   useEffect(() => {
+    if (relay.mode !== 'live' || authState !== 'connected' || !activeSigner) return
+    const applied = appliedSignerRelayRef.current
+    if (applied?.relay === relay && applied.signer === activeSigner) {
+      relay.refreshDirectMessageSubscriptions()
+      return
+    }
+    relay.setSigner(activeSigner)
+    appliedSignerRelayRef.current = { relay, signer: activeSigner }
+  }, [activeSigner, authState, relay])
+
+  useEffect(() => {
     if (relay.mode !== 'live') return undefined
 
     if (authState !== 'connected') return undefined
@@ -1111,13 +1688,69 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
 
   useEffect(() => {
     if (relay.mode !== 'live' || authState !== 'connected' || !activeSigner?.ping) return undefined
+    let cancelled = false
 
     const pingSigner = async () => {
+      const signer = activeSigner
+      const startedAt = performance.now()
+      const inFlight = signerPingInFlightRef.current
+      if (inFlight?.pubkey === signer.pubkey) {
+        debugWarn('auth', 'signer ping skipped; previous probe still in flight', {
+          pubkey: shortId(signer.pubkey),
+          inFlightMs: debugDuration(inFlight.startedAt),
+        })
+        return
+      }
+      signerPingInFlightRef.current = { pubkey: signer.pubkey, startedAt }
+      const pingCurrentSigner = () =>
+        withTimeout(signer.ping?.() ?? Promise.resolve(), SIGNER_PING_TIMEOUT_MS, 'signer ping timed out')
+
       try {
-        await withTimeout(activeSigner.ping?.() ?? Promise.resolve(), 8_000, 'signer ping timed out')
+        debugLog('auth', 'signer ping start', {
+          pubkey: shortId(signer.pubkey),
+          label: signer.label,
+          timeoutMs: SIGNER_PING_TIMEOUT_MS,
+        })
+        await pingCurrentSigner()
+        debugLog('auth', 'signer ping ok', {
+          pubkey: shortId(signer.pubkey),
+          elapsedMs: debugDuration(startedAt),
+        })
         setLastSignerPingAt(Date.now())
-      } catch (error) {
-        markSignerDisconnected(errorMessage(error))
+      } catch {
+        debugWarn('auth', 'signer ping first attempt failed; retrying', {
+          pubkey: shortId(signer.pubkey),
+          elapsedMs: debugDuration(startedAt),
+          retryDelayMs: SIGNER_PING_RETRY_DELAY_MS,
+        })
+        await new Promise((resolve) => window.setTimeout(resolve, SIGNER_PING_RETRY_DELAY_MS))
+        if (cancelled || activeSignerRef.current !== signer) return
+
+        try {
+          debugLog('auth', 'signer ping retry start', {
+            pubkey: shortId(signer.pubkey),
+            timeoutMs: SIGNER_PING_TIMEOUT_MS,
+          })
+          await pingCurrentSigner()
+          debugLog('auth', 'signer ping retry ok', {
+            pubkey: shortId(signer.pubkey),
+            elapsedMs: debugDuration(startedAt),
+          })
+          setLastSignerPingAt(Date.now())
+        } catch (error) {
+          if (cancelled || activeSignerRef.current !== signer) return
+          debugError('auth', 'signer ping retry failed', {
+            pubkey: shortId(signer.pubkey),
+            elapsedMs: debugDuration(startedAt),
+            error: errorMessage(error),
+          })
+          markSignerDisconnected(errorMessage(error))
+        }
+      } finally {
+        const current = signerPingInFlightRef.current
+        if (current?.pubkey === signer.pubkey && current.startedAt === startedAt) {
+          signerPingInFlightRef.current = null
+        }
       }
     }
 
@@ -1126,7 +1759,10 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
       void pingSigner()
     }, 20_000)
 
-    return () => window.clearInterval(timer)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
   }, [activeSigner, authState, markSignerDisconnected, relay.mode])
 
   useEffect(() => {
@@ -1174,6 +1810,38 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     return () => window.clearTimeout(timer)
   }, [appView, authState, beginLogin, relay.mode, relayHost])
 
+  useEffect(() => {
+    if (relay.mode !== 'live' || appView !== 'group' || !hasSelectedGroup || !canReadGroup) return undefined
+    if (roomAccessStatus !== 'open') return undefined
+    if (authState === 'connected' || authState === 'connecting' || authState === 'reconnecting') return undefined
+
+    const promptKey = `${snapshot.group.relay}:${snapshot.group.id}:${selfPubkey}`
+    if (roomLoginPromptedRef.current === promptKey) return undefined
+    roomLoginPromptedRef.current = promptKey
+
+    const timer = window.setTimeout(() => {
+      void beginLogin({
+        kind: 'manual',
+        title: 'Sign in to join the office',
+        detail: `Sign in with your Nostr signer to appear in ${metadataName}, move around, and join proximity calls.`,
+      })
+    }, 500)
+
+    return () => window.clearTimeout(timer)
+  }, [
+    appView,
+    authState,
+    beginLogin,
+    canReadGroup,
+    hasSelectedGroup,
+    metadataName,
+    relay.mode,
+    roomAccessStatus,
+    selfPubkey,
+    snapshot.group.id,
+    snapshot.group.relay,
+  ])
+
   async function retrySigner() {
     if (relay.mode !== 'live') return
     setAuthDetail('retrying signer connection')
@@ -1190,9 +1858,11 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     clearConnectSession()
     await activeSignerRef.current?.close?.()
     activeSignerRef.current = null
+    appliedSignerRelayRef.current = null
     setActiveSigner(null)
     if (relay.mode === 'live') relay.clearSigner()
     await clearStoredNostrConnectSession()
+    setStoredConnectSession(null)
     setSelfPubkey(seededPubkey('live-viewer'))
     setCallStarted(false)
     stopScreenShare()
@@ -1230,15 +1900,100 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   )
 
   const handleMove = useCallback(
-    (position: { x: number; y: number; vx: number; vy: number }) => {
-      if (!canEnterOffice) return
-      void relay.publishPosition(selfPubkey, position.x, position.y, position.vx, position.vy)
+    (movement: PositionMovement) => {
+      if (!canEnterOfficeRef.current) return
+      const sentAt = Date.now()
+      lastOwnPositionRef.current = { ...movement, sentAt }
+      void relay.publishPosition(selfPubkey, movement, sentAt)
     },
-    [canEnterOffice, relay, selfPubkey],
+    [relay, selfPubkey],
   )
+
+  const publishOwnPositionEvent = useCallback(() => {
+    if (!canEnterOfficeRef.current) return
+    const latestPosition = latestPositionsRef.current.find((position) => position.pubkey === selfPubkey) ?? null
+    const storedMovement =
+      lastOwnPositionRef.current ??
+      (latestPosition
+        ? {
+            startX: latestPosition.x,
+            startY: latestPosition.y,
+            endX: latestPosition.targetX ?? latestPosition.x,
+            endY: latestPosition.targetY ?? latestPosition.y,
+            speed: latestPosition.speed ?? 0,
+            sentAt: latestPosition.sentAt ?? Date.now(),
+          }
+        : null)
+    if (!storedMovement) return
+
+    lastOwnPositionRef.current = storedMovement
+    const { sentAt, ...movement } = storedMovement
+    return relay.publishPosition(selfPubkey, movement, sentAt)
+  }, [relay, selfPubkey])
+
+  const refreshOwnPositionEvent = useCallback(() => {
+    if (!canEnterOfficeRef.current) return
+    void Promise.resolve(relay.republishLastPosition(selfPubkey)).then((result) => {
+      if (
+        result.ok ||
+        (result.reason !== 'position-refresh-missing' && result.reason !== 'position-refresh-needs-signature')
+      ) {
+        return
+      }
+      if (positionRefreshFallbackInFlightRef.current) return
+      positionRefreshFallbackInFlightRef.current = true
+      Promise.resolve(publishOwnPositionEvent()).finally(() => {
+        positionRefreshFallbackInFlightRef.current = false
+      })
+    })
+  }, [publishOwnPositionEvent, relay, selfPubkey])
+
+  useEffect(() => {
+    canEnterOfficeRef.current = canEnterOffice
+  }, [canEnterOffice])
+
+  useEffect(() => {
+    latestPositionsRef.current = snapshot.positions
+  }, [snapshot.positions])
+
+  useEffect(() => {
+    positionRefreshRef.current = refreshOwnPositionEvent
+  }, [refreshOwnPositionEvent])
+
+  useEffect(() => {
+    const ownPosition = snapshot.positions.find((position) => position.pubkey === selfPubkey)
+    if (!ownPosition) return
+    lastOwnPositionRef.current = {
+      startX: ownPosition.startX ?? ownPosition.x,
+      startY: ownPosition.startY ?? ownPosition.y,
+      endX: ownPosition.targetX ?? ownPosition.x,
+      endY: ownPosition.targetY ?? ownPosition.y,
+      speed: ownPosition.speed ?? 0,
+      sentAt: ownPosition.sentAt ?? Date.now(),
+    }
+  }, [selfPubkey, snapshot.positions])
+
+  useEffect(() => {
+    if (relay.mode !== 'live' || authState !== 'connected' || !canEnterOffice) return undefined
+
+    const refreshPosition = () => positionRefreshRef.current()
+    const timer = window.setInterval(refreshPosition, POSITION_REBROADCAST_INTERVAL_MS)
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') refreshPosition()
+    }
+    window.addEventListener('pagehide', refreshPosition)
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+
+    return () => {
+      window.clearInterval(timer)
+      window.removeEventListener('pagehide', refreshPosition)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
+  }, [authState, canEnterOffice, relay.mode])
 
   useEffect(() => {
     if (relay.mode !== 'live' || authState !== 'connected' || !hasSelectedGroup || !canEnterOffice) return
+    if (roomAccessStatus !== 'open') return
     if (snapshot.positions.some((position) => position.pubkey === selfPubkey)) return
 
     const spawnKey = `${snapshot.group.id}:${selfPubkey}`
@@ -1246,8 +2001,23 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     spawnPublishKeyRef.current = spawnKey
 
     const spawn = spawnForPubkey(officeMap, selfPubkey, snapshot.users.length)
-    void relay.publishPosition(selfPubkey, spawn.x, spawn.y, 0, 0).then((result) => {
-      if (!result.ok && result.reason !== 'throttled' && result.reason !== 'group-required') {
+    const spawnMovement = {
+      startX: spawn.x,
+      startY: spawn.y,
+      endX: spawn.x,
+      endY: spawn.y,
+      speed: 0,
+      sentAt: Date.now(),
+    }
+    lastOwnPositionRef.current = spawnMovement
+    const { sentAt, ...movement } = spawnMovement
+    void relay.publishPosition(selfPubkey, movement, sentAt).then((result) => {
+      if (
+        !result.ok &&
+        result.reason !== 'position-publish-queued' &&
+        result.reason !== 'stale-position-discarded' &&
+        result.reason !== 'group-required'
+      ) {
         setAuthDetail(`position publish failed: ${result.reason}`)
       }
     })
@@ -1257,6 +2027,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     hasSelectedGroup,
     officeMap,
     relay,
+    roomAccessStatus,
     selfPubkey,
     snapshot.group.id,
     snapshot.positions,
@@ -1338,6 +2109,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   async function sendDirectMessage(event: FormEvent) {
     event.preventDefault()
     if (!activeDmPubkey) return
+    setUploadStatus('')
 
     let attachments: NestrAttachment[]
     try {
@@ -1356,31 +2128,80 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
       if (signerRequired(result.reason)) {
         requestAuth('dm', 'Sign in to send encrypted direct messages.')
       } else {
-        setAuthStatus(String(result.reason))
+        const message = directMessageErrorMessage(result.reason, activeDmPeer?.name ?? nameFor(activeDmPubkey, snapshot.users))
+        setUploadStatus(message)
+        setAuthStatus(message)
       }
       return
     }
 
     setDmMessage('')
     setDmFiles([])
+    setUploadStatus('')
   }
 
-  function selectRelayGroup(groupId: string) {
+  function navigateToRelayView(relayUrl = snapshot.group.relay) {
+    const normalized = normalizeRelayUrl(relayUrl)
+    const url = new URL(window.location.href)
+    url.searchParams.set('relay', normalized)
+    url.searchParams.delete('c')
+    url.searchParams.delete('group')
+    url.searchParams.delete('h')
+    url.searchParams.delete('view')
+    setAppView('relay')
+    navigateInApp(url)
+  }
+
+  function navigateToDirectMessages() {
+    const url = new URL(window.location.href)
+    url.searchParams.set('relay', snapshot.group.relay)
+    url.searchParams.set('view', 'dm')
+    setAppView('dm')
+    navigateInApp(url)
+  }
+
+  function navigateToGroupView(groupId: string, relayUrl = snapshot.group.relay) {
+    const url = new URL(window.location.href)
+    url.searchParams.set('c', groupId)
+    url.searchParams.set('relay', normalizeRelayUrl(relayUrl))
+    url.searchParams.delete('group')
+    url.searchParams.delete('h')
+    url.searchParams.delete('view')
+    setAppView('group')
+    navigateInApp(url)
+  }
+
+  function switchToRelay(relayUrl: string) {
+    const normalized = normalizeRelayUrl(relayUrl)
+    const next = uniqueRelayUrls([...storedRelayUrls, normalized])
+    setStoredRelayUrls(next)
+    writeSavedRelayUrls(next)
+    if (sameRelayUrl(normalized, snapshot.group.relay) && appView === 'relay') return
+    navigateToRelayView(normalized)
+  }
+
+  function addRelay(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const normalized = normalizeRelayUrl(relayUrlInput)
+    if (!normalized) return
+    setShowAddRelayDialog(false)
+    setRelayUrlInput('')
+    switchToRelay(normalized)
+  }
+
+  function selectRelayGroup(groupId: string, relayUrl = snapshot.group.relay) {
     if (relay.mode === 'mock') {
       relay.selectGroup(groupId)
       setAppView('group')
       return
     }
 
-    if (hasSelectedGroup && groupId === snapshot.group.id) {
-      setAppView('group')
+    if (hasSelectedGroup && groupId === snapshot.group.id && sameRelayUrl(relayUrl, snapshot.group.relay)) {
+      navigateToGroupView(groupId, relayUrl)
       return
     }
 
-    const url = new URL(window.location.href)
-    url.searchParams.set('c', groupId)
-    url.searchParams.set('relay', relayHostLabel(snapshot.group.relay))
-    window.location.href = url.toString()
+    navigateToGroupView(groupId, relayUrl)
   }
 
   function handleAccountClick() {
@@ -1535,6 +2356,25 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
       relay.publishCreateGroup(selfPubkey, groupName, groupId),
     )
     if (ok) {
+      groupNameHintsRef.current.set(groupNameHintKey(snapshot.group.relay, groupId), groupName)
+      if (relay.mode === 'live') {
+        await runNip29Action('name chatroom', () =>
+          relay.publishEditMetadata(
+            selfPubkey,
+            {
+              name: groupName,
+              about: '',
+              picture: '',
+              private: false,
+              restricted: false,
+              closed: false,
+              hidden: false,
+            },
+            'metadata updated from nestr',
+            groupId,
+          ),
+        )
+      }
       setNewGroupName('')
       setNewGroupId(randomGroupId())
       setShowCreateGroupDialog(false)
@@ -1571,23 +2411,199 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     }
   }
 
+  function currentCallMediaState(): CallMediaState {
+    const hasScreenVideo = Boolean(screenStreamRef.current?.getVideoTracks().some((track) => track.readyState === 'live'))
+    const hasCameraVideo = Boolean(
+      cameraEnabledRef.current &&
+        localStreamRef.current?.getVideoTracks().some((track) => track.readyState === 'live' && track.enabled),
+    )
+    const hasAudio = Boolean(
+      micEnabledRef.current &&
+        localStreamRef.current?.getAudioTracks().some((track) => track.readyState === 'live' && track.enabled),
+    )
+    return {
+      audio: hasAudio,
+      video: hasScreenVideo || hasCameraVideo,
+      screen: hasScreenVideo,
+    }
+  }
+
+  function liveCallParticipantPubkeys(targetPubkey?: string) {
+    return Array.from(
+      new Set(
+        [
+          selfPubkey,
+          targetPubkey,
+          ...liveCallPeersRef.current.map((peer) => peer.pubkey),
+          ...callPeersRef.current.map((peer) => peer.pubkey),
+        ].filter((pubkey): pubkey is string => Boolean(pubkey)),
+      ),
+    )
+  }
+
+  function withLocalCallMediaState(payload: unknown, targetPubkey?: string) {
+    const participants = liveCallParticipantPubkeys(targetPubkey)
+    if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+      return {
+        ...payload,
+        media: currentCallMediaState(),
+        participants,
+      }
+    }
+
+    return {
+      value: payload,
+      media: currentCallMediaState(),
+      participants,
+    }
+  }
+
   async function publishLiveCallSignal(kind: number, targetPubkey: string, payload: unknown) {
     if (relay.mode !== 'live') return
-    const result = await relay.publishCallSignal(selfPubkey, kind, targetPubkey, payload)
+    const result = await relay.publishCallSignal(selfPubkey, kind, targetPubkey, withLocalCallMediaState(payload, targetPubkey))
     if (!result.ok && result.reason !== 'throttled') setAuthDetail(`call signal failed: ${result.reason}`)
+  }
+
+  function scheduleLiveCallParticipantAnnouncement() {
+    if (relay.mode !== 'live' || !callStartedRef.current) return
+    if (liveParticipantAnnouncementTimerRef.current !== null) {
+      window.clearTimeout(liveParticipantAnnouncementTimerRef.current)
+    }
+    liveParticipantAnnouncementTimerRef.current = window.setTimeout(() => {
+      liveParticipantAnnouncementTimerRef.current = null
+      callPeersRef.current.forEach((peer) => {
+        void publishLiveCallSignal(OFFICE_KINDS.callRenegotiate, peer.pubkey, {
+          reason: 'participants',
+        })
+      })
+    }, 80)
+  }
+
+  function publishLiveMediaState() {
+    if (relay.mode !== 'live' || !callStartedRef.current) return
+    callPeersRef.current.forEach((peer) => {
+      void publishLiveCallSignal(OFFICE_KINDS.callRenegotiate, peer.pubkey, {
+        reason: 'media-state',
+      })
+    })
+  }
+
+  function liveCallMediaTracks(stream: MediaStream) {
+    const screenTrack = screenStreamRef.current?.getVideoTracks()[0]
+    return [
+      ...stream.getAudioTracks(),
+      ...(screenTrack ? [screenTrack] : stream.getVideoTracks()),
+    ]
+  }
+
+  async function renegotiateLivePeerConnection(peerPubkey: string) {
+    const connection = livePeerConnectionsRef.current.get(peerPubkey)
+    if (!connection || connection.signalingState !== 'stable') return
+
+    const offer = await connection.createOffer()
+    await connection.setLocalDescription(offer)
+    await publishLiveCallSignal(OFFICE_KINDS.callOffer, peerPubkey, {
+      description: connection.localDescription,
+    })
+  }
+
+  async function updateLiveVideoSenders(track: MediaStreamTrack | null, sourceStream: MediaStream | null) {
+    if (relay.mode !== 'live') return
+
+    await Promise.all(
+      Array.from(livePeerConnectionsRef.current.entries()).map(async ([peerPubkey, connection]) => {
+        const sender =
+          liveVideoSendersRef.current.get(peerPubkey) ??
+          connection.getSenders().find((candidate) => candidate.track?.kind === 'video')
+        if (sender) {
+          liveVideoSendersRef.current.set(peerPubkey, sender)
+          await sender.replaceTrack(track)
+          return
+        }
+        if (!track || !sourceStream) return
+        liveVideoSendersRef.current.set(peerPubkey, connection.addTrack(track, sourceStream))
+        await renegotiateLivePeerConnection(peerPubkey)
+      }),
+    )
+  }
+
+  function remoteDisplayState(pubkey: string, stream: MediaStream) {
+    const signaled = remoteMediaStatesRef.current.get(pubkey)
+    return {
+      hasVideo: signaled?.video === false ? false : remoteStreamHasLiveVideo(stream),
+      micMuted: signaled?.audio === undefined ? remoteStreamMicMuted(stream) : !signaled.audio,
+    }
+  }
+
+  function updateRemoteVideoState(pubkey: string, state: Pick<MockPeerVideo, 'hasVideo' | 'micMuted'>) {
+    let changed = false
+    const next = remoteVideosRef.current.map((video) => {
+      if (video.pubkey !== pubkey) return video
+      if (video.hasVideo === state.hasVideo && video.micMuted === state.micMuted) return video
+      changed = true
+      return { ...video, ...state }
+    })
+    if (changed) replaceRemoteVideos(next)
+  }
+
+  function applyRemoteMediaState(pubkey: string, media: CallMediaState | null) {
+    if (!media) return
+    remoteMediaStatesRef.current.set(pubkey, media)
+    const existing = remoteVideosRef.current.find((video) => video.pubkey === pubkey)
+    if (!existing) return
+    updateRemoteVideoState(pubkey, remoteDisplayState(pubkey, existing.stream))
+  }
+
+  function watchRemoteStream(pubkey: string, stream: MediaStream) {
+    const update = () => {
+      const existing = remoteVideosRef.current.find((video) => video.pubkey === pubkey)
+      if (!existing || existing.stream !== stream) return
+      updateRemoteVideoState(pubkey, remoteDisplayState(pubkey, stream))
+    }
+    const tracks = stream.getTracks()
+    tracks.forEach((track) => {
+      track.addEventListener('mute', update)
+      track.addEventListener('unmute', update)
+      track.addEventListener('ended', update)
+    })
+    const timer = window.setTimeout(update, 0)
+
+    return () => {
+      window.clearTimeout(timer)
+      tracks.forEach((track) => {
+        track.removeEventListener('mute', update)
+        track.removeEventListener('unmute', update)
+        track.removeEventListener('ended', update)
+      })
+    }
   }
 
   function upsertRemoteStream(pubkey: string, name: string, stream: MediaStream) {
     const existing = remoteVideosRef.current.find((video) => video.pubkey === pubkey)
-    if (existing?.stream === stream) return
+    if (existing?.stream === stream) existing.cleanup?.()
+    else if (existing) existing.stop()
+    else if (callStartedRef.current) playCallJoinSound()
+    const cleanup = watchRemoteStream(pubkey, stream)
+    const displayState = remoteDisplayState(pubkey, stream)
+    const nextVideo = {
+      pubkey,
+      name,
+      stream,
+      ...displayState,
+      cleanup,
+      stop: () => {
+        cleanup()
+        stream.getTracks().forEach((track) => track.stop())
+      },
+    }
+    if (existing?.stream === stream) {
+      const next = remoteVideosRef.current.map((video) => (video.pubkey === pubkey ? nextVideo : video))
+      replaceRemoteVideos(next)
+      return
+    }
     const next = [
       ...remoteVideosRef.current.filter((video) => video.pubkey !== pubkey),
-      {
-        pubkey,
-        name,
-        stream,
-        stop: () => stream.getTracks().forEach((track) => track.stop()),
-      },
+      nextVideo,
     ]
     replaceRemoteVideos(next)
   }
@@ -1600,7 +2616,11 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
       iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
     })
 
-    stream.getTracks().forEach((track) => connection.addTrack(track, stream))
+    liveCallMediaTracks(stream).forEach((track) => {
+      const sourceStream = screenStreamRef.current?.getVideoTracks()[0] === track ? screenStreamRef.current : stream
+      const sender = connection.addTrack(track, sourceStream ?? stream)
+      if (track.kind === 'video') liveVideoSendersRef.current.set(peerPubkey, sender)
+    })
     connection.onicecandidate = (event) => {
       if (!event.candidate) return
       void publishLiveCallSignal(OFFICE_KINDS.iceCandidate, peerPubkey, {
@@ -1613,9 +2633,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     }
     connection.onconnectionstatechange = () => {
       if (!['closed', 'failed', 'disconnected'].includes(connection.connectionState)) return
-      livePeerConnectionsRef.current.delete(peerPubkey)
-      setRemoteVideos((videos) => videos.filter((video) => video.pubkey !== peerPubkey))
-      remoteVideosRef.current = remoteVideosRef.current.filter((video) => video.pubkey !== peerPubkey)
+      removeLiveCallPeer(peerPubkey)
     }
 
     livePeerConnectionsRef.current.set(peerPubkey, connection)
@@ -1632,9 +2650,12 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
 
   async function ensureLiveCallMedia() {
     if (localStreamRef.current) return localStreamRef.current
+    callStartedRef.current = true
     setCallStarted(true)
     setCameraEnabled(true)
     setMicEnabled(true)
+    cameraEnabledRef.current = true
+    micEnabledRef.current = true
     return requestLocalMedia(true, true)
   }
 
@@ -1643,8 +2664,9 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     await Promise.all(
       callPeersRef.current.map(async (peer) => {
         if (peer.pubkey === selfPubkey) return
-        const connection = livePeerConnection(peer.pubkey, peer.name, stream)
-        if (selfPubkey > peer.pubkey || connection.signalingState !== 'stable') return
+        const existingConnection = livePeerConnectionsRef.current.get(peer.pubkey)
+        const connection = existingConnection ?? livePeerConnection(peer.pubkey, peer.name, stream)
+        if (existingConnection || selfPubkey > peer.pubkey || connection.signalingState !== 'stable') return
 
         const offer = await connection.createOffer()
         await connection.setLocalDescription(offer)
@@ -1655,6 +2677,8 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     )
   }
 
+  startLivePeerConnectionsRef.current = startLivePeerConnections
+
   async function handleLiveCallSignal(event: NestrEvent) {
     if (relay.mode !== 'live') return
     if (!isOfficeCallSignalKind(event.kind)) return
@@ -1663,12 +2687,16 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     const peerPubkey = event.pubkey
     const peerName = nameFor(peerPubkey, snapshot.users)
     const payload = parseCallSignalPayload(event)
+    const participants = callSignalParticipants(payload)
+    applyRemoteMediaState(peerPubkey, callSignalMedia(payload))
 
     if (event.kind === OFFICE_KINDS.callHangup) {
-      livePeerConnectionsRef.current.get(peerPubkey)?.close()
-      livePeerConnectionsRef.current.delete(peerPubkey)
-      setRemoteVideos((videos) => videos.filter((video) => video.pubkey !== peerPubkey))
-      remoteVideosRef.current = remoteVideosRef.current.filter((video) => video.pubkey !== peerPubkey)
+      removeLiveCallPeer(peerPubkey)
+      return
+    }
+
+    if (event.kind === OFFICE_KINDS.callRenegotiate && !callSignalDescription(payload)) {
+      await syncLiveCallParticipants(participants)
       return
     }
 
@@ -1686,9 +2714,11 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
 
     const description = callSignalDescription(payload)
     if (!description) return
+    addLiveCallPeer(peerPubkey, peerName)
     const stream = await ensureLiveCallMedia()
     if (!stream) return
     const connection = livePeerConnection(peerPubkey, peerName, stream)
+    await syncLiveCallParticipants(participants)
 
     if (event.kind === OFFICE_KINDS.callOffer) {
       await connection.setRemoteDescription(description)
@@ -1735,7 +2765,91 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     setRemoteVideos(videos)
   }
 
+  function setActiveLiveCallPeers(peers: Array<{ pubkey: string; name: string }>) {
+    liveCallPeersRef.current = peers
+    setLiveCallPeers(peers)
+    callPeersRef.current = relay.mode === 'live' && callStartedRef.current ? peers : callPeersRef.current
+  }
+
+  function addLiveCallPeer(pubkey: string, name: string) {
+    if (relay.mode !== 'live') return
+    const existing = liveCallPeersRef.current.find((peer) => peer.pubkey === pubkey)
+    const next = existing
+      ? liveCallPeersRef.current.map((peer) => (peer.pubkey === pubkey ? { pubkey, name } : peer))
+      : [...liveCallPeersRef.current, { pubkey, name }]
+    setActiveLiveCallPeers(next)
+    if (!existing) scheduleLiveCallParticipantAnnouncement()
+  }
+
+  async function syncLiveCallParticipants(participants: string[]) {
+    if (relay.mode !== 'live' || !callStartedRef.current) return
+    const nextByPubkey = new Map(liveCallPeersRef.current.map((peer) => [peer.pubkey, peer]))
+    let changed = false
+
+    participants.forEach((pubkey) => {
+      if (!pubkey || pubkey === selfPubkey) return
+      const name = nameFor(pubkey, snapshot.users)
+      const existing = nextByPubkey.get(pubkey)
+      if (existing?.name === name) return
+      nextByPubkey.set(pubkey, { pubkey, name })
+      changed = true
+    })
+
+    if (!changed) return
+    setActiveLiveCallPeers(Array.from(nextByPubkey.values()))
+    if (localStreamRef.current) await startLivePeerConnectionsRef.current(localStreamRef.current)
+  }
+
+  function cleanupLivePeer(pubkey: string) {
+    livePeerConnectionsRef.current.get(pubkey)?.close()
+    livePeerConnectionsRef.current.delete(pubkey)
+    liveVideoSendersRef.current.delete(pubkey)
+    pendingIceCandidatesRef.current.delete(pubkey)
+    remoteVideosRef.current.find((video) => video.pubkey === pubkey)?.stop()
+    remoteMediaStatesRef.current.delete(pubkey)
+    remoteVideosRef.current = remoteVideosRef.current.filter((video) => video.pubkey !== pubkey)
+    setRemoteVideos(remoteVideosRef.current)
+  }
+
+  function finishCallLocally() {
+    callStartedRef.current = false
+    localStreamRef.current?.getTracks().forEach((track) => track.stop())
+    screenStreamRef.current?.getTracks().forEach((track) => track.stop())
+    stopLivePeerConnections()
+    clearRemoteVideos()
+    setLocalStream(null)
+    setScreenStream(null)
+    localStreamRef.current = null
+    screenStreamRef.current = null
+    setActiveLiveCallPeers([])
+    setCallStarted(false)
+    setCallExpanded(false)
+    setMediaState('idle')
+  }
+
+  function removeLiveCallPeer(pubkey: string) {
+    cleanupLivePeer(pubkey)
+    const next = liveCallPeersRef.current.filter((peer) => peer.pubkey !== pubkey)
+    setActiveLiveCallPeers(next)
+    if (relay.mode === 'live' && callStartedRef.current && next.length === 0) {
+      finishCallLocally()
+    } else {
+      scheduleLiveCallParticipantAnnouncement()
+    }
+  }
+
+  function clearRemoteVideos() {
+    remoteVideosRef.current.forEach((video) => video.stop())
+    remoteVideosRef.current = []
+    remoteMediaStatesRef.current.clear()
+    setRemoteVideos([])
+  }
+
   function stopLivePeerConnections(notifyPeers = false) {
+    if (liveParticipantAnnouncementTimerRef.current !== null) {
+      window.clearTimeout(liveParticipantAnnouncementTimerRef.current)
+      liveParticipantAnnouncementTimerRef.current = null
+    }
     if (notifyPeers && relay.mode === 'live') {
       callPeersRef.current.forEach((peer) => {
         void publishLiveCallSignal(OFFICE_KINDS.callHangup, peer.pubkey, { reason: 'hangup' })
@@ -1743,19 +2857,24 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     }
     livePeerConnectionsRef.current.forEach((connection) => connection.close())
     livePeerConnectionsRef.current.clear()
+    liveVideoSendersRef.current.clear()
     pendingIceCandidatesRef.current.clear()
   }
 
   function stopRemoteVideos() {
     stopLivePeerConnections()
-    remoteVideosRef.current.forEach((video) => video.stop())
-    remoteVideosRef.current = []
-    setRemoteVideos([])
+    clearRemoteVideos()
+    setActiveLiveCallPeers([])
   }
 
   function stopScreenShare() {
-    screenStream?.getTracks().forEach((track) => track.stop())
+    const currentScreenStream = screenStreamRef.current ?? screenStream
+    const nextVideoTrack = cameraEnabledRef.current ? localStreamRef.current?.getVideoTracks()[0] ?? null : null
+    void updateLiveVideoSenders(nextVideoTrack, localStreamRef.current)
+    currentScreenStream?.getTracks().forEach((track) => track.stop())
+    screenStreamRef.current = null
     setScreenStream(null)
+    window.setTimeout(publishLiveMediaState, 0)
   }
 
   async function requestLocalMedia(nextCamera = cameraEnabled, nextMic = micEnabled) {
@@ -1801,52 +2920,68 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
 
   async function toggleCall() {
     if (callStarted) {
+      callStartedRef.current = false
       stopLivePeerConnections(true)
-      localStream?.getTracks().forEach((track) => track.stop())
-      stopScreenShare()
-      stopRemoteVideos()
-      setLocalStream(null)
-      localStreamRef.current = null
-      setCallStarted(false)
-      setCallExpanded(false)
-      setMediaState('idle')
+      finishCallLocally()
       return
     }
 
     setMediaState('requesting')
     setCameraEnabled(true)
     setMicEnabled(true)
+    cameraEnabledRef.current = true
+    micEnabledRef.current = true
+    if (relay.mode === 'live') {
+      setActiveLiveCallPeers(callPeers)
+      callPeersRef.current = callPeers
+    } else {
+      setActiveLiveCallPeers([])
+    }
+    callStartedRef.current = true
     setCallStarted(true)
     const stream = await requestLocalMedia(true, true)
     if (relay.mode === 'mock') {
       replaceRemoteVideos(reconcileMockVideos(callPeerKey))
       return
     }
+    clearRemoteVideos()
     await startLivePeerConnections(stream)
   }
 
   async function toggleCamera() {
     const nextCamera = !cameraEnabled
     setCameraEnabled(nextCamera)
+    cameraEnabledRef.current = nextCamera
     if (localStream?.getVideoTracks().length) {
       localStream.getVideoTracks().forEach((track) => {
         track.enabled = nextCamera
       })
+      if (!screenStreamRef.current) {
+        await updateLiveVideoSenders(nextCamera ? localStream.getVideoTracks()[0] ?? null : null, localStream)
+      }
+      publishLiveMediaState()
       if (!nextCamera) return
     }
-    await requestLocalMedia(nextCamera, micEnabled)
+    const stream = await requestLocalMedia(nextCamera, micEnabled)
+    if (!screenStreamRef.current) {
+      await updateLiveVideoSenders(nextCamera ? stream?.getVideoTracks()[0] ?? null : null, stream)
+    }
+    publishLiveMediaState()
   }
 
   async function toggleMic() {
     const nextMic = !micEnabled
     setMicEnabled(nextMic)
+    micEnabledRef.current = nextMic
     if (localStream?.getAudioTracks().length) {
       localStream.getAudioTracks().forEach((track) => {
         track.enabled = nextMic
       })
+      publishLiveMediaState()
       return
     }
     await requestLocalMedia(cameraEnabled, nextMic)
+    publishLiveMediaState()
   }
 
   async function toggleScreenShare() {
@@ -1861,10 +2996,15 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
         video: true,
         audio: false,
       })
-      stream.getVideoTracks()[0]?.addEventListener('ended', () => setScreenStream(null), { once: true })
+      stream.getVideoTracks()[0]?.addEventListener('ended', stopScreenShare, { once: true })
+      screenStreamRef.current = stream
       setScreenStream(stream)
+      await updateLiveVideoSenders(stream.getVideoTracks()[0] ?? null, stream)
+      publishLiveMediaState()
     } catch {
+      screenStreamRef.current = null
       setScreenStream(null)
+      publishLiveMediaState()
     }
   }
 
@@ -1956,11 +3096,9 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
             </div>
 
             {connectSession && nostrConnectQr && authState === 'connecting' && (
-              <Card className="connect-card" size="sm">
+              <a className="connect-card qr-action" href={connectSession.uri} aria-label="Open Nostr Connect">
                 <img src={nostrConnectQr} alt="Nostr Connect QR" />
-                <span>Listening on {connectSession.relays.map(relayHostLabel).join(', ')}</span>
-                <a href={connectSession.uri}>Open Nostr Connect</a>
-              </Card>
+              </a>
             )}
 
             {authState === 'connecting' && !nostrConnectQr && (
@@ -1990,6 +3128,24 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
             </div>
           </DialogContent>
         </Dialog>
+      )}
+
+      {signerPendingPrompt && (
+        <section className="signer-pending-overlay" role="dialog" aria-modal="true" aria-label="Signer pending">
+          <div className="signer-pending-modal">
+            <LoaderCircle size={30} className="spin-icon" />
+            <div>
+              <p className="eyebrow">waiting for approval</p>
+              <h2>Signer pending</h2>
+              <p>
+                Nestr is waiting for {signerPendingPrompt.signerLabel} to sign a{' '}
+                {signerEventDescription(signerPendingPrompt.eventKind)} event. Some signers ask you to approve each
+                event kind the first time, including call signaling and office presence.
+              </p>
+              <span>Event kind {signerPendingPrompt.eventKind}</span>
+            </div>
+          </div>
+        </section>
       )}
 
       <Dialog open={showAccountDialog} onOpenChange={setShowAccountDialog}>
@@ -2038,6 +3194,20 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
                 room: {roomAccessStatus === 'open' ? roomAccessMessage : `${roomAccessStatus} · ${roomAccessMessage}`}
               </code>
             </section>
+
+            {relay.mode === 'live' && (
+              <section className="account-info-card">
+                <div className="section-title">
+                  <span>Nostr Connect</span>
+                  <span>{accountSignerRelays.length}</span>
+                </div>
+                {accountSignerRelays.length > 0 ? (
+                  accountSignerRelays.map((relayUrl) => <code key={relayUrl}>{relayUrl}</code>)
+                ) : (
+                  <code>{activeSigner?.label === 'NIP-07' ? 'browser signer' : 'no relay hint stored'}</code>
+                )}
+              </section>
+            )}
 
             <section className="account-info-card wide relay-messages">
               <div className="section-title">
@@ -2146,6 +3316,38 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
         </DialogContent>
       </Dialog>
 
+      <Dialog open={showAddRelayDialog} onOpenChange={setShowAddRelayDialog}>
+        <DialogContent className="auth-modal create-chatroom-modal">
+          <DialogHeader className="auth-modal-header">
+            <div>
+              <p className="eyebrow">NIP-29</p>
+              <DialogTitle>Add Relay</DialogTitle>
+            </div>
+          </DialogHeader>
+          <DialogDescription className="auth-modal-copy">
+            Add a NIP-29 relay to the rail. Nestr will discover its chatrooms from kind 39000 metadata.
+          </DialogDescription>
+          <form className="admin-form" onSubmit={addRelay}>
+            <Input
+              value={relayUrlInput}
+              onChange={(event) => setRelayUrlInput(event.target.value)}
+              placeholder="wss://relay.example"
+              aria-label="Relay URL"
+              spellCheck={false}
+            />
+            <div className="auth-actions">
+              <Button type="button" className="secondary-action" onClick={() => setShowAddRelayDialog(false)}>
+                Cancel
+              </Button>
+              <Button type="submit" className="primary-action">
+                <Radio size={16} />
+                Add
+              </Button>
+            </div>
+          </form>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={adminDialog !== null} onOpenChange={(open) => !open && setAdminDialog(null)}>
         <DialogContent className="auth-modal admin-action-modal">
           {adminDialog === 'join' && (
@@ -2165,8 +3367,8 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
                 <Input
                   value={joinReason}
                   onChange={(event) => setJoinReason(event.target.value)}
-                  placeholder="Reason"
-                  aria-label="Join reason"
+                  placeholder="Message to moderators (optional)"
+                  aria-label="Optional message to moderators"
                 />
                 <Input
                   value={joinCode}
@@ -2177,7 +3379,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
                 <span className="form-hint">
                   {groupIsClosed
                     ? 'Closed chatrooms ignore normal requests unless the relay recognizes this code.'
-                    : 'An invite code is a preapproval token created by a room admin. Most requests do not need one.'}
+                    : 'The message and invite code are both optional. The relay decides how moderators see join requests.'}
                 </span>
                 <Button type="submit" className="primary-action">
                   <DoorOpen size={16} />
@@ -2385,7 +3587,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
           type="button"
           className={`rail-button ${appView === 'dm' ? 'active' : ''}`}
           onClick={() => {
-            setAppView('dm')
+            navigateToDirectMessages()
             setCallStarted(false)
             stopScreenShare()
             stopRemoteVideos()
@@ -2396,14 +3598,28 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
           <Send size={23} />
         </Button>
         <div className="rail-divider" />
+        {savedRelayUrls.map((relayUrl) => {
+          const activeRelay = sameRelayUrl(relayUrl, snapshot.group.relay)
+          return (
+            <RelayRailButton
+              key={relayUrl}
+              relayUrl={relayUrl}
+              active={activeRelay}
+              onClick={() => {
+                if (activeRelay) navigateToRelayView(relayUrl)
+                else switchToRelay(relayUrl)
+              }}
+            />
+          )
+        })}
         <Button
           type="button"
-          className={`rail-button relay ${appView !== 'dm' ? 'active' : ''}`}
-          onClick={() => setAppView('relay')}
-          aria-label={`Relay ${relayHost}`}
-          title={relayHost}
+          className="rail-button relay add"
+          onClick={() => setShowAddRelayDialog(true)}
+          aria-label="Add relay"
+          title="Add relay"
         >
-          <Radio size={22} />
+          <Plus size={22} />
         </Button>
         <div className="rail-spacer" />
         <Button
@@ -2420,7 +3636,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
       <aside
         className={`side-panel left-panel ${
           appView === 'dm' ? 'dm-sidebar' : appView === 'relay' ? 'relay-sidebar' : ''
-        }`}
+        } ${appView === 'group' && mobileDetailsOpen ? 'mobile-open' : ''}`}
         aria-label={appView === 'dm' ? 'Direct messages' : appView === 'relay' ? 'Relay chats' : 'Office'}
       >
         {appView === 'dm' ? (
@@ -2500,13 +3716,17 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
                 filteredRelayGroups.map((groupEvent) => {
                   const groupId = tagValue(groupEvent, 'd') ?? snapshot.group.id
                   const name = tagValue(groupEvent, 'name') ?? groupId
+                  const groupRelayUrl = relayUrlFromGroupEvent(groupEvent, snapshot.group.relay)
+                  const groupHost = relayHostLabel(groupRelayUrl)
+                  const currentGroup = hasSelectedGroup && groupId === snapshot.group.id && sameRelayUrl(groupRelayUrl, snapshot.group.relay)
 
                   return (
                     <Button
                       type="button"
-                      key={`${groupEvent.pubkey}:${groupId}`}
-                      className={`relay-nav-row ${hasSelectedGroup && groupId === snapshot.group.id ? 'active' : ''}`}
-                      onClick={() => selectRelayGroup(groupId)}
+                      key={`${groupRelayUrl}:${groupEvent.pubkey}:${groupId}`}
+                      className={`relay-nav-row ${currentGroup ? 'active' : ''}`}
+                      onClick={() => selectRelayGroup(groupId, groupRelayUrl)}
+                      title={groupHost}
                     >
                       <MessageCircle size={16} />
                       <span>{name}</span>
@@ -2523,6 +3743,14 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
             <p className="eyebrow">{relayHost}</p>
             <h1>{metadataName}</h1>
           </div>
+          <Button
+            type="button"
+            className="mobile-details-toggle"
+            onClick={() => setMobileDetailsOpen((open) => !open)}
+            aria-label={mobileDetailsOpen ? 'Collapse group details' : 'Expand group details'}
+          >
+            {mobileDetailsOpen ? <ChevronLeft size={16} /> : <Info size={16} />}
+          </Button>
           <span className="relay-dot" data-status={connectionStatus} />
         </div>
 
@@ -2632,7 +3860,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
             <span>Members</span>
             <span>{groupMemberPubkeys.length} members</span>
           </div>
-          {visiblePeople.map((user) => (
+          {renderedPeople.map((user) => (
             <Button
               type="button"
               key={user.pubkey}
@@ -2661,6 +3889,20 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
               </span>
             </Button>
           ))}
+          {hiddenPeopleCount > 0 && (
+            <Button
+              type="button"
+              className="secondary-action members-more"
+              onClick={() =>
+                setPeopleRenderState((current) => ({
+                  key: peopleListKey,
+                  limit: (current.key === peopleListKey ? current.limit : PEOPLE_RENDER_STEP) + PEOPLE_RENDER_STEP,
+                }))
+              }
+            >
+              Show {Math.min(PEOPLE_RENDER_STEP, hiddenPeopleCount)} more
+            </Button>
+          )}
         </section>
           </>
         )}
@@ -2707,6 +3949,18 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
       {appView === 'group' && hasSelectedGroup && canReadGroup && (
         <>
           <section className="world-panel map-panel" aria-label="Spatial office">
+            <div className="office-count-chip" aria-label={officePresenceLabel}>
+              {officePresenceLabel}
+            </div>
+            <Button
+              type="button"
+              className="office-chat-toggle"
+              onClick={() => setMobileChatOpen((open) => !open)}
+              aria-label={mobileChatOpen ? 'Close chat' : `Open chat${unreadChatCount ? `, ${unreadChatCount} unread` : ''}`}
+            >
+              <MessageCircle size={18} />
+              {unreadChatCount > 0 && <span>{unreadChatCount > 99 ? '99+' : unreadChatCount}</span>}
+            </Button>
             <OfficeRenderer
               snapshot={{
                 map: officeMap,
@@ -2720,8 +3974,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
             {!canEnterOffice && (
               <Card className="call-invite-card read-only-office" size="sm">
                 <div>
-                  <strong>Join to enter the office</strong>
-                  <span>This chatroom is readable, but only members can appear on the map.</span>
+                  <strong>Want to say hello? Join the group!</strong>
                 </div>
                 <Button type="button" className="primary-action" onClick={() => setAdminDialog('join')}>
                   <DoorOpen size={17} />
@@ -2775,7 +4028,6 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
                     aria-label={cameraEnabled ? 'Disable camera' : 'Enable camera'}
                   >
                     {cameraEnabled ? <Camera size={18} /> : <CameraOff size={18} />}
-                    <span>Camera</span>
                   </Button>
                   <Button
                     type="button"
@@ -2784,7 +4036,6 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
                     aria-label={micEnabled ? 'Mute microphone' : 'Enable microphone'}
                   >
                     {micEnabled ? <Mic size={18} /> : <MicOff size={18} />}
-                    <span>Mic</span>
                   </Button>
                   <Button
                     type="button"
@@ -2800,67 +4051,64 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
                     }
                   >
                     <Monitor size={18} />
-                    <span>Share</span>
+                  </Button>
+                  <Button
+                    type="button"
+                    className="hangup"
+                    onClick={toggleCall}
+                    aria-label="Hang up"
+                  >
+                    <PhoneOff size={18} />
                   </Button>
                 </div>
                 <div className="stream-grid">
                   <StreamTile
                     label={currentUser?.name ?? 'You'}
-                    sublabel={
-                      !cameraEnabled
-                        ? 'camera off'
-                        : mediaState === 'live'
-                          ? 'local camera'
-                          : mediaState === 'blocked'
-                            ? 'camera blocked'
-                            : 'requesting camera'
-                    }
-                    stream={cameraEnabled ? localStream : null}
+                    stream={localCallStream}
                     muted
                     micMuted={!micEnabled}
-                    status="local"
+                    status={screenStream ? 'screen' : 'local'}
                   />
-                  {screenStream && (
-                    <StreamTile
-                      label={`${currentUser?.name ?? 'You'} screen`}
-                      sublabel="screen share"
-                      stream={screenStream}
-                      muted
-                      micMuted
-                      status="screen"
-                    />
-                  )}
                   {remoteVideos.map((video) => (
                     <StreamTile
                       key={video.pubkey}
                       label={video.name}
-                      sublabel={relay.mode === 'mock' ? 'mock peer stream' : 'peer camera'}
                       stream={video.stream}
-                      micMuted={Number.parseInt(video.pubkey.slice(0, 2), 16) % 4 === 0}
+                      showVideo={video.hasVideo ?? true}
+                      micMuted={video.micMuted ?? false}
                     />
                   ))}
                   {relay.mode === 'live' &&
-                    remoteVideos.length === 0 &&
-                    callPeers.map((peer) => (
-                      <StreamTile
-                        key={`pending-${peer.pubkey}`}
-                        label={peer.name}
-                        sublabel="connecting peer"
-                        stream={null}
-                        micMuted
-                      />
-                    ))}
+                    displayedCallPeers
+                      .filter((peer) => !remoteVideoPubkeys.has(peer.pubkey))
+                      .map((peer) => (
+                        <StreamTile
+                          key={`pending-${peer.pubkey}`}
+                          label={peer.name}
+                          sublabel="connecting"
+                          stream={null}
+                          micMuted
+                        />
+                      ))}
                 </div>
               </section>
             )}
           </section>
 
-          <aside className="side-panel chat-panel" aria-label="Chat">
+          <aside className={`side-panel chat-panel ${mobileChatOpen ? 'mobile-open' : ''}`} aria-label="Chat">
             <div className="chat-header">
               <div>
                 <h2>Chat</h2>
               </div>
-              <MessageCircle size={22} />
+              <Button
+                type="button"
+                className="chat-close"
+                onClick={() => setMobileChatOpen(false)}
+                aria-label="Close chat"
+              >
+                <X size={16} />
+              </Button>
+              <MessageCircle className="chat-header-icon" size={22} />
             </div>
 
             <div className="messages" role="log" aria-label="Messages">
@@ -2891,48 +4139,43 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
               <div ref={messagesEndRef} />
             </div>
 
-            <form className="composer" onSubmit={sendMessage}>
-              <Label htmlFor="message">Message</Label>
-              {!canWriteGroupChat && (
-                <span className="composer-lock">
-                  This chatroom is readable, but only members can write.
-                  <Button type="button" className="link-button" onClick={() => setAdminDialog('join')}>
-                    Join
-                  </Button>
-                </span>
-              )}
-              <SelectedFiles files={messageFiles} onRemove={removeMessageFile} />
-              <div className="input-row">
-                <Input
-                  id="message"
-                  value={message}
-                  onChange={(event) => setMessage(event.target.value)}
-                  placeholder={canWriteGroupChat ? 'Write to the room' : 'Join this chatroom to write'}
-                  disabled={!canWriteGroupChat}
-                />
-                <Label
-                  className={`file-picker ${canWriteGroupChat ? '' : 'disabled'}`}
-                  aria-label="Attach files"
-                  aria-disabled={!canWriteGroupChat}
-                >
-                  <Paperclip size={17} />
-                  <input
-                    type="file"
-                    multiple
-                    disabled={!canWriteGroupChat}
-                    onChange={(event) => {
-                      const files = Array.from(event.currentTarget.files ?? [])
-                      setMessageFiles((current) => [...current, ...files])
-                      event.currentTarget.value = ''
-                    }}
+            {canWriteGroupChat ? (
+              <form className="composer" onSubmit={sendMessage}>
+                <Label htmlFor="message">Message</Label>
+                <SelectedFiles files={messageFiles} onRemove={removeMessageFile} />
+                <div className="input-row">
+                  <Input
+                    id="message"
+                    value={message}
+                    onChange={(event) => setMessage(event.target.value)}
+                    placeholder="Write to the room"
                   />
-                </Label>
-                <Button type="submit" aria-label="Send message" disabled={!canWriteGroupChat}>
-                  {uploadStatus ? <LoaderCircle size={18} className="spin-icon" /> : <Send size={18} />}
+                  <Label className="file-picker" aria-label="Attach files">
+                    <Paperclip size={17} />
+                    <input
+                      type="file"
+                      multiple
+                      onChange={(event) => {
+                        const files = Array.from(event.currentTarget.files ?? [])
+                        setMessageFiles((current) => [...current, ...files])
+                        event.currentTarget.value = ''
+                      }}
+                    />
+                  </Label>
+                  <Button type="submit" aria-label="Send message">
+                    {uploadStatus ? <LoaderCircle size={18} className="spin-icon" /> : <Send size={18} />}
+                  </Button>
+                </div>
+                {uploadStatus && <span className="upload-status">{uploadStatus}</span>}
+              </form>
+            ) : (
+              <div className="composer composer-read-only" role="note">
+                <span>Only members can send messages</span>
+                <Button type="button" className="link-button" onClick={() => setAdminDialog('join')}>
+                  Join
                 </Button>
               </div>
-              {uploadStatus && <span className="upload-status">{uploadStatus}</span>}
-            </form>
+            )}
           </aside>
         </>
       )}
@@ -2960,12 +4203,18 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
                 aria-label="Search relay groups"
               />
             </Label>
-            {canCreateRelayGroup && (
-              <Button type="button" className="primary-action" onClick={() => setShowCreateGroupDialog(true)}>
-                <MessageCircle size={16} />
-                Create
+            <div className="relay-toolbar-actions">
+              <Button type="button" className="secondary-action" onClick={() => setShowAddRelayDialog(true)}>
+                <Plus size={16} />
+                Relay
               </Button>
-            )}
+              {canCreateRelayGroup && (
+                <Button type="button" className="primary-action" onClick={() => setShowCreateGroupDialog(true)}>
+                  <MessageCircle size={16} />
+                  Create
+                </Button>
+              )}
+            </div>
           </div>
           <div className="relay-chat-grid">
             {relayGroups.length === 0 ? (
@@ -2977,18 +4226,21 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
                 const groupId = tagValue(groupEvent, 'd') ?? snapshot.group.id
                 const name = tagValue(groupEvent, 'name') ?? groupId
                 const about = tagValue(groupEvent, 'about') ?? 'Chatroom'
+                const groupRelayUrl = relayUrlFromGroupEvent(groupEvent, snapshot.group.relay)
+                const groupHost = relayHostLabel(groupRelayUrl)
+                const currentGroup = hasSelectedGroup && groupId === snapshot.group.id && sameRelayUrl(groupRelayUrl, snapshot.group.relay)
 
                 return (
                   <Button
                     type="button"
-                    key={`${groupEvent.pubkey}:${groupId}`}
-                    className={`relay-chat-card ${hasSelectedGroup && groupId === snapshot.group.id ? 'current' : ''}`}
-                    onClick={() => selectRelayGroup(groupId)}
+                    key={`${groupRelayUrl}:${groupEvent.pubkey}:${groupId}`}
+                    className={`relay-chat-card ${currentGroup ? 'current' : ''}`}
+                    onClick={() => selectRelayGroup(groupId, groupRelayUrl)}
                   >
                     <span className="relay-chat-hash">#</span>
                     <span>
                       <strong>{name}</strong>
-                      <small>{about}</small>
+                      <small>{sameRelayUrl(groupRelayUrl, snapshot.group.relay) ? about : `${about} · ${groupHost}`}</small>
                     </span>
                   </Button>
                 )
@@ -3123,7 +4375,7 @@ function LandingApp() {
             type="button"
             className="rail-button account"
             onClick={() => {
-              window.location.href = '/?relay=relay.nestr.development'
+              navigateInApp('/?relay=relay.nestr.development')
             }}
             aria-label="Sign in"
           >
@@ -3148,6 +4400,7 @@ function LandingApp() {
                 key={relay.host}
                 className="relay-chat-card landing-relay-card"
                 href={`/?relay=${relay.host}`}
+                onClick={handleInternalLink}
               >
                 <span className="relay-chat-hash">
                   <Radio size={21} />
@@ -3158,7 +4411,7 @@ function LandingApp() {
                 </span>
               </a>
             ))}
-            <a className="relay-chat-card landing-relay-card" href="/?relay=groups.0xchat.com">
+            <a className="relay-chat-card landing-relay-card" href="/?relay=groups.0xchat.com" onClick={handleInternalLink}>
               <span className="relay-chat-hash">
                 <Radio size={21} />
               </span>
@@ -3175,10 +4428,16 @@ function LandingApp() {
 }
 
 function App() {
-  const launch = useMemo(() => parseLaunch(), [])
+  const [launch, setLaunch] = useState(() => parseLaunch())
+
+  useEffect(() => {
+    const syncLaunch = () => setLaunch(parseLaunch())
+    window.addEventListener('popstate', syncLaunch)
+    return () => window.removeEventListener('popstate', syncLaunch)
+  }, [])
 
   if (launch.mode === 'landing') return <LandingApp />
-  return <OfficeApp launch={launch} />
+  return <OfficeApp key={launchKey(launch)} launch={launch} />
 }
 
 export default App

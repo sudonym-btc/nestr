@@ -4,6 +4,9 @@ export interface MockPeerVideo {
   pubkey: string
   name: string
   stream: MediaStream
+  hasVideo?: boolean
+  micMuted?: boolean
+  cleanup?: () => void
   stop: () => void
 }
 
@@ -75,6 +78,8 @@ export function createMockPeerVideo(pubkey: string, name: string): MockPeerVideo
     pubkey,
     name,
     stream,
+    hasVideo: true,
+    micMuted: false,
     stop: () => {
       window.cancelAnimationFrame(raf)
       stream.getTracks().forEach((track) => track.stop())

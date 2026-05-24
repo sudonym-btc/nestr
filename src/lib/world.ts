@@ -43,7 +43,14 @@ export interface WorldPosition {
   updatedAt: number
   eventTime?: number
   eventId?: string
-  sequence?: number
+  startX?: number
+  startY?: number
+  targetX?: number
+  targetY?: number
+  speed?: number
+  sentAt?: number
+  arrivesAt?: number
+  moving?: boolean
 }
 
 function hashSeed(value: string) {

@@ -24,14 +24,20 @@ export const OFFICE_KINDS = {
   callAnswer: 25051,
   iceCandidate: 25052,
   callHangup: 25053,
+  callRenegotiate: 25055,
 } as const
 
 export const DM_KINDS = {
+  legacyDirectMessage: 4,
   seal: 13,
   directMessage: 14,
   fileMessage: 15,
   inboxRelays: 10050,
   giftWrap: 1059,
+} as const
+
+export const NIP51_KINDS = {
+  simpleGroups: 10009,
 } as const
 
 export type NostrTag = string[]
@@ -52,6 +58,7 @@ export interface NestrSigner {
   pubkey: string
   label: string
   signEvent: (event: NestrEventTemplate) => Promise<NestrEvent>
+  nip04Decrypt?: (pubkey: string, ciphertext: string) => Promise<string>
   nip44Encrypt?: (pubkey: string, plaintext: string) => Promise<string>
   nip44Decrypt?: (pubkey: string, ciphertext: string) => Promise<string>
   ping?: () => Promise<void>
@@ -67,7 +74,7 @@ export interface NestrDirectMessage {
   content: string
   attachments?: NestrAttachment[]
   createdAt: number
-  protocol: 'nip17' | 'mock'
+  protocol: 'nip17' | 'nip04' | 'mock'
 }
 
 export interface NestrAttachment {

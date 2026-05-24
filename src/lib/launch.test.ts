@@ -43,6 +43,16 @@ describe('launch URL parsing', () => {
     })
   })
 
+  it('can route directly to direct messages without losing the relay or room hint', () => {
+    expect(parseLaunch('?relay=groups.0xchat.com&c=room&view=dm')).toEqual({
+      mode: 'live',
+      groupId: 'room',
+      relayUrl: 'wss://groups.0xchat.com',
+      nostrConnectRelays: [],
+      initialView: 'dm',
+    })
+  })
+
   it('normalizes HTTP relay hints to WebSocket URLs', () => {
     expect(normalizeRelayUrl('https://relay.example/')).toBe('wss://relay.example')
   })

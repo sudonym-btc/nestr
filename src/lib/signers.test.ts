@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { createNostrConnectURI } from 'nostr-tools/nip46'
+import { createNostrConnectURI, type BunkerPointer } from 'nostr-tools/nip46'
 import {
   DEFAULT_NOSTR_CONNECT_RELAYS,
   NESTR_NIP46_PERMISSIONS,
+  normalizeStoredNostrConnectSession,
   nostrConnectAppMetadata,
   nostrConnectRelayHints,
+  nostrConnectStoredRelayHints,
 } from './signers'
 
 describe('Nostr Connect metadata', () => {
@@ -52,5 +54,41 @@ describe('Nostr Connect metadata', () => {
     expect(nostrConnectRelayHints('wss://groups.0xchat.com', ['relay.nsec.app'])).toEqual([
       'wss://relay.nsec.app',
     ])
+  })
+
+  it('backfills stored Nostr Connect sessions with relay hints for restore', () => {
+    const normalized = normalizeStoredNostrConnectSession({
+      version: 1,
+      clientSecretKey: '0'.repeat(64),
+      bunkerPointer: {
+        pubkey: 'a'.repeat(64),
+        secret: null,
+      } as BunkerPointer,
+      userPubkey: 'b'.repeat(64),
+      relayUrl: 'https://relay.nsec.app/',
+      connectedAt: 1,
+    })
+
+    expect(normalized.relayUrl).toBe('wss://relay.nsec.app')
+    expect(normalized.relayUrls).toEqual(['wss://relay.nsec.app'])
+    expect(normalized.bunkerPointer.relays).toEqual(['wss://relay.nsec.app'])
+  })
+
+  it('deduplicates stored Nostr Connect relay hints across legacy fields', () => {
+    expect(
+      nostrConnectStoredRelayHints({
+        version: 1,
+        clientSecretKey: '0'.repeat(64),
+        bunkerPointer: {
+          pubkey: 'a'.repeat(64),
+          relays: ['https://relay.nsec.app/', 'relay2.example'],
+          secret: null,
+        },
+        userPubkey: 'b'.repeat(64),
+        relayUrl: 'relay.nsec.app',
+        relayUrls: ['wss://relay.nsec.app'],
+        connectedAt: 1,
+      }),
+    ).toEqual(['wss://relay.nsec.app', 'wss://relay2.example'])
   })
 })

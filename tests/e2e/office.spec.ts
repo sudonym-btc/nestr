@@ -61,9 +61,10 @@ test('renders the chatroom office and sends global chat', async ({ page }) => {
   await expect(page.getByText(/file servers/i)).toBeVisible()
   await page.keyboard.press('Escape')
 
-  await expect(page.getByLabel('Mock call')).toBeVisible()
-  await expect(page.getByText('mock peer stream').first()).toBeVisible()
-  await expect(page.getByText(/local camera|camera blocked|requesting camera/)).toBeVisible()
+  const mockCall = page.getByLabel('Mock call')
+  await expect(mockCall).toBeVisible()
+  await expect(mockCall.getByText('Som')).toBeVisible()
+  await expect(mockCall.getByText(/local camera|peer camera|mock peer stream|camera blocked|requesting camera/)).toHaveCount(0)
   await expect(page.getByRole('button', { name: 'Fullscreen call' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Disable camera' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Mute microphone' })).toBeVisible()
@@ -106,6 +107,21 @@ test('filters relay group chats', async ({ page }) => {
   await expect(relayDirectory.getByText('No groups match that search.')).toBeVisible()
 })
 
+test('keeps rail view navigation in the URL without leaving the current relay', async ({ page }) => {
+  await page.goto('/?relay=openrelay.nestr.development')
+
+  await page.getByRole('button', { name: 'Direct messages' }).click()
+  await expect(page).toHaveURL(/view=dm/)
+  await expect(page.getByRole('region', { name: 'Direct messages' })).toBeVisible()
+
+  const relayButton = page.locator('button[aria-label^="Relay "]')
+  await expect(relayButton).toHaveCount(1)
+  await relayButton.click()
+
+  await expect(page).toHaveURL(/relay=.*openrelay\.nestr\.development$/)
+  await expect(page.getByRole('region', { name: 'Relay chats' })).toBeVisible()
+})
+
 test.describe('WebGL viewport sizing', () => {
   test.use({ deviceScaleFactor: 2, viewport: { width: 1180, height: 760 } })
 
@@ -135,8 +151,9 @@ test.describe('WebGL viewport sizing', () => {
 
       expect(Math.abs(sizing.canvasWidth - sizing.hostWidth)).toBeLessThan(1)
       expect(Math.abs(sizing.canvasHeight - sizing.hostHeight)).toBeLessThan(1)
-      expect(sizing.backingWidth).toBeGreaterThanOrEqual(Math.floor(sizing.canvasWidth * sizing.dpr) - 2)
-      expect(sizing.backingHeight).toBeGreaterThanOrEqual(Math.floor(sizing.canvasHeight * sizing.dpr) - 2)
+      const expectedPixelRatio = Math.min(sizing.dpr, 1.5)
+      expect(sizing.backingWidth).toBeGreaterThanOrEqual(Math.floor(sizing.canvasWidth * expectedPixelRatio) - 2)
+      expect(sizing.backingHeight).toBeGreaterThanOrEqual(Math.floor(sizing.canvasHeight * expectedPixelRatio) - 2)
     }
   })
 })

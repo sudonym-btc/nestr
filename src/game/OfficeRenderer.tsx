@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
-import { avatarFromPubkey } from '../lib/avatar'
+import { avatarFromPubkey, type AvatarStyle } from '../lib/avatar'
+import type { PositionMovement } from '../lib/positionEvents'
 import type { MockUser } from '../lib/mockRelay'
 import type { OfficeMap, WorldPosition } from '../lib/world'
 
@@ -12,7 +13,8 @@ interface OfficeSceneSnapshot {
   selfPubkey: string
 }
 
-type MoveHandler = (position: Pick<WorldPosition, 'x' | 'y' | 'vx' | 'vy'>) => void
+type MoveHandler = (movement: PositionMovement) => void
+type JumpTarget = Pick<WorldPosition, 'x' | 'y'>
 
 interface OfficeRendererProps {
   snapshot: OfficeSceneSnapshot
@@ -75,8 +77,22 @@ interface AvatarNode {
   current: THREE.Vector2
   target: THREE.Vector2
   labelText: string
+  labelAvatarKey: string
   walkingUntil: number
   lastSnapshotAt: number
+  trajectory?: AvatarTrajectory
+}
+
+interface AvatarTrajectory {
+  start: THREE.Vector2
+  end: THREE.Vector2
+  speed: number
+  sentAt: number
+}
+
+interface LabelAvatarOptions {
+  fallback: AvatarStyle
+  image?: HTMLImageElement
 }
 
 interface RoomPlan {
@@ -97,18 +113,38 @@ interface AssetPlacementOptions {
   tint?: number
 }
 
+interface CameraDragState {
+  pointerId: number
+  button: number
+  startX: number
+  startY: number
+  lastX: number
+  lastY: number
+  dragging: boolean
+}
+
 const WORLD_SCALE = 0.045
 const CHUNK_SIZE = 24
 const KEYBOARD_SPEED = 178
 const CLICK_SPEED = KEYBOARD_SPEED * 2
 const ARRIVAL_RADIUS = 0.24
+const KEYBOARD_INTENT_HORIZON_MS = 10_000
+const KEYBOARD_REPUBLISH_MS = 5_000
 const ROOM_RANGE = 2
+const ROOM_BUFFER_RANGE = ROOM_RANGE
+const WORLD_REBUILD_HYSTERESIS_CHUNKS = 1
 const SELF_ECHO_HOLD_MS = 900
+const AVATAR_APPROACH_DISTANCE = 2.45
 const MODEL_ROOT = `${import.meta.env.BASE_URL}assets/office-pack/models/`
 const CAMERA_VIEW_HEIGHT = 23
+const MAX_CAMERA_VIEW_SCALE = 2.7
+const CAMERA_DRAG_THRESHOLD = 4
+const CAMERA_ZOOM_RESET_MS = 280
+const MAX_RENDER_PIXEL_RATIO = 1.5
 
 const assetCache = new Map<AssetKey, LoadedAsset>()
 const loader = new GLTFLoader()
+const profileImageCache = new Map<string, HTMLImageElement | 'failed' | Promise<HTMLImageElement | null>>()
 
 const OFFICE_ASSETS = {
   adjustableDesk: asset('adjustableDesk', 'adjustable-desk.glb', [2.1, 1.15], 1.15, 'table', 0xc58f58),
@@ -141,7 +177,7 @@ const OFFICE_ASSETS = {
 
 const ASSET_BASE_LIFT: Partial<Record<AssetKey, number>> = {
   houseplant: 0.08,
-  plantWhitePot: 0.16,
+  plantWhitePot: 0.42,
   pottedPlant: 0.1,
 }
 
@@ -163,6 +199,13 @@ const glassMaterial = new THREE.MeshPhysicalMaterial({
 const ringMaterial = new THREE.MeshBasicMaterial({
   color: 0x9bdd8f,
   opacity: 0.23,
+  transparent: true,
+  depthWrite: false,
+})
+const softFloorWashGeometry = new THREE.CircleGeometry(46, 56)
+const softFloorWashMaterial = new THREE.MeshBasicMaterial({
+  color: 0xffffff,
+  opacity: 0.055,
   transparent: true,
   depthWrite: false,
 })
@@ -227,6 +270,13 @@ function setModelShadows(object: THREE.Object3D) {
   })
 }
 
+function cloneObjectMaterials(object: THREE.Object3D) {
+  object.traverse((child) => {
+    if (!isMesh(child)) return
+    child.material = cloneMaterial(child.material)
+  })
+}
+
 function cloneMaterial(material: THREE.Material | THREE.Material[]) {
   return Array.isArray(material) ? material.map((entry) => entry.clone()) : material.clone()
 }
@@ -247,6 +297,7 @@ function loadAsset(spec: AssetSpec) {
           child.castShadow = true
           child.receiveShadow = true
         })
+        normalizeObject(scene, spec)
         assetCache.set(spec.key, { scene })
         resolve(scene)
       },
@@ -366,14 +417,116 @@ function drawRoundedCanvasRect(
   context.closePath()
 }
 
+function drawProfileAvatar(
+  context: CanvasRenderingContext2D,
+  avatar: AvatarStyle,
+  x: number,
+  y: number,
+  size: number,
+) {
+  const radius = size / 2
+  const centerX = x + radius
+  const centerY = y + radius
+
+  context.save()
+  context.beginPath()
+  context.arc(centerX, centerY, radius, 0, Math.PI * 2)
+  context.clip()
+  context.fillStyle = avatar.body
+  context.fillRect(x, y, size, size)
+  context.fillStyle = avatar.trim
+  context.fillRect(x, y + size * 0.62, size, size * 0.38)
+  context.fillStyle = avatar.skin
+  context.beginPath()
+  context.arc(centerX, y + size * 0.44, size * 0.24, 0, Math.PI * 2)
+  context.fill()
+  context.fillStyle = avatar.hair
+  context.fillRect(x + size * 0.26, y + size * 0.2, size * 0.48, size * 0.16)
+  context.restore()
+
+  context.lineWidth = Math.max(2, size * 0.08)
+  context.strokeStyle = 'rgba(255, 255, 255, 0.88)'
+  context.beginPath()
+  context.arc(centerX, centerY, radius - context.lineWidth / 2, 0, Math.PI * 2)
+  context.stroke()
+}
+
+function drawProfileImageAvatar(
+  context: CanvasRenderingContext2D,
+  image: HTMLImageElement,
+  x: number,
+  y: number,
+  size: number,
+) {
+  const radius = size / 2
+  const centerX = x + radius
+  const centerY = y + radius
+  const imageRatio = image.naturalWidth / Math.max(image.naturalHeight, 1)
+  const targetRatio = 1
+  const sourceWidth = imageRatio > targetRatio ? image.naturalHeight * targetRatio : image.naturalWidth
+  const sourceHeight = imageRatio > targetRatio ? image.naturalHeight : image.naturalWidth / targetRatio
+  const sourceX = (image.naturalWidth - sourceWidth) / 2
+  const sourceY = (image.naturalHeight - sourceHeight) / 2
+
+  context.save()
+  context.beginPath()
+  context.arc(centerX, centerY, radius, 0, Math.PI * 2)
+  context.clip()
+  context.drawImage(image, sourceX, sourceY, sourceWidth, sourceHeight, x, y, size, size)
+  context.restore()
+
+  context.lineWidth = Math.max(2, size * 0.08)
+  context.strokeStyle = 'rgba(255, 255, 255, 0.9)'
+  context.beginPath()
+  context.arc(centerX, centerY, radius - context.lineWidth / 2, 0, Math.PI * 2)
+  context.stroke()
+}
+
+function profileImageKey(candidates: string[] = []) {
+  return candidates.join('|')
+}
+
+function loadProfileImage(url: string): Promise<HTMLImageElement | null> {
+  const cached = profileImageCache.get(url)
+  if (cached === 'failed') return Promise.resolve(null)
+  if (cached instanceof HTMLImageElement) return Promise.resolve(cached)
+  if (cached) return cached
+
+  const loading = new Promise<HTMLImageElement | null>((resolve) => {
+    const image = new Image()
+    image.crossOrigin = 'anonymous'
+    image.referrerPolicy = 'no-referrer'
+    image.onload = () => {
+      profileImageCache.set(url, image)
+      resolve(image)
+    }
+    image.onerror = () => {
+      profileImageCache.set(url, 'failed')
+      resolve(null)
+    }
+    image.src = url
+  })
+
+  profileImageCache.set(url, loading)
+  return loading
+}
+
+async function loadFirstProfileImage(candidates: string[] = []) {
+  for (const candidate of candidates) {
+    const image = await loadProfileImage(candidate)
+    if (image) return image
+  }
+  return undefined
+}
+
 function makeTextSprite(
   text: string,
-  options: { background?: string; color?: string; fontSize?: number; padding?: number; chipColor?: string } = {},
+  options: { background?: string; color?: string; fontSize?: number; padding?: number; avatar?: LabelAvatarOptions } = {},
 ) {
   const fontSize = options.fontSize ?? 30
   const padding = options.padding ?? 14
-  const chipSize = options.chipColor ? fontSize * 0.72 : 0
-  const chipGap = options.chipColor ? fontSize * 0.34 : 0
+  const avatarSize = options.avatar ? fontSize * 0.92 : 0
+  const avatarGap = options.avatar ? fontSize * 0.34 : 0
   const dpr = Math.min(window.devicePixelRatio || 1, 2)
   const canvas = document.createElement('canvas')
   const context = canvas.getContext('2d')
@@ -381,7 +534,7 @@ function makeTextSprite(
 
   context.font = `800 ${fontSize}px Inter, ui-sans-serif, system-ui, sans-serif`
   const metrics = context.measureText(text)
-  const width = Math.ceil(metrics.width + chipSize + chipGap + padding * 2)
+  const width = Math.ceil(metrics.width + avatarSize + avatarGap + padding * 2)
   const height = Math.ceil(fontSize + padding * 1.4)
   canvas.width = Math.ceil(width * dpr)
   canvas.height = Math.ceil(height * dpr)
@@ -393,17 +546,13 @@ function makeTextSprite(
   context.fill()
 
   let textX = padding
-  if (options.chipColor) {
-    const centerY = height / 2
-    const radius = chipSize / 2
-    context.beginPath()
-    context.arc(padding + radius, centerY, radius, 0, Math.PI * 2)
-    context.fillStyle = options.chipColor
-    context.fill()
-    context.lineWidth = 2
-    context.strokeStyle = 'rgba(255, 255, 255, 0.86)'
-    context.stroke()
-    textX += chipSize + chipGap
+  if (options.avatar) {
+    if (options.avatar.image) {
+      drawProfileImageAvatar(context, options.avatar.image, padding, (height - avatarSize) / 2, avatarSize)
+    } else {
+      drawProfileAvatar(context, options.avatar.fallback, padding, (height - avatarSize) / 2, avatarSize)
+    }
+    textX += avatarSize + avatarGap
   }
 
   context.fillStyle = options.color ?? '#23262d'
@@ -578,8 +727,12 @@ function makeAssetObject(key: AssetKey, options: AssetPlacementOptions = {}) {
   const cached = assetCache.get(key)
   const source = cached?.scene
   const object = source?.clone(true) ?? createFallbackAsset(spec)
-  setModelShadows(object)
-  if (source) normalizeObject(object, spec, options.scale ?? 1)
+  if (!source) {
+    setModelShadows(object)
+  } else if (options.scale !== undefined) {
+    object.scale.multiplyScalar(options.scale)
+  }
+  if (source && options.tint !== undefined) cloneObjectMaterials(object)
   if (options.tint !== undefined) tintObject(object, options.tint)
   return object
 }
@@ -609,6 +762,20 @@ function addAsset(
   group.add(object)
   parent.add(group)
   return group
+}
+
+function userProfileImageCandidates(user?: MockUser) {
+  return user?.pictureCandidates?.length ? user.pictureCandidates : user?.pictureUrl ? [user.pictureUrl] : []
+}
+
+function createLabelSprite(pubkey: string, label: string, image?: HTMLImageElement) {
+  return makeTextSprite(label, {
+    background: 'rgba(32, 34, 39, 0.92)',
+    color: '#ffffff',
+    fontSize: 24,
+    padding: 12,
+    avatar: label ? { fallback: avatarFromPubkey(pubkey), image } : undefined,
+  })
 }
 
 function createAvatar(pubkey: string, labelText: string) {
@@ -655,13 +822,7 @@ function createAvatar(pubkey: string, labelText: string) {
   const rightLeg = createLimb(0.065, 0.52, shoeMaterial, [0.11, 0.42, 0.02])
   group.add(leftArm, rightArm, leftLeg, rightLeg)
 
-  const label = makeTextSprite(labelText, {
-    background: 'rgba(32, 34, 39, 0.92)',
-    color: '#ffffff',
-    fontSize: 24,
-    padding: 12,
-    chipColor: style.body,
-  })
+  const label = createLabelSprite(pubkey, labelText)
   label.position.set(0, 1.78, 0)
   label.visible = Boolean(labelText)
   group.add(label)
@@ -677,6 +838,7 @@ function createAvatar(pubkey: string, labelText: string) {
     current: new THREE.Vector2(),
     target: new THREE.Vector2(),
     labelText,
+    labelAvatarKey: '',
     walkingUntil: 0,
     lastSnapshotAt: 0,
   } satisfies AvatarNode
@@ -751,6 +913,10 @@ function roomsOverlap(a: RoomPlan, b: RoomPlan) {
     first.top < second.bottom &&
     first.bottom > second.top
   )
+}
+
+function roomPriority(room: RoomPlan) {
+  return hashInt(`${room.seed}:priority`)
 }
 
 function roomLocal(room: RoomPlan, x: number, z: number) {
@@ -839,18 +1005,30 @@ class ThreeOffice {
   private keys = new Set<string>()
   private cameraCenter = new THREE.Vector3()
   private cameraDesired = new THREE.Vector3()
+  private cameraDetached = false
+  private cameraViewScale = 1
+  private cameraTargetViewScale = 1
+  private cameraDrag?: CameraDragState
   private target?: THREE.Vector2
   private snapshot?: OfficeSceneSnapshot
   private onMove: MoveHandler
   private canPlaceSelf: boolean
   private frame = 0
   private lastTime = performance.now()
-  private lastEmit = 0
-  private lastWorldKey = ''
+  private lastKeyboardIntentAt = 0
+  private lastKeyboardIntentKey = ''
+  private lastIntentRequiresStop = false
+  private worldCenterChunkX = Number.NaN
+  private worldCenterChunkZ = Number.NaN
+  private worldSeed = ''
+  private worldAssetVersion = -1
+  private queuedWorldRebuild?: number
   private assetVersion = 0
   private localEchoHoldUntil = 0
   private followedSelfPubkey = ''
   private resizeObserver?: ResizeObserver
+  private previousAvatarPosition = new THREE.Vector2()
+  private trajectoryDelta = new THREE.Vector2()
 
   constructor(host: HTMLDivElement, onMove: MoveHandler, canPlaceSelf = true) {
     this.host = host
@@ -860,11 +1038,11 @@ class ThreeOffice {
       antialias: true,
       alpha: false,
       powerPreference: 'high-performance',
-      preserveDrawingBuffer: import.meta.env.DEV,
+      preserveDrawingBuffer: false,
     })
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2))
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, MAX_RENDER_PIXEL_RATIO))
     this.renderer.shadowMap.enabled = true
-    this.renderer.shadowMap.type = THREE.VSMShadowMap
+    this.renderer.shadowMap.type = THREE.PCFShadowMap
     this.renderer.outputColorSpace = THREE.SRGBColorSpace
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping
     this.renderer.toneMappingExposure = 1.05
@@ -884,16 +1062,37 @@ class ThreeOffice {
 
   dispose() {
     window.cancelAnimationFrame(this.frame)
+    if (this.queuedWorldRebuild !== undefined) window.clearTimeout(this.queuedWorldRebuild)
     this.resizeObserver?.disconnect()
     window.removeEventListener('keydown', this.handleKeyDown)
     window.removeEventListener('keyup', this.handleKeyUp)
     this.renderer.domElement.removeEventListener('pointerdown', this.handlePointerDown)
+    this.renderer.domElement.removeEventListener('pointermove', this.handlePointerMove)
+    this.renderer.domElement.removeEventListener('pointerup', this.handlePointerUp)
+    this.renderer.domElement.removeEventListener('pointercancel', this.handlePointerCancel)
+    this.renderer.domElement.removeEventListener('wheel', this.handleWheel)
+    this.renderer.domElement.removeEventListener('contextmenu', this.preventContextMenu)
     this.renderer.dispose()
     this.renderer.domElement.remove()
   }
 
   setMoveHandler(onMove: MoveHandler) {
     this.onMove = onMove
+  }
+
+  moveSelfNear(position: JumpTarget) {
+    if (!this.canPlaceSelf) return
+    const node = this.selfNode()
+    if (!node) return
+
+    const destination = this.approachTargetForWorldPosition(position)
+    const x = worldToSceneX(destination.x)
+    const z = worldToSceneZ(destination.y)
+    this.keys.clear()
+    this.resetCameraTracking()
+    this.target = new THREE.Vector2(x, z)
+    this.emitMoveIntent(this.target, CLICK_SPEED)
+    this.lastIntentRequiresStop = false
   }
 
   setCanPlaceSelf(canPlaceSelf: boolean) {
@@ -907,9 +1106,13 @@ class ThreeOffice {
   }
 
   applySnapshot(snapshot: OfficeSceneSnapshot) {
+    const previousSeed = this.snapshot?.map.seed
     this.snapshot = snapshot
     this.syncAvatars()
-    this.rebuildWorld(true)
+    if (previousSeed !== snapshot.map.seed) {
+      this.worldSeed = ''
+      this.rebuildWorld(true)
+    }
   }
 
   private preloadAssets() {
@@ -917,12 +1120,20 @@ class ThreeOffice {
       void loadAsset(spec)
         .then(() => {
           this.assetVersion += 1
-          this.rebuildWorld(true)
+          this.scheduleWorldRebuild()
         })
         .catch(() => {
           this.assetVersion += 1
         })
     })
+  }
+
+  private scheduleWorldRebuild() {
+    if (this.queuedWorldRebuild !== undefined) return
+    this.queuedWorldRebuild = window.setTimeout(() => {
+      this.queuedWorldRebuild = undefined
+      this.rebuildWorld(true)
+    }, 140)
   }
 
   private bindEvents() {
@@ -931,6 +1142,11 @@ class ThreeOffice {
     window.addEventListener('keydown', this.handleKeyDown)
     window.addEventListener('keyup', this.handleKeyUp)
     this.renderer.domElement.addEventListener('pointerdown', this.handlePointerDown)
+    this.renderer.domElement.addEventListener('pointermove', this.handlePointerMove)
+    this.renderer.domElement.addEventListener('pointerup', this.handlePointerUp)
+    this.renderer.domElement.addEventListener('pointercancel', this.handlePointerCancel)
+    this.renderer.domElement.addEventListener('wheel', this.handleWheel, { passive: false })
+    this.renderer.domElement.addEventListener('contextmenu', this.preventContextMenu)
   }
 
   private createFloor() {
@@ -957,11 +1173,11 @@ class ThreeOffice {
     const sun = new THREE.DirectionalLight(0xffffff, 1.65)
     sun.position.set(-4, 48, -4)
     sun.castShadow = true
-    sun.shadow.mapSize.set(2048, 2048)
+    sun.shadow.mapSize.set(1024, 1024)
     sun.shadow.bias = -0.00005
     sun.shadow.normalBias = 0.12
-    sun.shadow.radius = 32
-    sun.shadow.blurSamples = 40
+    sun.shadow.radius = 10
+    sun.shadow.blurSamples = 8
     sun.shadow.camera.near = 2
     sun.shadow.camera.far = 96
     sun.shadow.camera.left = -52
@@ -979,6 +1195,7 @@ class ThreeOffice {
     if (!this.canPlaceSelf) return
     if (event.defaultPrevented || this.isTypingTarget(event.target)) return
     if (!this.isMovementKey(event.key)) return
+    this.resetCameraTracking()
     this.keys.add(event.key.toLowerCase())
     event.preventDefault()
   }
@@ -988,8 +1205,53 @@ class ThreeOffice {
   }
 
   private handlePointerDown = (event: PointerEvent) => {
+    if (event.button !== 0 && event.button !== 1) return
+    if (event.target !== this.renderer.domElement) return
+    this.cameraDrag = {
+      pointerId: event.pointerId,
+      button: event.button,
+      startX: event.clientX,
+      startY: event.clientY,
+      lastX: event.clientX,
+      lastY: event.clientY,
+      dragging: false,
+    }
+    this.renderer.domElement.setPointerCapture(event.pointerId)
+  }
+
+  private handlePointerMove = (event: PointerEvent) => {
+    if (!this.cameraDrag || event.pointerId !== this.cameraDrag.pointerId) return
+    const totalDistance = Math.hypot(event.clientX - this.cameraDrag.startX, event.clientY - this.cameraDrag.startY)
+    if (!this.cameraDrag.dragging && totalDistance < CAMERA_DRAG_THRESHOLD) return
+
+    this.cameraDrag.dragging = true
+    this.panCameraByPixels(event.clientX - this.cameraDrag.lastX, event.clientY - this.cameraDrag.lastY)
+    this.cameraDrag.lastX = event.clientX
+    this.cameraDrag.lastY = event.clientY
+    event.preventDefault()
+  }
+
+  private handlePointerUp = (event: PointerEvent) => {
+    if (!this.cameraDrag || event.pointerId !== this.cameraDrag.pointerId) return
+    const wasDragging = this.cameraDrag.dragging
+    const button = this.cameraDrag.button
+    this.cameraDrag = undefined
+    this.renderer.domElement.releasePointerCapture(event.pointerId)
+    if (wasDragging || button !== 0) {
+      event.preventDefault()
+      return
+    }
+    this.handleMapClick(event)
+  }
+
+  private handlePointerCancel = (event: PointerEvent) => {
+    if (!this.cameraDrag || event.pointerId !== this.cameraDrag.pointerId) return
+    this.cameraDrag = undefined
+    this.renderer.domElement.releasePointerCapture(event.pointerId)
+  }
+
+  private handleMapClick(event: PointerEvent) {
     if (!this.canPlaceSelf) return
-    if (event.button !== 0) return
     const rect = this.renderer.domElement.getBoundingClientRect()
     this.pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1
     this.pointer.y = -(((event.clientY - rect.top) / rect.height) * 2 - 1)
@@ -1003,7 +1265,9 @@ class ThreeOffice {
     if (avatarHit) {
       const node = this.avatars.get(avatarHit)
       if (node) {
-        this.target = new THREE.Vector2(node.current.x, node.current.y)
+        this.resetCameraTracking()
+        this.target = this.approachTargetForAvatar(node)
+        this.emitMoveIntent(this.target, CLICK_SPEED)
         event.preventDefault()
         return
       }
@@ -1011,7 +1275,25 @@ class ThreeOffice {
 
     const intersection = new THREE.Vector3()
     this.raycaster.ray.intersectPlane(this.groundPlane, intersection)
+    this.resetCameraTracking()
     this.target = new THREE.Vector2(intersection.x, intersection.z)
+    this.emitMoveIntent(this.target, CLICK_SPEED)
+  }
+
+  private handleWheel = (event: WheelEvent) => {
+    if (event.target !== this.renderer.domElement) return
+    event.preventDefault()
+    const multiplier = Math.exp(event.deltaY * 0.0012)
+    const nextScale = THREE.MathUtils.clamp(this.cameraViewScale * multiplier, 1, MAX_CAMERA_VIEW_SCALE)
+    if (nextScale === this.cameraViewScale) return
+    this.cameraDetached = true
+    this.cameraViewScale = nextScale
+    this.cameraTargetViewScale = nextScale
+    this.applyCameraProjection()
+  }
+
+  private preventContextMenu = (event: MouseEvent) => {
+    if (this.cameraDrag?.dragging) event.preventDefault()
   }
 
   private pubkeyForObject(object: THREE.Object3D) {
@@ -1035,10 +1317,27 @@ class ThreeOffice {
   }
 
   private resize() {
+    this.applyCameraProjection()
+    this.renderer.setSize(Math.max(this.host.clientWidth, 1), Math.max(this.host.clientHeight, 1), false)
+  }
+
+  private baseViewHeight() {
+    return Math.max(this.host.clientWidth, 1) < 620 ? 22 : CAMERA_VIEW_HEIGHT
+  }
+
+  private currentViewHeight() {
+    return this.baseViewHeight() * this.cameraViewScale
+  }
+
+  private cameraAspect() {
+    return Math.max(this.host.clientWidth, 1) / Math.max(this.host.clientHeight, 1)
+  }
+
+  private applyCameraProjection() {
     const width = Math.max(this.host.clientWidth, 1)
     const height = Math.max(this.host.clientHeight, 1)
     const aspect = width / height
-    const viewHeight = width < 620 ? 22 : CAMERA_VIEW_HEIGHT
+    const viewHeight = this.currentViewHeight()
     this.camera.left = (-viewHeight * aspect) / 2
     this.camera.right = (viewHeight * aspect) / 2
     this.camera.top = viewHeight / 2
@@ -1046,14 +1345,13 @@ class ThreeOffice {
     this.camera.near = 0.1
     this.camera.far = 160
     this.camera.updateProjectionMatrix()
-    this.renderer.setSize(width, height, false)
   }
 
   private tick = (time: number) => {
     const delta = Math.min(50, time - this.lastTime)
     this.lastTime = time
     this.moveSelf(delta, time)
-    this.animateAvatars(time, delta)
+    this.animateAvatars(time, delta, Date.now())
     this.updateCamera(delta)
     this.rebuildWorld()
     this.renderer.render(this.scene, this.camera)
@@ -1063,6 +1361,80 @@ class ThreeOffice {
   private selfNode() {
     if (!this.snapshot || !this.canPlaceSelf) return undefined
     return this.avatars.get(this.snapshot.selfPubkey)
+  }
+
+  private clearSelfTrajectory(node = this.selfNode()) {
+    if (!node) return
+    node.trajectory = undefined
+    node.target.copy(node.current)
+  }
+
+  private approachTargetForAvatar(targetNode: AvatarNode) {
+    const destination = targetNode.current.clone()
+    const self = this.selfNode()
+    const offset = self ? self.current.clone().sub(targetNode.current) : new THREE.Vector2(1, 0)
+    if (offset.lengthSq() < 0.0001) {
+      const seed = Number.parseInt(targetNode.group.userData.pubkey?.slice(0, 4) ?? '1', 16)
+      const angle = (Number.isFinite(seed) ? seed : 1) * 0.017
+      offset.set(Math.cos(angle), Math.sin(angle))
+    }
+    offset.setLength(AVATAR_APPROACH_DISTANCE)
+    return destination.add(offset)
+  }
+
+  private approachTargetForWorldPosition(position: JumpTarget): JumpTarget {
+    const self = this.selfNode()
+    if (!self) return position
+
+    const target = new THREE.Vector2(worldToSceneX(position.x), worldToSceneZ(position.y))
+    const offset = self.current.clone().sub(target)
+    if (offset.lengthSq() < 0.0001) offset.set(1, 0)
+    offset.setLength(AVATAR_APPROACH_DISTANCE)
+    const destination = target.add(offset)
+    return {
+      x: sceneToWorldX(destination.x),
+      y: sceneToWorldY(destination.y),
+    }
+  }
+
+  private emitMoveIntent(target: THREE.Vector2, speed: number, requiresStop = false) {
+    const node = this.selfNode()
+    if (!node) return
+    this.clearSelfTrajectory(node)
+    this.localEchoHoldUntil = performance.now() + SELF_ECHO_HOLD_MS
+    const startX = sceneToWorldX(node.current.x)
+    const startY = sceneToWorldY(node.current.y)
+    const endX = sceneToWorldX(target.x)
+    const endY = sceneToWorldY(target.y)
+    const distance = Math.hypot(endX - startX, endY - startY)
+
+    this.onMove({
+      startX,
+      startY,
+      endX,
+      endY,
+      speed: distance > 0.001 ? speed : 0,
+    })
+    this.lastIntentRequiresStop = requiresStop
+    if (!requiresStop) this.lastKeyboardIntentKey = ''
+  }
+
+  private emitIdleIntent() {
+    if (!this.lastIntentRequiresStop) return
+    const node = this.selfNode()
+    if (!node) return
+    this.clearSelfTrajectory(node)
+    const x = sceneToWorldX(node.current.x)
+    const y = sceneToWorldY(node.current.y)
+    this.onMove({
+      startX: x,
+      startY: y,
+      endX: x,
+      endY: y,
+      speed: 0,
+    })
+    this.lastIntentRequiresStop = false
+    this.lastKeyboardIntentKey = ''
   }
 
   private moveSelf(delta: number, time: number) {
@@ -1077,12 +1449,16 @@ class ThreeOffice {
     if (this.keys.has('w') || this.keys.has('arrowup')) z -= 1
 
     let speed = KEYBOARD_SPEED * WORLD_SCALE
+    let keyboardIntent = false
     if (x !== 0 || z !== 0) {
       this.target = undefined
+      this.clearSelfTrajectory(node)
+      keyboardIntent = true
       const length = Math.hypot(x, z)
       x /= length
       z /= length
     } else if (this.target) {
+      this.clearSelfTrajectory(node)
       const dx = this.target.x - node.current.x
       const dz = this.target.y - node.current.y
       const distance = Math.hypot(dx, dz)
@@ -1098,39 +1474,70 @@ class ThreeOffice {
       }
     }
 
-    if (x === 0 && z === 0) return
+    if (x === 0 && z === 0) {
+      this.emitIdleIntent()
+      return
+    }
 
-    node.current.x += x * speed * (delta / 1000)
-    node.current.y += z * speed * (delta / 1000)
+    if (keyboardIntent) {
+      const intentKey = `${x.toFixed(3)}:${z.toFixed(3)}`
+      if (intentKey !== this.lastKeyboardIntentKey || time - this.lastKeyboardIntentAt >= KEYBOARD_REPUBLISH_MS) {
+        this.lastKeyboardIntentKey = intentKey
+        this.lastKeyboardIntentAt = time
+        const horizonSeconds = KEYBOARD_INTENT_HORIZON_MS / 1000
+        this.emitMoveIntent(
+          new THREE.Vector2(
+            node.current.x + x * KEYBOARD_SPEED * WORLD_SCALE * horizonSeconds,
+            node.current.y + z * KEYBOARD_SPEED * WORLD_SCALE * horizonSeconds,
+          ),
+          KEYBOARD_SPEED,
+          true,
+        )
+      }
+    }
+
+    this.resetCameraTracking()
+    const moveX = x * speed * (delta / 1000)
+    const moveZ = z * speed * (delta / 1000)
+    node.current.x += moveX
+    node.current.y += moveZ
     node.target.copy(node.current)
     node.group.position.set(node.current.x, 0, node.current.y)
+    this.rotateAvatarTowardDelta(node, moveX, moveZ)
     node.walkingUntil = performance.now() + 170
     this.localEchoHoldUntil = performance.now() + SELF_ECHO_HOLD_MS
+  }
 
-    if (time - this.lastEmit > 54 || !this.target) {
-      this.lastEmit = time
-      this.onMove({
-        x: sceneToWorldX(node.current.x),
-        y: sceneToWorldY(node.current.y),
-        vx: x,
-        vy: z,
-      })
+  private rotateAvatarTowardDelta(node: AvatarNode, dx: number, dz: number, amount = 0.28) {
+    if (Math.hypot(dx, dz) <= 0.002) return
+    const direction = Math.atan2(dx, dz)
+    if (Number.isFinite(direction)) {
+      node.group.rotation.y = THREE.MathUtils.lerp(node.group.rotation.y, direction + Math.PI, amount)
     }
   }
 
-  private animateAvatars(time: number, delta: number) {
+  private animateAvatars(time: number, delta: number, wallTime: number) {
     const lerp = 1 - Math.exp(-delta / 118)
     const now = performance.now()
     this.avatars.forEach((node) => {
-      const previous = node.current.clone()
+      if (node.trajectory) {
+        this.trajectoryPointAt(node.trajectory, wallTime, node.target)
+        if (node.target.distanceTo(node.current) > 0.002) node.walkingUntil = now + 120
+      }
+      this.previousAvatarPosition.copy(node.current)
       node.current.lerp(node.target, lerp)
       node.group.position.set(node.current.x, 0, node.current.y)
 
-      const moving = node.current.distanceTo(previous) > 0.002 || now < node.walkingUntil
+      const movedDistance = node.current.distanceTo(this.previousAvatarPosition)
+      const moving = movedDistance > 0.002 || now < node.walkingUntil
       if (moving) {
-        const direction = Math.atan2(node.current.x - previous.x, node.current.y - previous.y)
-        if (Number.isFinite(direction)) {
-          node.group.rotation.y = THREE.MathUtils.lerp(node.group.rotation.y, direction + Math.PI, 0.18)
+        if (movedDistance > 0.002) {
+          this.rotateAvatarTowardDelta(
+            node,
+            node.current.x - this.previousAvatarPosition.x,
+            node.current.y - this.previousAvatarPosition.y,
+            0.18,
+          )
         }
       }
 
@@ -1144,21 +1551,80 @@ class ThreeOffice {
     })
   }
 
-  private updateCamera(delta: number) {
-    const self = this.selfNode()
-    if (self) {
-      this.setCameraDesired(self.current.x, self.current.y)
-    } else if (this.snapshot?.positions[0]) {
-      this.setCameraDesired(worldToSceneX(this.snapshot.positions[0].x), worldToSceneZ(this.snapshot.positions[0].y))
+  private trajectoryForPosition(position: WorldPosition): AvatarTrajectory | undefined {
+    if (
+      typeof position.startX !== 'number' ||
+      typeof position.startY !== 'number' ||
+      typeof position.targetX !== 'number' ||
+      typeof position.targetY !== 'number' ||
+      typeof position.speed !== 'number' ||
+      typeof position.sentAt !== 'number'
+    ) {
+      return undefined
     }
 
+    return {
+      start: new THREE.Vector2(worldToSceneX(position.startX), worldToSceneZ(position.startY)),
+      end: new THREE.Vector2(worldToSceneX(position.targetX), worldToSceneZ(position.targetY)),
+      speed: position.speed * WORLD_SCALE,
+      sentAt: position.sentAt,
+    }
+  }
+
+  private trajectoryPointAt(trajectory: AvatarTrajectory, at: number, target = new THREE.Vector2()) {
+    this.trajectoryDelta.copy(trajectory.end).sub(trajectory.start)
+    const distance = this.trajectoryDelta.length()
+    if (trajectory.speed <= 0 || distance <= 0) return target.copy(trajectory.end)
+    const durationMs = (distance / trajectory.speed) * 1000
+    const progress = THREE.MathUtils.clamp((at - trajectory.sentAt) / durationMs, 0, 1)
+    return target.copy(trajectory.start).lerp(trajectory.end, progress)
+  }
+
+  private updateCamera(delta: number) {
+    const self = this.selfNode()
+    if (!this.cameraDetached && self) {
+      this.setCameraDesired(self.current.x, self.current.y)
+    }
+
+    this.updateCameraZoom(delta)
     const follow = 1 - Math.exp(-delta / 190)
     this.cameraCenter.lerp(this.cameraDesired, follow)
     this.applyCameraTransform()
   }
 
+  private updateCameraZoom(delta: number) {
+    if (this.cameraViewScale === this.cameraTargetViewScale) return
+    const previousScale = this.cameraViewScale
+    const zoom = 1 - Math.exp(-delta / CAMERA_ZOOM_RESET_MS)
+    this.cameraViewScale = THREE.MathUtils.lerp(this.cameraViewScale, this.cameraTargetViewScale, zoom)
+    if (Math.abs(this.cameraViewScale - this.cameraTargetViewScale) < 0.003) {
+      this.cameraViewScale = this.cameraTargetViewScale
+    }
+    if (this.cameraViewScale !== previousScale) this.applyCameraProjection()
+  }
+
   private setCameraDesired(x: number, z: number) {
     this.cameraDesired.set(x, 0, z)
+  }
+
+  private panCameraByPixels(dx: number, dy: number) {
+    const viewHeight = this.currentViewHeight()
+    const unitsPerPixelX = (viewHeight * this.cameraAspect()) / Math.max(this.host.clientWidth, 1)
+    const unitsPerPixelY = viewHeight / Math.max(this.host.clientHeight, 1)
+    this.cameraDetached = true
+    this.cameraTargetViewScale = this.cameraViewScale
+    this.cameraDesired.x -= dx * unitsPerPixelX
+    this.cameraDesired.z -= dy * unitsPerPixelY
+    this.cameraCenter.copy(this.cameraDesired)
+    this.applyCameraTransform()
+  }
+
+  private resetCameraTracking() {
+    if (!this.cameraDetached && this.cameraTargetViewScale === 1) return
+    this.cameraDetached = false
+    this.cameraTargetViewScale = 1
+    const self = this.selfNode()
+    if (self) this.snapCameraTo(self.current.x, self.current.y)
   }
 
   private snapCameraTo(x: number, z: number) {
@@ -1177,15 +1643,25 @@ class ThreeOffice {
     if (!this.snapshot) return
     const centerX = Math.floor(this.cameraCenter.x / CHUNK_SIZE)
     const centerZ = Math.floor(this.cameraCenter.z / CHUNK_SIZE)
-    const key = `${this.snapshot.map.seed.slice(0, 10)}:${centerX}:${centerZ}:${this.assetVersion}`
-    if (!force && key === this.lastWorldKey) return
-    this.lastWorldKey = key
+    if (
+      !force &&
+      this.worldSeed === this.snapshot.map.seed &&
+      this.worldAssetVersion === this.assetVersion &&
+      Math.abs(centerX - this.worldCenterChunkX) <= WORLD_REBUILD_HYSTERESIS_CHUNKS &&
+      Math.abs(centerZ - this.worldCenterChunkZ) <= WORLD_REBUILD_HYSTERESIS_CHUNKS
+    ) {
+      return
+    }
+    this.worldSeed = this.snapshot.map.seed
+    this.worldAssetVersion = this.assetVersion
+    this.worldCenterChunkX = centerX
+    this.worldCenterChunkZ = centerZ
     this.worldRoot.clear()
 
     this.addSoftFloorWash()
     const candidates: RoomPlan[] = []
-    for (let chunkZ = centerZ - ROOM_RANGE; chunkZ <= centerZ + ROOM_RANGE; chunkZ += 1) {
-      for (let chunkX = centerX - ROOM_RANGE; chunkX <= centerX + ROOM_RANGE; chunkX += 1) {
+    for (let chunkZ = centerZ - ROOM_BUFFER_RANGE; chunkZ <= centerZ + ROOM_BUFFER_RANGE; chunkZ += 1) {
+      for (let chunkX = centerX - ROOM_BUFFER_RANGE; chunkX <= centerX + ROOM_BUFFER_RANGE; chunkX += 1) {
         for (let index = 0; index < 2; index += 1) {
           const room = roomForChunk(this.snapshot.map.seed, chunkX, chunkZ, index)
           if (room) candidates.push(room)
@@ -1196,9 +1672,9 @@ class ThreeOffice {
     const rooms: RoomPlan[] = []
     candidates
       .sort((a, b) => {
-        const distanceA = Math.hypot(a.x - this.cameraCenter.x, a.z - this.cameraCenter.z)
-        const distanceB = Math.hypot(b.x - this.cameraCenter.x, b.z - this.cameraCenter.z)
-        if (distanceA !== distanceB) return distanceA - distanceB
+        const priorityA = roomPriority(a)
+        const priorityB = roomPriority(b)
+        if (priorityA !== priorityB) return priorityA - priorityB
         return a.id.localeCompare(b.id)
       })
       .forEach((candidate) => {
@@ -1210,13 +1686,7 @@ class ThreeOffice {
   }
 
   private addSoftFloorWash() {
-    const lightMaterial = new THREE.MeshBasicMaterial({
-      color: 0xffffff,
-      opacity: 0.055,
-      transparent: true,
-      depthWrite: false,
-    })
-    const mesh = new THREE.Mesh(new THREE.CircleGeometry(46, 72), lightMaterial)
+    const mesh = new THREE.Mesh(softFloorWashGeometry, softFloorWashMaterial)
     mesh.rotation.x = -Math.PI / 2
     mesh.position.set(this.cameraCenter.x, 0.021, this.cameraCenter.z)
     this.worldRoot.add(mesh)
@@ -1263,18 +1733,22 @@ class ThreeOffice {
     })
 
     positions.forEach((position) => {
-      const label = labels.get(position.pubkey) ?? this.labelFor(position, users.get(position.pubkey))
+      const user = users.get(position.pubkey)
+      const label = labels.get(position.pubkey) ?? this.labelFor(position, user)
+      const labelAvatarKey = profileImageKey(userProfileImageCandidates(user))
       const isSelf = this.canPlaceSelf && position.pubkey === this.snapshot?.selfPubkey
+      const trajectory = this.trajectoryForPosition(position)
+      const current = trajectory ? this.trajectoryPointAt(trajectory, Date.now()) : new THREE.Vector2(worldToSceneX(position.x), worldToSceneZ(position.y))
+      const target = trajectory?.end ?? new THREE.Vector2(worldToSceneX(position.x), worldToSceneZ(position.y))
       let node = this.avatars.get(position.pubkey)
       if (!node) {
         node = createAvatar(position.pubkey, label)
         node.group.userData.pubkey = position.pubkey
         node.label.userData.pubkey = position.pubkey
-        const x = worldToSceneX(position.x)
-        const z = worldToSceneZ(position.y)
-        node.current.set(x, z)
-        node.target.set(x, z)
-        node.group.position.set(x, 0, z)
+        node.current.copy(current)
+        node.target.copy(target)
+        node.trajectory = trajectory
+        node.group.position.set(current.x, 0, current.y)
         if (isSelf) {
           const ring = new THREE.Mesh(new THREE.CircleGeometry(3.05, 56), ringMaterial)
           ring.rotation.x = -Math.PI / 2
@@ -1285,25 +1759,20 @@ class ThreeOffice {
         this.avatars.set(position.pubkey, node)
       }
 
+      if (node.labelAvatarKey !== labelAvatarKey) {
+        node.labelAvatarKey = labelAvatarKey
+        if (labelAvatarKey) void this.refreshAvatarLabelImage(position.pubkey, label, labelAvatarKey)
+      }
+
       if (isSelf && this.followedSelfPubkey !== position.pubkey) {
         this.followedSelfPubkey = position.pubkey
         this.snapCameraTo(node.current.x, node.current.y)
       }
 
       if (node.labelText !== label) {
-        node.group.remove(node.label)
-        node.label = makeTextSprite(label, {
-          background: 'rgba(32, 34, 39, 0.92)',
-          color: '#ffffff',
-          fontSize: 24,
-          padding: 12,
-          chipColor: label ? avatarFromPubkey(position.pubkey).body : undefined,
-        })
-        node.label.position.set(0, 1.78, 0)
-        node.label.visible = Boolean(label)
-        node.label.userData.pubkey = position.pubkey
-        node.group.add(node.label)
+        this.replaceAvatarLabel(position.pubkey, label)
         node.labelText = label
+        if (labelAvatarKey) void this.refreshAvatarLabelImage(position.pubkey, label, labelAvatarKey)
       }
 
       if (
@@ -1311,15 +1780,34 @@ class ThreeOffice {
         position.pubkey === this.snapshot?.selfPubkey &&
         performance.now() < this.localEchoHoldUntil
       ) {
+        node.trajectory = undefined
         node.target.copy(node.current)
         return
       }
 
-      const target = new THREE.Vector2(worldToSceneX(position.x), worldToSceneZ(position.y))
+      node.trajectory = trajectory
       if (target.distanceTo(node.target) > 0.02) node.walkingUntil = performance.now() + 260
       node.target.copy(target)
       node.lastSnapshotAt = position.updatedAt
     })
+  }
+
+  private replaceAvatarLabel(pubkey: string, label: string, image?: HTMLImageElement) {
+    const node = this.avatars.get(pubkey)
+    if (!node) return
+    node.group.remove(node.label)
+    node.label = createLabelSprite(pubkey, label, image)
+    node.label.position.set(0, 1.78, 0)
+    node.label.visible = Boolean(label)
+    node.label.userData.pubkey = pubkey
+    node.group.add(node.label)
+  }
+
+  private async refreshAvatarLabelImage(pubkey: string, label: string, labelAvatarKey: string) {
+    const image = await loadFirstProfileImage(labelAvatarKey.split('|').filter(Boolean))
+    const node = this.avatars.get(pubkey)
+    if (!node || node.labelAvatarKey !== labelAvatarKey || node.labelText !== label || !image) return
+    this.replaceAvatarLabel(pubkey, label, image)
   }
 
   private avatarLabels(users: Map<string, MockUser>) {
@@ -1403,7 +1891,12 @@ export function OfficeRenderer({ snapshot, onMove, canPlaceSelf = true }: Office
 
   return (
     <div ref={hostRef} className="office-canvas" data-testid="office-canvas">
-      <EdgePresenceOverlay snapshot={snapshot} size={size} />
+      <EdgePresenceOverlay
+        snapshot={snapshot}
+        size={size}
+        canMove={canPlaceSelf}
+        onMoveTo={(position) => rendererRef.current?.moveSelfNear(position)}
+      />
     </div>
   )
 }
@@ -1411,9 +1904,13 @@ export function OfficeRenderer({ snapshot, onMove, canPlaceSelf = true }: Office
 function EdgePresenceOverlay({
   snapshot,
   size,
+  canMove,
+  onMoveTo,
 }: {
   snapshot: OfficeSceneSnapshot
   size: { width: number; height: number }
+  canMove: boolean
+  onMoveTo: (position: JumpTarget) => void
 }) {
   const markers = useMemo(() => {
     const self = snapshot.positions.find((position) => position.pubkey === snapshot.selfPubkey)
@@ -1440,6 +1937,9 @@ function EdgePresenceOverlay({
         return {
           pubkeys: [position.pubkey],
           label: users.get(position.pubkey)?.name ?? 'npub',
+          imageUrl: userProfileImageCandidates(users.get(position.pubkey))[0],
+          x: position.x,
+          y: position.y,
           left,
           top,
           angle: Math.atan2(ny, nx),
@@ -1448,6 +1948,9 @@ function EdgePresenceOverlay({
       .filter(Boolean) as Array<{
       pubkeys: string[]
       label: string
+      imageUrl?: string
+      x: number
+      y: number
       left: number
       top: number
       angle: number
@@ -1461,6 +1964,9 @@ function EdgePresenceOverlay({
         return
       }
       existing.pubkeys.push(...marker.pubkeys)
+      existing.imageUrl = undefined
+      existing.x = (existing.x + marker.x) / 2
+      existing.y = (existing.y + marker.y) / 2
       existing.left = (existing.left + marker.left) / 2
       existing.top = (existing.top + marker.top) / 2
       existing.angle = Math.atan2(
@@ -1476,21 +1982,43 @@ function EdgePresenceOverlay({
   if (markers.length === 0) return null
 
   return (
-    <div className="edge-presence-layer" aria-hidden="true">
-      {markers.map((marker) => (
-        <div
-          key={marker.pubkeys.join(':')}
-          className="edge-presence-chip"
-          style={{
-            left: `${marker.left}%`,
-            top: `${marker.top}%`,
-            ['--edge-angle' as string]: `${marker.angle}rad`,
-          }}
-        >
-          <span className="edge-presence-arrow" />
-          <span>{marker.label}</span>
-        </div>
-      ))}
+    <div className="edge-presence-layer">
+      {markers.map((marker) => {
+        const avatar = marker.pubkeys.length === 1 ? avatarFromPubkey(marker.pubkeys[0]) : null
+        const style = {
+          left: `${marker.left}%`,
+          top: `${marker.top}%`,
+          ['--edge-angle']: `${marker.angle}rad`,
+          ...(avatar
+            ? {
+                '--avatar-body': avatar.body,
+                '--avatar-trim': avatar.trim,
+                '--avatar-skin': avatar.skin,
+                '--avatar-hair': avatar.hair,
+              }
+            : {}),
+        } as CSSProperties
+
+        return (
+          <button
+            type="button"
+            key={marker.pubkeys.join(':')}
+            className="edge-presence-chip"
+            style={style}
+            disabled={!canMove}
+            aria-label={`Move near ${marker.label}`}
+            onClick={() => onMoveTo({ x: marker.x, y: marker.y })}
+          >
+            <span className="edge-presence-arrow" />
+            {avatar && (
+              <span className={`edge-presence-avatar ${marker.imageUrl ? 'has-image' : ''}`}>
+                {marker.imageUrl && <img src={marker.imageUrl} alt="" referrerPolicy="no-referrer" />}
+              </span>
+            )}
+            <span>{marker.label}</span>
+          </button>
+        )
+      })}
     </div>
   )
 }

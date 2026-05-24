@@ -48,15 +48,33 @@ describe('mock NIP-29 relay', () => {
     expect(latestDm?.attachments?.[0]).toMatchObject(attachment)
   })
 
-  it('keeps office movement ephemeral while updating active positions', () => {
+  it('publishes office movement as ephemeral position events', () => {
     const relay = createMockRelay()
     const user = relay.snapshot().users[0]
     const before = relay.snapshot().eventCount
-    const result = relay.publishPosition(user.pubkey, 120, 160, 1, 0)
+    const result = relay.publishPosition(user.pubkey, {
+      startX: 120,
+      startY: 160,
+      endX: 220,
+      endY: 160,
+      speed: 100,
+    })
     const after = relay.snapshot()
     expect(result.ok).toBe(true)
     expect(after.eventCount).toBe(before)
-    expect(after.positions.find((position) => position.pubkey === user.pubkey)?.x).toBe(120)
+    const position = after.positions.find((candidate) => candidate.pubkey === user.pubkey)
+    expect(position?.x).toBeGreaterThanOrEqual(120)
+    expect(position?.x).toBeLessThan(130)
+
+    const replacement = relay.publishPosition(user.pubkey, {
+      startX: 220,
+      startY: 160,
+      endX: 320,
+      endY: 160,
+      speed: 100,
+    })
+    expect(replacement.ok).toBe(true)
+    expect(relay.snapshot().eventCount).toBe(before)
   })
 
   it('rejects malformed group events without the h tag', () => {

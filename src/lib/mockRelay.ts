@@ -34,9 +34,25 @@ import {
   type OfficeMap,
   type WorldPosition,
 } from './world'
-import { facingFromVelocity, parsePositionPayload, positionEventTime } from './positionEvents'
+import {
+  createPositionPayload,
+  parsePositionPayload,
+  resolveWorldPosition,
+  worldPositionFromPayload,
+  type PositionMovement,
+} from './positionEvents'
 
 const encoder = new TextEncoder()
+
+function isOfficePositionKind(kind: number) {
+  return kind === OFFICE_KINDS.avatarPosition
+}
+
+function replaceableEventKey(event: NestrEvent) {
+  if (event.kind < 30000 || event.kind >= 40000) return ''
+  const d = tagValue(event, 'd')
+  return d ? `${event.kind}:${event.pubkey}:${d}` : ''
+}
 
 export interface MockUser {
   pubkey: string
@@ -75,6 +91,7 @@ export interface RelaySnapshot {
   connectionLog?: string[]
   roomAccessStatus?: 'unknown' | 'open' | 'auth-required' | 'blocked' | 'closed'
   roomAccessMessage?: string
+  relayUrls?: string[]
   group: Nip29Group
   relayGroups: NestrEvent[]
   users: MockUser[]
@@ -163,6 +180,7 @@ export class MockNip29Relay {
   private readonly memberPubkeys = new Set<string>()
   private readonly adminRoles = new Map<string, string[]>()
   private readonly deletedEventIds = new Set<string>()
+  private lastSignedPositionEvent?: NestrEvent
   private group: Nip29Group
 
   constructor(options: MockRelayOptions = {}) {
@@ -261,7 +279,7 @@ export class MockNip29Relay {
       moderationEvents,
       invites: this.events.filter((event) => event.kind === NIP29_KINDS.createInvite),
       deletedEventIds: Array.from(this.deletedEventIds),
-      positions: Array.from(this.positions.values()),
+      positions: Array.from(this.positions.values()).map((position) => resolveWorldPosition(position)),
       presence: Object.fromEntries(this.activityAt),
       eventCount: this.events.length,
     }
@@ -305,7 +323,13 @@ export class MockNip29Relay {
     this.refreshGroupStateEvents()
     const map = buildOfficeMap(this.groupId, this.users.size)
     const spawn = spawnForPubkey(map, pubkey, this.users.size)
-    this.publishPosition(pubkey, spawn.x, spawn.y, 0, 0)
+    this.publishPosition(pubkey, {
+      startX: spawn.x,
+      startY: spawn.y,
+      endX: spawn.x,
+      endY: spawn.y,
+      speed: 0,
+    })
     this.emit()
     return user
   }
@@ -383,28 +407,38 @@ export class MockNip29Relay {
 
   publishPosition(
     pubkey: string,
-    x: number,
-    y: number,
-    vx: number,
-    vy: number,
-    createdAt = Date.now(),
+    movement: PositionMovement,
+    sentAt = Date.now(),
   ) {
     const user = this.users.get(pubkey)
     if (!user) return { ok: false, reason: 'unknown-user' }
 
-    const facing = facingFromVelocity(vx, vy)
+    const payload = createPositionPayload(movement, sentAt)
     const template = {
       kind: OFFICE_KINDS.avatarPosition,
       pubkey,
-      created_at: Math.floor(createdAt / 1000),
-      tags: [groupTag(this.groupId), ['relay', this.relayUrl]],
-      content: JSON.stringify({ x, y, vx, vy, facing, sentAt: createdAt }),
+      created_at: now(),
+      tags: [
+        groupTag(this.groupId),
+        ['relay', this.relayUrl],
+        ['client', 'nestr'],
+      ],
+      content: payload,
     }
 
     const event = user.secretKey
       ? sign(template, user.secretKey)
       : mockSignature(template)
 
+    this.lastSignedPositionEvent = event
+    return this.publish(event)
+  }
+
+  republishLastPosition(pubkey: string) {
+    const event = this.lastSignedPositionEvent
+    if (!event || event.pubkey !== pubkey || !isOfficePositionKind(event.kind)) {
+      return { ok: false, reason: 'position-refresh-missing' }
+    }
     return this.publish(event)
   }
 
@@ -448,8 +482,16 @@ export class MockNip29Relay {
     return this.publishAdminEvent(pubkey, NIP29_KINDS.removeUser, [['p', target]], content)
   }
 
-  publishEditMetadata(pubkey: string, draft: Nip29MetadataDraft, content = '') {
-    return this.publishAdminEvent(pubkey, NIP29_KINDS.editMetadata, metadataTags(this.groupId, draft).slice(1), content)
+  publishEditMetadata(pubkey: string, draft: Nip29MetadataDraft, content = '', targetGroupId = this.groupId) {
+    const groupId = targetGroupId.trim()
+    if (!groupId) return { ok: false, reason: 'group-required' }
+    return this.publishAdminEvent(
+      pubkey,
+      NIP29_KINDS.editMetadata,
+      metadataTags(groupId, draft).slice(1),
+      content,
+      groupId,
+    )
   }
 
   publishDeleteEvent(pubkey: string, eventId: string, content = '') {
@@ -465,6 +507,7 @@ export class MockNip29Relay {
 
     const event = this.signUserEvent(pubkey, NIP29_KINDS.createGroup, [
       groupTag(groupId),
+      ['name', content.trim() || groupId],
       ['client', 'nestr'],
     ], content.trim())
 
@@ -500,30 +543,26 @@ export class MockNip29Relay {
       return { ok: false, reason: 'restricted: signer cannot perform this chatroom action' }
     }
 
-    if (event.kind === OFFICE_KINDS.avatarPosition) {
+    if (isOfficePositionKind(event.kind)) {
       const payload = parsePositionPayload(event.content)
-      this.positions.set(event.pubkey, {
-        pubkey: event.pubkey,
-        x: payload.x,
-        y: payload.y,
-        vx: payload.vx,
-        vy: payload.vy,
-        facing: payload.facing,
-        updatedAt: Date.now(),
-        eventTime: positionEventTime(event, payload),
-        eventId: event.id,
-        sequence: payload.seq,
-      })
+      this.positions.set(event.pubkey, worldPositionFromPayload(event.pubkey, event, payload))
     }
 
-    this.recordActivity(event.pubkey, event.created_at * 1000)
+    this.recordActivity(event.pubkey, isOfficePositionKind(event.kind) ? Date.now() : event.created_at * 1000)
 
     if (isNip29ModerationKind(event.kind)) {
       this.applyModerationEvent(event)
     }
 
     if (!isEphemeralKind(event.kind)) {
-      this.events.push(event)
+      const replaceableKey = replaceableEventKey(event)
+      if (replaceableKey) {
+        const index = this.events.findIndex((existing) => replaceableEventKey(existing) === replaceableKey)
+        if (index >= 0) this.events.splice(index, 1, event)
+        else this.events.push(event)
+      } else {
+        this.events.push(event)
+      }
       this.persist()
     }
 
@@ -538,22 +577,29 @@ export class MockNip29Relay {
     Array.from(this.users.values())
       .filter((user) => user.pubkey !== excludePubkey && !frozen.has(user.pubkey))
       .forEach((user, index) => {
-        const current = this.positions.get(user.pubkey) ?? {
+        const current = resolveWorldPosition(this.positions.get(user.pubkey) ?? {
           pubkey: user.pubkey,
           ...spawnForPubkey(map, user.pubkey, index),
           vx: 0,
           vy: 0,
           facing: 'south' as const,
           updatedAt: timestamp,
-        }
+        }, timestamp)
         const driftSeed = Number.parseInt(user.pubkey.slice(index, index + 4), 16)
         const angle = timestamp / (1800 + (driftSeed % 900)) + index
         const vx = Math.cos(angle) * 0.55
         const vy = Math.sin(angle * 0.8) * 0.5
         const x = current.x + vx * 28
         const y = current.y + vy * 28
+        const distance = Math.hypot(x - current.x, y - current.y)
 
-        this.publishPosition(user.pubkey, x, y, vx, vy, timestamp)
+        this.publishPosition(user.pubkey, {
+          startX: current.x,
+          startY: current.y,
+          endX: x,
+          endY: y,
+          speed: distance / 0.56,
+        }, timestamp - 560)
       })
   }
 
@@ -607,8 +653,8 @@ export class MockNip29Relay {
     return user.secretKey ? sign(template, user.secretKey) : mockSignature(template)
   }
 
-  private publishAdminEvent(pubkey: string, kind: number, tags: string[][], content = '') {
-    return this.publish(this.signUserEvent(pubkey, kind, [groupTag(this.groupId), ...tags, ['client', 'nestr']], content.trim()))
+  private publishAdminEvent(pubkey: string, kind: number, tags: string[][], content = '', targetGroupId = this.groupId) {
+    return this.publish(this.signUserEvent(pubkey, kind, [groupTag(targetGroupId), ...tags, ['client', 'nestr']], content.trim()))
   }
 
   private publishRelayModeration(kind: number, tags: string[][], content = '') {

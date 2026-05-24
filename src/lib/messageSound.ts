@@ -43,3 +43,25 @@ export function playMessageSound() {
   oscillator.start(start)
   oscillator.stop(start + 0.18)
 }
+
+export function playCallJoinSound() {
+  const context = getAudioContext()
+  if (!context || context.state === 'suspended') return
+
+  const start = context.currentTime
+  const gain = context.createGain()
+  gain.gain.setValueAtTime(0.0001, start)
+  gain.gain.exponentialRampToValueAtTime(0.065, start + 0.018)
+  gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.34)
+  gain.connect(context.destination)
+
+  const tones = [440, 660]
+  tones.forEach((frequency, index) => {
+    const oscillator = context.createOscillator()
+    oscillator.type = 'triangle'
+    oscillator.frequency.setValueAtTime(frequency, start + index * 0.08)
+    oscillator.connect(gain)
+    oscillator.start(start + index * 0.08)
+    oscillator.stop(start + 0.28 + index * 0.06)
+  })
+}
