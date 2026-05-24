@@ -11,6 +11,7 @@ export interface SimpleGroupsList {
   event: NestrEvent
   groups: SimpleGroupPointer[]
   relays: string[]
+  explicitRelayUrls: string[]
 }
 
 export function parseSimpleGroupsEvent(event: NestrEvent): SimpleGroupsList | null {
@@ -18,6 +19,7 @@ export function parseSimpleGroupsEvent(event: NestrEvent): SimpleGroupsList | nu
 
   const groups: SimpleGroupPointer[] = []
   const relays: string[] = []
+  const explicitRelayUrls: string[] = []
   const seenGroups = new Set<string>()
 
   event.tags.forEach((tag) => {
@@ -40,7 +42,10 @@ export function parseSimpleGroupsEvent(event: NestrEvent): SimpleGroupsList | nu
 
     if (tag[0] === 'r') {
       const relayUrl = normalizeRelayUrl(tag[1] ?? '')
-      if (relayUrl) relays.push(relayUrl)
+      if (relayUrl) {
+        relays.push(relayUrl)
+        explicitRelayUrls.push(relayUrl)
+      }
     }
   })
 
@@ -48,5 +53,6 @@ export function parseSimpleGroupsEvent(event: NestrEvent): SimpleGroupsList | nu
     event,
     groups,
     relays: uniqueRelayUrls(relays),
+    explicitRelayUrls: uniqueRelayUrls(explicitRelayUrls),
   }
 }

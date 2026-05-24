@@ -59,6 +59,7 @@ export const NESTR_NIP46_PERMISSIONS = [
   'sign_event:9009',
   'sign_event:9021',
   'sign_event:9022',
+  'sign_event:10009',
   'sign_event:25050',
   'sign_event:25051',
   'sign_event:25052',

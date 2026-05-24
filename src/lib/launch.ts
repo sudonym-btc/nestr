@@ -2,7 +2,7 @@ export interface LandingLaunch {
   mode: 'landing'
 }
 
-export type LaunchView = 'relay' | 'group' | 'dm'
+export type LaunchView = 'home' | 'relay' | 'group' | 'dm'
 
 export interface MockLaunch {
   mode: 'mock'
@@ -78,7 +78,14 @@ export function parseLaunch(search = globalThis.location?.search ?? ''): LaunchC
   const params = new URLSearchParams(search)
   const groupId = params.get('c') ?? params.get('group') ?? params.get('h')
   const relay = params.get('relay')
-  const view = params.get('view') === 'dm' ? 'dm' : params.get('view') === 'relay' ? 'relay' : undefined
+  const view =
+    params.get('view') === 'dm'
+      ? 'dm'
+      : params.get('view') === 'home'
+        ? 'home'
+        : params.get('view') === 'relay'
+          ? 'relay'
+          : undefined
   const initialView = view ?? (groupId ? 'group' : 'relay')
   const nostrConnectRelays = relayListParams(params, [
     'connectRelay',

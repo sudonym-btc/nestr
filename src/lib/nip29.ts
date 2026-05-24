@@ -58,9 +58,63 @@ export function adminRoleMap(event: Pick<NestrEvent, 'tags'>) {
 }
 
 export function supportedRoleTags(event: Pick<NestrEvent, 'tags'>) {
-  return event.tags
+  const roles = new Map<
+    string,
+    {
+      name: string
+      description: string
+      label: string
+      color: string
+      order: number | null
+      permissions: string[]
+      access: string[]
+    }
+  >()
+
+  const ensureRole = (name: string) => {
+    const existing = roles.get(name)
+    if (existing) return existing
+    const role = {
+      name,
+      description: '',
+      label: name,
+      color: '',
+      order: null,
+      permissions: [] as string[],
+      access: [] as string[],
+    }
+    roles.set(name, role)
+    return role
+  }
+
+  event.tags
     .filter((tag) => tag[0] === 'role' && tag[1])
-    .map((tag) => ({ name: tag[1], description: tag[2] ?? '' }))
+    .forEach((tag) => {
+      const role = ensureRole(tag[1])
+      role.description = tag[2] ?? ''
+      tag.slice(3).filter(Boolean).forEach((permission) => role.permissions.push(permission))
+    })
+
+  event.tags.forEach((tag) => {
+    const roleName = tag[1]
+    if (!roleName) return
+    const role = ensureRole(roleName)
+    if (tag[0] === 'role-label') role.label = tag[2] || role.name
+    if (tag[0] === 'role-color') role.color = tag[2] ?? ''
+    if (tag[0] === 'role-order') {
+      const order = Number(tag[2])
+      role.order = Number.isFinite(order) ? order : null
+    }
+    if (tag[0] === 'role-permission' && tag[2]) role.permissions.push(tag[2])
+    if (tag[0] === 'role-access' && tag[2]) role.access.push(tag[2])
+  })
+
+  return Array.from(roles.values()).sort((a, b) => {
+    if (a.order !== null && b.order !== null) return a.order - b.order
+    if (a.order !== null) return -1
+    if (b.order !== null) return 1
+    return a.name.localeCompare(b.name)
+  })
 }
 
 export function targetPubkey(event: Pick<NestrEvent, 'tags'>) {

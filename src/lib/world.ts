@@ -53,6 +53,11 @@ export interface WorldPosition {
   moving?: boolean
 }
 
+export interface SpawnAvoidanceTarget {
+  x: number
+  y: number
+}
+
 function hashSeed(value: string) {
   return bytesToHex(sha256(encoder.encode(value)))
 }
@@ -149,4 +154,63 @@ export function spawnForPubkey(map: OfficeMap, pubkey: string, index = 0) {
     x: tileX * map.tileSize + map.tileSize / 2,
     y: tileY * map.tileSize + map.tileSize / 2,
   }
+}
+
+function nearestDistance(spawn: SpawnAvoidanceTarget, targets: SpawnAvoidanceTarget[]) {
+  return targets.reduce(
+    (nearest, target) => Math.min(nearest, Math.hypot(target.x - spawn.x, target.y - spawn.y)),
+    Number.POSITIVE_INFINITY,
+  )
+}
+
+export function spawnAwayFromPositions(
+  map: OfficeMap,
+  pubkey: string,
+  index = 0,
+  avoid: SpawnAvoidanceTarget[] = [],
+  minDistance = map.tileSize * 5,
+) {
+  const targets = avoid.filter((target) => Number.isFinite(target.x) && Number.isFinite(target.y))
+  const preferred = spawnForPubkey(map, pubkey, index)
+  if (targets.length === 0) return preferred
+
+  let safest = preferred
+  let safestNearest = nearestDistance(preferred, targets)
+  let safestPreferredDistance = 0
+  let closestSafe:
+    | {
+        spawn: SpawnAvoidanceTarget
+        nearest: number
+        preferredDistance: number
+      }
+    | null = safestNearest >= minDistance
+      ? { spawn: preferred, nearest: safestNearest, preferredDistance: 0 }
+      : null
+
+  const candidateCount = Math.max(96, map.zones.length * 32)
+  for (let offset = 1; offset <= candidateCount; offset += 1) {
+    const candidate = spawnForPubkey(map, pubkey, index + offset)
+    const nearest = nearestDistance(candidate, targets)
+    const preferredDistance = Math.hypot(candidate.x - preferred.x, candidate.y - preferred.y)
+
+    if (
+      nearest > safestNearest ||
+      (nearest === safestNearest && preferredDistance < safestPreferredDistance)
+    ) {
+      safest = candidate
+      safestNearest = nearest
+      safestPreferredDistance = preferredDistance
+    }
+
+    if (nearest < minDistance) continue
+    if (
+      !closestSafe ||
+      preferredDistance < closestSafe.preferredDistance ||
+      (preferredDistance === closestSafe.preferredDistance && nearest > closestSafe.nearest)
+    ) {
+      closestSafe = { spawn: candidate, nearest, preferredDistance }
+    }
+  }
+
+  return closestSafe?.spawn ?? safest
 }

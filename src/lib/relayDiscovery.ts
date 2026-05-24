@@ -1,7 +1,5 @@
 import { tagValue, type NestrEvent } from './nostr'
 
-export const SAVED_RELAYS_STORAGE_KEY = 'nestr/relays'
-
 export function normalizeRelayUrl(value: string) {
   const trimmed = value.trim()
   if (!trimmed) return ''
@@ -41,25 +39,4 @@ export function withRelayTag(event: NestrEvent, relayUrl: string): NestrEvent {
     ...event,
     tags: [...event.tags.filter((tag) => tag[0] !== 'relay'), ['relay', normalized]],
   }
-}
-
-function browserStorage() {
-  return typeof window === 'undefined' ? undefined : window.localStorage
-}
-
-export function readSavedRelayUrls(storage: Pick<Storage, 'getItem'> | undefined = browserStorage()) {
-  if (!storage) return []
-  try {
-    const raw = storage.getItem(SAVED_RELAYS_STORAGE_KEY)
-    if (!raw) return []
-    const parsed = JSON.parse(raw) as unknown
-    return Array.isArray(parsed) ? uniqueRelayUrls(parsed.filter((value): value is string => typeof value === 'string')) : []
-  } catch {
-    return []
-  }
-}
-
-export function writeSavedRelayUrls(relays: readonly string[], storage: Pick<Storage, 'setItem'> | undefined = browserStorage()) {
-  if (!storage) return
-  storage.setItem(SAVED_RELAYS_STORAGE_KEY, JSON.stringify(uniqueRelayUrls(relays)))
 }

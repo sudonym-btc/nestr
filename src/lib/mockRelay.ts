@@ -91,7 +91,17 @@ export interface RelaySnapshot {
   connectionLog?: string[]
   roomAccessStatus?: 'unknown' | 'open' | 'auth-required' | 'blocked' | 'closed'
   roomAccessMessage?: string
+  relayError?: {
+    id: string
+    kind?: number
+    eventId?: string
+    message: string
+    createdAt: number
+  }
   relayUrls?: string[]
+  savedRelayUrls?: string[]
+  savedGroupsLoading?: boolean
+  savedGroupKeys?: string[]
   group: Nip29Group
   relayGroups: NestrEvent[]
   users: MockUser[]
@@ -270,6 +280,8 @@ export class MockNip29Relay {
       connectionLog: [this.authRequired ? 'local development relay' : 'local open development relay'],
       roomAccessStatus: 'open',
       roomAccessMessage: 'local room open',
+      savedGroupsLoading: false,
+      savedGroupKeys: [],
       group: this.group,
       relayGroups: Array.from(this.relayGroupEvents.values()),
       users: Array.from(this.users.values()),

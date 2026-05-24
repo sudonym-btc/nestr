@@ -6,9 +6,17 @@ import {
   profileNameFromContent,
   profilePictureFromContent,
 } from './profileImages'
-import { LiveNip29Relay, directMessageSubscriptionFilters, roleLabelFromState } from './liveRelay'
-import type { NestrEvent, NestrEventTemplate } from './nostr'
+import {
+  LiveNip29Relay,
+  directMessageSubscriptionFilters,
+  legacyDirectMessageReadFilters,
+  legacyDirectMessageWriteFilters,
+  nip17DirectMessageSubscriptionFilters,
+  roleLabelFromState,
+} from './liveRelay'
+import { NIP29_KINDS, NIP51_KINDS, OFFICE_KINDS, type NestrEvent, type NestrEventTemplate } from './nostr'
 import { POSITION_REBROADCAST_RESIGN_AFTER_MS } from './positionEvents'
+import { relayGroupKey, relayUrlFromGroupEvent } from './relayDiscovery'
 
 describe('live NIP-29 helpers', () => {
   it('uses profile display names when profile metadata is available', () => {
@@ -77,17 +85,66 @@ describe('live NIP-29 helpers', () => {
     relay.dmRelaySubs = [{ close: staleRelayClose }]
     relay.dmRelays = new Map()
     relay.readRelays = new Map()
+    relay.writeRelays = new Map()
+    relay.dmSubscriptionGeneration = 0
 
     relay.refreshDirectMessageSubscriptions()
-    await Promise.resolve()
+    await vi.waitFor(() => expect(roomSubscribe).toHaveBeenCalledOnce())
 
     expect(staleRoomClose).toHaveBeenCalledOnce()
     expect(staleRelayClose).toHaveBeenCalledOnce()
     expect(roomSubscribe).toHaveBeenCalledWith(
-      directMessageSubscriptionFilters(pubkey),
+      [...legacyDirectMessageReadFilters(pubkey), ...legacyDirectMessageWriteFilters(pubkey)],
       expect.objectContaining({ eoseTimeout: 3500 }),
     )
     expect(relay.dmRelaySubs).toEqual([])
+  })
+
+  it('routes direct message subscriptions to the user advertised DM relays', async () => {
+    const pubkey = 'c'.repeat(64)
+    const roomSubscribe = vi.fn(() => ({ close: vi.fn() }))
+    const profileSubscribe = vi.fn(() => ({ close: vi.fn() }))
+
+    const relay = Object.create(LiveNip29Relay.prototype) as Record<string, unknown> & {
+      openDmRelaySubscriptions: () => Promise<void>
+      dmRelaySubs: Array<{ close: () => void }>
+    }
+    relay.closed = false
+    relay.relayUrl = 'wss://active.example'
+    relay.signer = {
+      pubkey,
+      label: 'test',
+      signEvent: vi.fn(),
+    }
+    relay.relay = { subscribe: roomSubscribe }
+    relay.profilePool = { subscribe: profileSubscribe }
+    relay.dmSub = undefined
+    relay.dmRelaySubs = []
+    relay.dmSubscriptionGeneration = 0
+    relay.dmRelays = new Map([[pubkey, ['wss://nip17.example']]])
+    relay.readRelays = new Map([[pubkey, ['wss://legacy-read.example']]])
+    relay.writeRelays = new Map([[pubkey, ['wss://legacy-write.example']]])
+    relay.receiveDirectMessage = vi.fn()
+
+    await relay.openDmRelaySubscriptions()
+
+    expect(roomSubscribe).not.toHaveBeenCalled()
+    expect(profileSubscribe).toHaveBeenCalledWith(
+      ['wss://nip17.example'],
+      nip17DirectMessageSubscriptionFilters(pubkey)[0],
+      expect.objectContaining({ eoseTimeout: 3500 }),
+    )
+    expect(profileSubscribe).toHaveBeenCalledWith(
+      ['wss://legacy-read.example'],
+      legacyDirectMessageReadFilters(pubkey)[0],
+      expect.objectContaining({ eoseTimeout: 3500 }),
+    )
+    expect(profileSubscribe).toHaveBeenCalledWith(
+      ['wss://legacy-write.example'],
+      legacyDirectMessageWriteFilters(pubkey)[0],
+      expect.objectContaining({ eoseTimeout: 3500 }),
+    )
+    expect(relay.dmRelaySubs).toHaveLength(3)
   })
 
   it('does not request the whole relay directory while opening a selected group', () => {
@@ -115,7 +172,77 @@ describe('live NIP-29 helpers', () => {
     expect(subscribe).toHaveBeenCalledOnce()
     const filters = subscribe.mock.calls[0]?.[0] as unknown[]
     expect(filters).toContainEqual({ kinds: [39000, 39001, 39002, 39003], '#d': ['room'], limit: 32 })
+    expect(filters).toContainEqual({ kinds: [9021, 9022], '#h': ['room'], limit: 80 })
     expect(filters).not.toContainEqual({ kinds: [39000], limit: 240 })
+    if (relay.roomAccessTimer) clearTimeout(relay.roomAccessTimer)
+  })
+
+  it('authenticates the relay and reloads the directory list after auth succeeds', async () => {
+    const pubkey = 'e'.repeat(64)
+    const oldGroup: NestrEvent = {
+      id: 'old-directory-group',
+      pubkey: 'a'.repeat(64),
+      sig: 'sig',
+      kind: NIP29_KINDS.groupMetadata,
+      created_at: 1,
+      tags: [
+        ['d', 'old'],
+        ['relay', 'wss://relay.example'],
+      ],
+      content: '',
+    }
+    const savedGroup: NestrEvent = {
+      ...oldGroup,
+      id: 'saved-other-group',
+      tags: [
+        ['d', 'saved'],
+        ['relay', 'wss://other.example'],
+      ],
+    }
+    const auth = vi.fn(async () => 'ok')
+    const subscribe = vi.fn(() => ({ close: vi.fn() }))
+    const relay = Object.create(LiveNip29Relay.prototype) as Record<string, unknown> & {
+      authenticateAndRefetch: () => Promise<void>
+      relayGroups: Map<string, NestrEvent>
+      directoryGroupKeys: Set<string>
+      roomAccessTimer?: ReturnType<typeof setTimeout>
+      refreshDirectMessageSubscriptions: () => void
+    }
+    const oldGroupKey = relayGroupKey('wss://relay.example', 'old')
+    const savedGroupKey = relayGroupKey('wss://other.example', 'saved')
+    relay.closed = false
+    relay.relayUrl = 'wss://relay.example'
+    relay.hasSelectedGroup = false
+    relay.groupId = ''
+    relay.relayGroups = new Map([
+      [oldGroupKey, oldGroup],
+      [savedGroupKey, savedGroup],
+    ])
+    relay.directoryGroupKeys = new Set([oldGroupKey])
+    relay.connectionStatus = 'connected'
+    relay.connectionMessage = 'connected'
+    relay.connectionLog = []
+    relay.roomAccessStatus = 'open'
+    relay.groupSub = undefined
+    relay.dmRelaySubs = []
+    relay.signer = {
+      pubkey,
+      label: 'test',
+      signEvent: vi.fn(),
+    }
+    relay.relay = { auth, subscribe }
+    relay.emit = vi.fn()
+    relay.refreshDirectMessageSubscriptions = vi.fn()
+
+    await relay.authenticateAndRefetch()
+
+    expect(auth).toHaveBeenCalledOnce()
+    expect(subscribe).toHaveBeenCalledWith(
+      [{ kinds: [39000], limit: 240 }],
+      expect.objectContaining({ eoseTimeout: 3500 }),
+    )
+    expect(relay.relayGroups.has(oldGroupKey)).toBe(false)
+    expect(relay.relayGroups.get(savedGroupKey)).toBe(savedGroup)
     if (relay.roomAccessTimer) clearTimeout(relay.roomAccessTimer)
   })
 
@@ -172,6 +299,251 @@ describe('live NIP-29 helpers', () => {
       { kinds: [39000, 39001, 39002, 39003], '#d': ['room'], limit: 4 },
       { maxWait: 50 },
     )
+    expect(roomClose).toHaveBeenCalledOnce()
+  })
+
+  it('saves the current relay by publishing the public NIP-51 relay tag', async () => {
+    const pubkey = '8'.repeat(64)
+    const publish = vi.fn(async () => 'ok')
+    const signEvent = vi.fn(async (template: NestrEventTemplate) => ({
+      ...template,
+      id: 'saved-list',
+      sig: 'sig',
+      pubkey,
+    }))
+    const previous: NestrEvent = {
+      id: 'previous-list',
+      sig: 'sig',
+      pubkey,
+      kind: NIP51_KINDS.simpleGroups,
+      created_at: 1,
+      tags: [
+        ['group', 'room', 'wss://groups.example', 'Room'],
+        ['r', 'wss://relay.old'],
+      ],
+      content: 'encrypted-private-items',
+    }
+    const relay = Object.create(LiveNip29Relay.prototype) as Record<string, unknown> & {
+      publishSaveRelay: LiveNip29Relay['publishSaveRelay']
+    }
+    relay.relayUrl = 'wss://groups.example'
+    relay.signer = { pubkey, label: 'test', signEvent }
+    relay.relay = { publish }
+    relay.simpleGroupListEvents = new Map([[pubkey, previous]])
+    relay.savedRelayUrls = new Set()
+    relay.userSavedRelayUrls = new Set()
+    relay.savedGroupKeys = new Set()
+    relay.relayGroups = new Map()
+    relay.connectionStatus = 'connected'
+    relay.connectionMessage = 'connected'
+    relay.connectionLog = []
+    relay.emit = vi.fn()
+    relay.fetchSavedGroupState = vi.fn()
+
+    await expect(relay.publishSaveRelay(pubkey, 'groups.example')).resolves.toMatchObject({ ok: true })
+
+    expect(signEvent).toHaveBeenCalledWith(expect.objectContaining({
+      kind: NIP51_KINDS.simpleGroups,
+      content: 'encrypted-private-items',
+      tags: expect.arrayContaining([
+        ['group', 'room', 'wss://groups.example', 'Room'],
+        ['r', 'wss://relay.old'],
+        ['r', 'wss://groups.example'],
+      ]),
+    }))
+    expect(relay.userSavedRelayUrls).toEqual(new Set(['wss://relay.old', 'wss://groups.example']))
+  })
+
+  it('removes only the explicit NIP-51 relay tag and preserves saved groups', async () => {
+    const pubkey = '7'.repeat(64)
+    const publish = vi.fn(async () => 'ok')
+    const signEvent = vi.fn(async (template: NestrEventTemplate) => ({
+      ...template,
+      id: 'removed-list',
+      sig: 'sig',
+      pubkey,
+    }))
+    const previous: NestrEvent = {
+      id: 'previous-list',
+      sig: 'sig',
+      pubkey,
+      kind: NIP51_KINDS.simpleGroups,
+      created_at: 1,
+      tags: [
+        ['r', 'wss://groups.example/'],
+        ['group', 'room', 'wss://groups.example', 'Room'],
+        ['r', 'wss://relay.keep'],
+      ],
+      content: '',
+    }
+    const relay = Object.create(LiveNip29Relay.prototype) as Record<string, unknown> & {
+      publishRemoveRelay: LiveNip29Relay['publishRemoveRelay']
+    }
+    relay.relayUrl = 'wss://groups.example'
+    relay.signer = { pubkey, label: 'test', signEvent }
+    relay.relay = { publish }
+    relay.simpleGroupListEvents = new Map([[pubkey, previous]])
+    relay.savedRelayUrls = new Set()
+    relay.userSavedRelayUrls = new Set(['wss://groups.example', 'wss://relay.keep'])
+    relay.savedGroupKeys = new Set()
+    relay.relayGroups = new Map()
+    relay.connectionStatus = 'connected'
+    relay.connectionMessage = 'connected'
+    relay.connectionLog = []
+    relay.emit = vi.fn()
+    relay.fetchSavedGroupState = vi.fn()
+
+    await expect(relay.publishRemoveRelay(pubkey, 'groups.example')).resolves.toMatchObject({ ok: true })
+
+    const signedTags = signEvent.mock.calls[0]?.[0].tags ?? []
+    expect(signedTags).not.toContainEqual(['r', 'wss://groups.example'])
+    expect(signedTags).toContainEqual(['group', 'room', 'wss://groups.example', 'Room'])
+    expect(signedTags).toContainEqual(['r', 'wss://relay.keep'])
+    expect(relay.userSavedRelayUrls).toEqual(new Set(['wss://relay.keep']))
+  })
+
+  it('treats active relay directory metadata as local to the relay that returned it', () => {
+    const relay = Object.create(LiveNip29Relay.prototype) as Record<string, unknown> & {
+      receive: (event: NestrEvent) => void
+      relayGroups: Map<string, NestrEvent>
+      savedRelayUrls: Set<string>
+      directoryGroupKeys: Set<string>
+    }
+    relay.relayUrl = 'wss://active.example'
+    relay.hasSelectedGroup = false
+    relay.relayGroups = new Map()
+    relay.savedRelayUrls = new Set()
+    relay.directoryGroupKeys = new Set()
+    relay.emit = vi.fn()
+
+    relay.receive({
+      id: 'metadata',
+      pubkey: 'a'.repeat(64),
+      sig: 'sig',
+      kind: NIP29_KINDS.groupMetadata,
+      created_at: 1,
+      tags: [
+        ['d', 'room'],
+        ['relay', 'wss://wrong.example'],
+        ['name', 'Room'],
+      ],
+      content: '',
+    })
+
+    const stored = relay.relayGroups.get(relayGroupKey('wss://active.example', 'room'))
+    expect(stored).toBeDefined()
+    expect(relay.relayGroups.has(relayGroupKey('wss://wrong.example', 'room'))).toBe(false)
+    expect(relayUrlFromGroupEvent(stored!, '')).toBe('wss://active.example')
+    expect(relay.savedRelayUrls).toEqual(new Set(['wss://active.example']))
+  })
+
+  it('records relay publish errors for the UI toast', async () => {
+    const pubkey = '6'.repeat(64)
+    const message = 'restricted: you are not a member of this relay'
+    const publish = vi.fn(async () => {
+      throw new Error(message)
+    })
+    const signEvent = vi.fn(async (template: NestrEventTemplate) => ({
+      ...template,
+      id: 'create-room',
+      sig: 'sig',
+      pubkey,
+    }))
+    const relay = Object.create(LiveNip29Relay.prototype) as Record<string, unknown> & {
+      publishCreateGroup: LiveNip29Relay['publishCreateGroup']
+      connectionStatus: string
+      connectionMessage: string
+    }
+    relay.relayUrl = 'wss://groups.example'
+    relay.groupId = ''
+    relay.signer = { pubkey, label: 'test', signEvent }
+    relay.relay = { publish }
+    relay.connectionStatus = 'connected'
+    relay.connectionMessage = 'connected'
+    relay.setConnection = vi.fn((status: string, nextMessage: string) => {
+      relay.connectionStatus = status
+      relay.connectionMessage = nextMessage
+    })
+    relay.emit = vi.fn()
+
+    await expect(relay.publishCreateGroup(pubkey, 'Room', 'room')).resolves.toMatchObject({
+      ok: false,
+      reason: message,
+    })
+
+    expect(relay.relayError).toMatchObject({
+      kind: NIP29_KINDS.createGroup,
+      eventId: 'create-room',
+      message,
+    })
+  })
+
+  it('refreshes selected group state after a join request is approved elsewhere', async () => {
+    const pubkey = '9'.repeat(64)
+    const memberEvent: NestrEvent = {
+      id: 'members',
+      sig: 'sig',
+      pubkey: 'a'.repeat(64),
+      kind: NIP29_KINDS.groupMembers,
+      created_at: 1,
+      tags: [
+        ['d', 'room'],
+        ['p', pubkey],
+      ],
+      content: '',
+    }
+    const roomClose = vi.fn()
+    const roomSubscribe = vi.fn((filtersArg: unknown, optionsArg: { onevent?: (event: NestrEvent) => void; oneose?: () => void }) => {
+      void filtersArg
+      setTimeout(() => {
+        optionsArg.onevent?.(memberEvent)
+        optionsArg.oneose?.()
+      }, 0)
+      return { close: roomClose }
+    })
+    const relay = Object.create(LiveNip29Relay.prototype) as Record<string, unknown> & {
+      refreshGroupState: LiveNip29Relay['refreshGroupState']
+    }
+    relay.closed = false
+    relay.hasSelectedGroup = true
+    relay.groupId = 'room'
+    relay.relayUrl = 'wss://groups.0xchat.com'
+    relay.roomAccessStatus = 'blocked'
+    relay.roomAccessMessage = 'blocked'
+    relay.memberPubkeys = new Set()
+    relay.adminRoles = new Map()
+    relay.group = {
+      metadata: { tags: [], pubkey: 'a'.repeat(64) },
+      admins: { tags: [] },
+      members: { tags: [] },
+      roles: { tags: [] },
+    }
+    relay.users = new Map()
+    relay.profiles = new Map()
+    relay.blossomServers = new Map()
+    relay.dmRelays = new Map()
+    relay.readRelays = new Map()
+    relay.writeRelays = new Map()
+    relay.relayGroups = new Map()
+    relay.relay = { subscribe: roomSubscribe }
+    relay.queueProfileFetch = vi.fn()
+    relay.refreshPresenceSubscription = vi.fn()
+    relay.openGroupSubscription = vi.fn()
+    relay.emit = vi.fn()
+
+    await relay.refreshGroupState(50)
+
+    expect(roomSubscribe).toHaveBeenCalledWith(
+      [
+        { kinds: [39000, 39001, 39002, 39003], '#d': ['room'], limit: 32 },
+        { kinds: [9021, 9022], '#h': ['room'], limit: 80 },
+        { '#h': ['room'], limit: 180 },
+      ],
+      expect.objectContaining({ eoseTimeout: 50 }),
+    )
+    expect(relay.memberPubkeys).toEqual(new Set([pubkey]))
+    expect(relay.roomAccessStatus).toBe('open')
+    expect(relay.openGroupSubscription).toHaveBeenCalledOnce()
     expect(roomClose).toHaveBeenCalledOnce()
   })
 
@@ -363,5 +735,50 @@ describe('live NIP-29 helpers', () => {
     })
     expect(publish).toHaveBeenCalledOnce()
     expect(relay.lastSignedPositionEvent).toBeUndefined()
+    expect(relay.relayError).toBeUndefined()
+  })
+
+  it('re-signs a call signal when the relay rejects a late-approved event as too old', async () => {
+    const pubkey = 'a'.repeat(64)
+    const targetPubkey = 'b'.repeat(64)
+    const publish = vi
+      .fn<(event: NestrEvent) => Promise<string>>()
+      .mockRejectedValueOnce(new Error('blocked: event too old'))
+      .mockResolvedValueOnce('ok')
+    const signEvent = vi.fn(async (template: NestrEventTemplate) => ({
+      ...template,
+      id: `signed-call-${signEvent.mock.calls.length}`,
+      sig: 'sig',
+      pubkey,
+    }))
+
+    const relay = Object.create(LiveNip29Relay.prototype) as Record<string, unknown> & {
+      publishCallSignal: LiveNip29Relay['publishCallSignal']
+      connectionStatus: string
+      connectionMessage: string
+    }
+    relay.hasSelectedGroup = true
+    relay.groupId = 'room'
+    relay.signer = { pubkey, label: 'test', signEvent }
+    relay.relay = { publish }
+    relay.connectionStatus = 'connected'
+    relay.connectionMessage = 'connected'
+    relay.setConnection = vi.fn((status: string, message: string) => {
+      relay.connectionStatus = status
+      relay.connectionMessage = message
+    })
+    relay.emit = vi.fn()
+
+    await expect(
+      relay.publishCallSignal(pubkey, OFFICE_KINDS.iceCandidate, targetPubkey, {
+        candidate: { candidate: 'candidate:1', sdpMid: '0', sdpMLineIndex: 0 },
+      }),
+    ).resolves.toMatchObject({ ok: true })
+
+    expect(signEvent).toHaveBeenCalledTimes(2)
+    expect(publish).toHaveBeenCalledTimes(2)
+    expect(publish.mock.calls[0]?.[0].id).toBe('signed-call-1')
+    expect(publish.mock.calls[1]?.[0].id).toBe('signed-call-2')
+    expect(relay.relayError).toBeUndefined()
   })
 })

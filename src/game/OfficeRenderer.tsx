@@ -124,7 +124,7 @@ interface CameraDragState {
 }
 
 const WORLD_SCALE = 0.045
-const CHUNK_SIZE = 24
+const CHUNK_SIZE = 19
 const KEYBOARD_SPEED = 178
 const CLICK_SPEED = KEYBOARD_SPEED * 2
 const ARRIVAL_RADIUS = 0.24
@@ -133,18 +133,22 @@ const KEYBOARD_REPUBLISH_MS = 5_000
 const ROOM_RANGE = 2
 const ROOM_BUFFER_RANGE = ROOM_RANGE
 const WORLD_REBUILD_HYSTERESIS_CHUNKS = 1
+const ROOM_COLLISION_MARGIN = 0.55
 const SELF_ECHO_HOLD_MS = 900
 const AVATAR_APPROACH_DISTANCE = 2.45
 const MODEL_ROOT = `${import.meta.env.BASE_URL}assets/office-pack/models/`
-const CAMERA_VIEW_HEIGHT = 23
+const CAMERA_VIEW_HEIGHT = 20.5
 const MAX_CAMERA_VIEW_SCALE = 2.7
 const CAMERA_DRAG_THRESHOLD = 4
 const CAMERA_ZOOM_RESET_MS = 280
 const MAX_RENDER_PIXEL_RATIO = 1.5
+const FLOOR_SIZE = 260
+const FLOOR_TEXTURE_REPEAT = 18
 
 const assetCache = new Map<AssetKey, LoadedAsset>()
 const loader = new GLTFLoader()
 const profileImageCache = new Map<string, HTMLImageElement | 'failed' | Promise<HTMLImageElement | null>>()
+let contactShadowTexture: THREE.CanvasTexture | undefined
 
 const OFFICE_ASSETS = {
   adjustableDesk: asset('adjustableDesk', 'adjustable-desk.glb', [2.1, 1.15], 1.15, 'table', 0xc58f58),
@@ -176,9 +180,9 @@ const OFFICE_ASSETS = {
 } satisfies Record<AssetKey, AssetSpec>
 
 const ASSET_BASE_LIFT: Partial<Record<AssetKey, number>> = {
-  houseplant: 0.08,
-  plantWhitePot: 0.42,
-  pottedPlant: 0.1,
+  houseplant: 0.02,
+  plantWhitePot: 0.02,
+  pottedPlant: 0.02,
 }
 
 const roomMaterials: Record<OfficeTone, THREE.MeshStandardMaterial> = {
@@ -336,12 +340,6 @@ function roundedRectShape(width: number, depth: number, radius: number) {
   return shape
 }
 
-function roundedRectPath(width: number, depth: number, radius: number) {
-  const path = new THREE.Path()
-  drawRoundedPath(path, width, depth, radius)
-  return path
-}
-
 function drawRoundedPath(path: THREE.Path, width: number, depth: number, radius: number) {
   const x = -width / 2
   const y = -depth / 2
@@ -369,23 +367,156 @@ function makeRoundedPlane(width: number, depth: number, radius: number, material
   return mesh
 }
 
-function makeRoomWall(width: number, depth: number) {
-  const group = new THREE.Group()
-  const height = 0.72
-  const thickness = 0.34
-  const outer = roundedRectShape(width + thickness * 1.2, depth + thickness * 1.2, 1.16)
-  outer.holes.push(roundedRectPath(width - thickness * 1.18, depth - thickness * 1.18, 0.86))
-  const geometry = new THREE.ExtrudeGeometry(outer, {
-    depth: height,
-    bevelEnabled: false,
-    curveSegments: 24,
-    steps: 1,
+function makeRectPlane(width: number, depth: number, material: THREE.Material) {
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(width, depth), material)
+  mesh.rotation.x = -Math.PI / 2
+  mesh.receiveShadow = true
+  return mesh
+}
+
+function getContactShadowTexture() {
+  if (contactShadowTexture) return contactShadowTexture
+
+  const canvas = document.createElement('canvas')
+  canvas.width = 256
+  canvas.height = 256
+  const context = canvas.getContext('2d')
+  if (!context) throw new Error('Canvas 2D context is unavailable')
+
+  const center = canvas.width / 2
+  const gradient = context.createRadialGradient(center, center, 8, center, center, center)
+  gradient.addColorStop(0, 'rgba(0, 0, 0, 0.78)')
+  gradient.addColorStop(0.28, 'rgba(0, 0, 0, 0.5)')
+  gradient.addColorStop(0.56, 'rgba(0, 0, 0, 0.2)')
+  gradient.addColorStop(0.84, 'rgba(0, 0, 0, 0.04)')
+  gradient.addColorStop(1, 'rgba(0, 0, 0, 0)')
+  context.fillStyle = gradient
+  context.fillRect(0, 0, canvas.width, canvas.height)
+
+  contactShadowTexture = new THREE.CanvasTexture(canvas)
+  contactShadowTexture.colorSpace = THREE.SRGBColorSpace
+  contactShadowTexture.minFilter = THREE.LinearFilter
+  contactShadowTexture.magFilter = THREE.LinearFilter
+  return contactShadowTexture
+}
+
+function makeContactShadow(
+  width: number,
+  depth: number,
+  opacity = 0.12,
+  color = 0x1f1b17,
+) {
+  const material = new THREE.MeshBasicMaterial({
+    map: getContactShadowTexture(),
+    color,
+    opacity,
+    transparent: true,
+    depthWrite: false,
   })
-  geometry.rotateX(-Math.PI / 2)
-  const ring = new THREE.Mesh(geometry, wallMaterial)
-  ring.castShadow = true
-  ring.receiveShadow = true
-  group.add(ring)
+  const mesh = makeRectPlane(width, depth, material)
+  mesh.receiveShadow = false
+  mesh.renderOrder = -3
+  return mesh
+}
+
+function makeWallSegment(width: number, depth: number, height: number) {
+  const group = new THREE.Group()
+  const shadow = makeContactShadow(width + 0.64, depth + 0.58, 0.12)
+  shadow.position.y = 0.026
+  group.add(shadow)
+
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(width, height, depth), wallMaterial)
+  mesh.position.y = height / 2
+  mesh.castShadow = true
+  mesh.receiveShadow = true
+  group.add(mesh)
+  return group
+}
+
+function addHorizontalWallSegments(
+  parent: THREE.Group,
+  z: number,
+  width: number,
+  thickness: number,
+  height: number,
+  gapCenter: number,
+  gapWidth: number,
+) {
+  if (gapWidth <= 0 || gapCenter - gapWidth / 2 >= width / 2 || gapCenter + gapWidth / 2 <= -width / 2) {
+    const wall = makeWallSegment(width, thickness, height)
+    wall.position.set(0, 0, z)
+    parent.add(wall)
+    return
+  }
+  const leftEnd = Math.max(-width / 2, gapCenter - gapWidth / 2)
+  const rightStart = Math.min(width / 2, gapCenter + gapWidth / 2)
+  const segments = [
+    { center: (-width / 2 + leftEnd) / 2, length: leftEnd + width / 2 },
+    { center: (rightStart + width / 2) / 2, length: width / 2 - rightStart },
+  ]
+
+  segments.forEach((segment) => {
+    if (segment.length <= 0.42) return
+    const wall = makeWallSegment(segment.length, thickness, height)
+    wall.position.set(segment.center, 0, z)
+    parent.add(wall)
+  })
+}
+
+function addVerticalWallSegments(
+  parent: THREE.Group,
+  x: number,
+  depth: number,
+  thickness: number,
+  height: number,
+  gapCenter: number,
+  gapWidth: number,
+) {
+  if (gapWidth <= 0 || gapCenter - gapWidth / 2 >= depth / 2 || gapCenter + gapWidth / 2 <= -depth / 2) {
+    const wall = makeWallSegment(thickness, depth, height)
+    wall.position.set(x, 0, 0)
+    parent.add(wall)
+    return
+  }
+  const topEnd = Math.max(-depth / 2, gapCenter - gapWidth / 2)
+  const bottomStart = Math.min(depth / 2, gapCenter + gapWidth / 2)
+  const segments = [
+    { center: (-depth / 2 + topEnd) / 2, length: topEnd + depth / 2 },
+    { center: (bottomStart + depth / 2) / 2, length: depth / 2 - bottomStart },
+  ]
+
+  segments.forEach((segment) => {
+    if (segment.length <= 0.42) return
+    const wall = makeWallSegment(thickness, segment.length, height)
+    wall.position.set(x, 0, segment.center)
+    parent.add(wall)
+  })
+}
+
+function makeRoomWall(width: number, depth: number, seed: string) {
+  const group = new THREE.Group()
+  const height = 0.68
+  const thickness = 0.34
+  const mainGapWidth = THREE.MathUtils.clamp(width * 0.22, 1.85, 2.75)
+  const sideGapWidth = THREE.MathUtils.clamp(depth * 0.2, 1.55, 2.25)
+  const mainGapCenter = randomBetween(seed, 'wall-gap-main', -width * 0.22, width * 0.22)
+  const sideGapCenter = randomBetween(seed, 'wall-gap-side', -depth * 0.18, depth * 0.18)
+  const sideGapOnLeft = randomUnit(seed, 'wall-gap-side-pick') > 0.5
+  const horizontalWidth = width + thickness * 2
+  const topZ = -depth / 2 - thickness / 2
+  const bottomZ = depth / 2 + thickness / 2
+  const leftX = -width / 2 - thickness / 2
+  const rightX = width / 2 + thickness / 2
+
+  addHorizontalWallSegments(group, topZ, horizontalWidth, thickness, height, horizontalWidth * 2, 0)
+  addHorizontalWallSegments(group, bottomZ, horizontalWidth, thickness, height, mainGapCenter, mainGapWidth)
+  if (sideGapOnLeft) {
+    addVerticalWallSegments(group, leftX, depth, thickness, height, sideGapCenter, sideGapWidth)
+    addVerticalWallSegments(group, rightX, depth, thickness, height, depth * 2, 0)
+  } else {
+    addVerticalWallSegments(group, leftX, depth, thickness, height, -depth * 2, 0)
+    addVerticalWallSegments(group, rightX, depth, thickness, height, sideGapCenter, sideGapWidth)
+  }
 
   const glass = makeRoundedPlane(width - 0.86, depth - 0.86, 0.82, glassMaterial)
   glass.position.y = 0.62
@@ -574,88 +705,83 @@ function makeTextSprite(
   return sprite
 }
 
-function createTileTexture() {
+function createWoodFloorTexture() {
   const canvas = document.createElement('canvas')
-  canvas.width = 768
-  canvas.height = 768
+  canvas.width = 1024
+  canvas.height = 1024
   const context = canvas.getContext('2d')
   if (!context) throw new Error('Canvas 2D context is unavailable')
 
-  context.fillStyle = '#e4e0d8'
+  context.fillStyle = '#caa878'
   context.fillRect(0, 0, canvas.width, canvas.height)
 
-  const tile = 96
-  for (let y = 0; y < canvas.height; y += tile) {
-    for (let x = 0; x < canvas.width; x += tile) {
-      const baseLight = 83 + randomUnit(`${x}:${y}`, 'light') * 4
-      const alternateLight = baseLight + 1.6 + randomUnit(`${x}:${y}`, 'alternate') * 2.4
-      const base = `hsl(39 18% ${baseLight}%)`
-      const alternate = `hsl(39 19% ${alternateLight}%)`
-      const descending = randomUnit(`${x}:${y}`, 'split') > 0.48
-      context.fillStyle = base
-      context.fillRect(x, y, tile, tile)
+  const plankHeight = 54
+  const plankWidths = [236, 284, 328, 372]
+  for (let y = 0; y < canvas.height + plankHeight; y += plankHeight) {
+    let x = -plankWidths[(y / plankHeight) % plankWidths.length] * randomUnit(`wood:${y}`, 'offset')
+    let segment = 0
+    while (x < canvas.width) {
+      const width = plankWidths[(segment + y / plankHeight) % plankWidths.length]
+      const hue = 34 + randomUnit(`wood:${x}:${y}`, 'hue') * 4
+      const saturation = 30 + randomUnit(`wood:${x}:${y}`, 'sat') * 8
+      const light = 61 + randomUnit(`wood:${x}:${y}`, 'light') * 10
+      const gradient = context.createLinearGradient(0, y, 0, y + plankHeight)
+      gradient.addColorStop(0, `hsl(${hue} ${saturation}% ${light + 4}%)`)
+      gradient.addColorStop(0.5, `hsl(${hue} ${saturation}% ${light}%)`)
+      gradient.addColorStop(1, `hsl(${hue} ${saturation}% ${light - 3}%)`)
+      context.fillStyle = gradient
+      context.fillRect(x, y, width, plankHeight)
 
-      context.fillStyle = alternate
-      context.beginPath()
-      if (descending) {
-        context.moveTo(x, y)
-        context.lineTo(x + tile, y + tile)
-        context.lineTo(x, y + tile)
-      } else {
-        context.moveTo(x, y)
-        context.lineTo(x + tile, y)
-        context.lineTo(x, y + tile)
+      context.strokeStyle = 'rgba(86, 57, 29, 0.22)'
+      context.lineWidth = 1.2
+      context.strokeRect(x + 0.5, y + 0.5, width - 1, plankHeight - 1)
+
+      for (let grain = 0; grain < 7; grain += 1) {
+        const grainY = y + 8 + randomUnit(`wood:${x}:${y}:grain:${grain}`, 'y') * (plankHeight - 16)
+        const alpha = 0.055 + randomUnit(`wood:${x}:${y}:grain:${grain}`, 'a') * 0.055
+        context.strokeStyle = `rgba(79, 49, 23, ${alpha})`
+        context.lineWidth = 0.7 + randomUnit(`wood:${x}:${y}:grain:${grain}`, 'w') * 1.2
+        context.beginPath()
+        context.moveTo(x + 12, grainY)
+        context.bezierCurveTo(
+          x + width * 0.32,
+          grainY + randomBetween(`wood:${x}:${y}:grain:${grain}`, 'c1', -7, 7),
+          x + width * 0.66,
+          grainY + randomBetween(`wood:${x}:${y}:grain:${grain}`, 'c2', -7, 7),
+          x + width - 12,
+          grainY + randomBetween(`wood:${x}:${y}:grain:${grain}`, 'end', -4, 4),
+        )
+        context.stroke()
       }
-      context.closePath()
-      context.fill()
 
-      context.fillStyle = `rgba(255, 255, 255, ${0.035 + randomUnit(`${x}:${y}`, 'facet') * 0.055})`
-      context.beginPath()
-      context.moveTo(x + tile * 0.5, y)
-      context.lineTo(x + tile, y + tile * 0.5)
-      context.lineTo(x + tile * 0.5, y + tile)
-      context.closePath()
-      context.fill()
+      context.fillStyle = `rgba(255, 244, 218, ${0.035 + randomUnit(`wood:${x}:${y}`, 'glow') * 0.035})`
+      context.fillRect(x + 2, y + 2, width - 4, 7)
 
-      context.strokeStyle = 'rgba(112, 111, 106, 0.055)'
-      context.lineWidth = 1
-      context.beginPath()
-      if (descending) {
-        context.moveTo(x, y)
-        context.lineTo(x + tile, y + tile)
-      } else {
-        context.moveTo(x + tile, y)
-        context.lineTo(x, y + tile)
-      }
-      context.stroke()
+      x += width
+      segment += 1
     }
   }
 
   const image = context.getImageData(0, 0, canvas.width, canvas.height)
   for (let index = 0; index < image.data.length; index += 4) {
-    const noise = ((hashInt(`floor:${index}`) % 19) - 9) * 0.58
+    const noise = ((hashInt(`floor:${index}`) % 23) - 11) * 0.9
     image.data[index] = Math.max(0, Math.min(255, image.data[index] + noise))
     image.data[index + 1] = Math.max(0, Math.min(255, image.data[index + 1] + noise))
     image.data[index + 2] = Math.max(0, Math.min(255, image.data[index + 2] + noise))
   }
   context.putImageData(image, 0, 0)
 
-  context.strokeStyle = 'rgba(255, 255, 255, 0.105)'
-  context.lineWidth = 1
-  for (let offset = -canvas.height; offset < canvas.width; offset += 48) {
-    context.beginPath()
-    context.moveTo(offset, 0)
-    context.lineTo(offset + canvas.height, canvas.height)
-    context.stroke()
-  }
-
   const texture = new THREE.CanvasTexture(canvas)
   texture.colorSpace = THREE.SRGBColorSpace
   texture.wrapS = THREE.RepeatWrapping
   texture.wrapT = THREE.RepeatWrapping
-  texture.repeat.set(30, 30)
-  texture.anisotropy = 8
+  texture.repeat.set(FLOOR_TEXTURE_REPEAT, FLOOR_TEXTURE_REPEAT)
+  texture.anisotropy = 12
   return texture
+}
+
+function wrapTextureOffset(value: number) {
+  return ((value % 1) + 1) % 1
 }
 
 function createFallbackAsset(spec: AssetSpec) {
@@ -756,8 +882,21 @@ function addAsset(
   options: AssetPlacementOptions = {},
 ) {
   const group = new THREE.Group()
+  const spec = OFFICE_ASSETS[key]
+  const placementY = options.y ?? ASSET_BASE_LIFT[key] ?? 0
+  const shadowScale = options.scale ?? 1
+  const restsOnFloor = options.y === undefined || placementY <= 0.2 || ASSET_BASE_LIFT[key] !== undefined
+  if (restsOnFloor && spec.fallback !== 'rug') {
+    const shadow = makeContactShadow(
+      spec.footprint[0] * shadowScale + 0.58,
+      spec.footprint[1] * shadowScale + 0.48,
+      spec.fallback === 'plant' ? 0.16 : 0.17,
+    )
+    shadow.position.y = -placementY + 0.026
+    group.add(shadow)
+  }
   const object = makeAssetObject(key, options)
-  group.position.set(x, options.y ?? ASSET_BASE_LIFT[key] ?? 0, z)
+  group.position.set(x, placementY, z)
   group.rotation.y = rotation
   group.add(object)
   parent.add(group)
@@ -787,9 +926,9 @@ function createAvatar(pubkey: string, labelText: string) {
   const hairMaterial = new THREE.MeshStandardMaterial({ color: new THREE.Color(style.hair), roughness: 0.84 })
   const shoeMaterial = new THREE.MeshStandardMaterial({ color: 0x2e333a, roughness: 0.82 })
 
-  const shadow = new THREE.Mesh(new THREE.CircleGeometry(0.48, 28), new THREE.MeshBasicMaterial({ color: 0x1d2528, opacity: 0.1, transparent: true }))
-  shadow.rotation.x = -Math.PI / 2
-  shadow.position.y = 0.012
+  const shadow = makeContactShadow(1.24, 0.9, 0.2, 0x1a1714)
+  shadow.position.y = 0.026
+  shadow.renderOrder = -2
   group.add(shadow)
 
   const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.22, 0.46, 5, 10), bodyMaterial)
@@ -870,14 +1009,14 @@ function roomTone(seed: string) {
 
 function roomForChunk(seed: string, chunkX: number, chunkZ: number, index: number): RoomPlan | undefined {
   const chunkSeed = `${seed}:room:${chunkX}:${chunkZ}:${index}`
-  const density = index === 0 || chunkX === 0 || chunkZ === 0 ? 0.86 : 0.58
+  const density = index === 0 || chunkX === 0 || chunkZ === 0 ? 0.92 : 0.7
   if (randomUnit(chunkSeed, 'density') > density) return undefined
 
   const tone = roomTone(chunkSeed)
-  const width = randomBetween(chunkSeed, 'width', tone === 'lounge' ? 8.8 : 9.8, tone === 'work' ? 15.6 : 13.5)
-  const depth = randomBetween(chunkSeed, 'depth', 6.7, tone === 'garden' ? 11.6 : 9.7)
-  const x = chunkX * CHUNK_SIZE + randomBetween(chunkSeed, 'x', -5.8, 5.8)
-  const z = chunkZ * CHUNK_SIZE + randomBetween(chunkSeed, 'z', -5.4, 5.4)
+  const width = randomBetween(chunkSeed, 'width', tone === 'lounge' ? 9.6 : 10.4, tone === 'work' ? 16.2 : 14.4)
+  const depth = randomBetween(chunkSeed, 'depth', 7.4, tone === 'garden' ? 12.4 : 10.6)
+  const x = chunkX * CHUNK_SIZE + randomBetween(chunkSeed, 'x', -3.8, 3.8)
+  const z = chunkZ * CHUNK_SIZE + randomBetween(chunkSeed, 'z', -3.6, 3.6)
   const rotation = randomChoice(chunkSeed, 'rotation', [0, 0, 0, Math.PI / 2] as const)
   return {
     id: `${chunkX}:${chunkZ}:${index}`,
@@ -892,7 +1031,7 @@ function roomForChunk(seed: string, chunkX: number, chunkZ: number, index: numbe
   }
 }
 
-function roomBounds(room: RoomPlan, margin = 1.65) {
+function roomBounds(room: RoomPlan, margin = ROOM_COLLISION_MARGIN) {
   const rotated = Math.abs(Math.sin(room.rotation)) > 0.5
   const width = rotated ? room.depth : room.width
   const depth = rotated ? room.width : room.depth
@@ -999,6 +1138,7 @@ class ThreeOffice {
   private pointer = new THREE.Vector2()
   private groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0)
   private floor: THREE.Mesh
+  private floorTexture?: THREE.Texture
   private worldRoot = new THREE.Group()
   private avatarRoot = new THREE.Group()
   private avatars = new Map<string, AvatarNode>()
@@ -1042,7 +1182,7 @@ class ThreeOffice {
     })
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, MAX_RENDER_PIXEL_RATIO))
     this.renderer.shadowMap.enabled = true
-    this.renderer.shadowMap.type = THREE.PCFShadowMap
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap
     this.renderer.outputColorSpace = THREE.SRGBColorSpace
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping
     this.renderer.toneMappingExposure = 1.05
@@ -1150,43 +1290,44 @@ class ThreeOffice {
   }
 
   private createFloor() {
-    const texture = createTileTexture()
+    const texture = createWoodFloorTexture()
+    this.floorTexture = texture
     const material = new THREE.MeshStandardMaterial({
       map: texture,
-      roughness: 0.96,
+      roughness: 0.82,
       metalness: 0,
-      color: 0xf4f1ea,
+      color: 0xf4dcc0,
     })
-    const floor = new THREE.Mesh(new THREE.PlaneGeometry(260, 260, 1, 1), material)
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(FLOOR_SIZE, FLOOR_SIZE, 1, 1), material)
     floor.rotation.x = -Math.PI / 2
     floor.receiveShadow = true
     return floor
   }
 
   private addLights() {
-    const ambient = new THREE.AmbientLight(0xffffff, 1.45)
+    const ambient = new THREE.AmbientLight(0xfff3df, 0.48)
     this.scene.add(ambient)
 
-    const hemisphere = new THREE.HemisphereLight(0xffffff, 0xd9ddd6, 1.2)
+    const hemisphere = new THREE.HemisphereLight(0xfff8ed, 0x8f806d, 0.72)
     this.scene.add(hemisphere)
 
-    const sun = new THREE.DirectionalLight(0xffffff, 1.65)
-    sun.position.set(-4, 48, -4)
+    const sun = new THREE.DirectionalLight(0xffe3b8, 3.25)
+    sun.position.set(-24, 52, -26)
     sun.castShadow = true
-    sun.shadow.mapSize.set(1024, 1024)
-    sun.shadow.bias = -0.00005
-    sun.shadow.normalBias = 0.12
+    sun.shadow.mapSize.set(2048, 2048)
+    sun.shadow.bias = -0.00008
+    sun.shadow.normalBias = 0.08
     sun.shadow.radius = 10
     sun.shadow.blurSamples = 8
     sun.shadow.camera.near = 2
-    sun.shadow.camera.far = 96
-    sun.shadow.camera.left = -52
-    sun.shadow.camera.right = 52
-    sun.shadow.camera.top = 52
-    sun.shadow.camera.bottom = -52
+    sun.shadow.camera.far = 120
+    sun.shadow.camera.left = -62
+    sun.shadow.camera.right = 62
+    sun.shadow.camera.top = 62
+    sun.shadow.camera.bottom = -62
     this.scene.add(sun)
 
-    const fill = new THREE.DirectionalLight(0xe7edf7, 0.55)
+    const fill = new THREE.DirectionalLight(0xdce8ff, 0.42)
     fill.position.set(18, 36, 22)
     this.scene.add(fill)
   }
@@ -1322,7 +1463,7 @@ class ThreeOffice {
   }
 
   private baseViewHeight() {
-    return Math.max(this.host.clientWidth, 1) < 620 ? 22 : CAMERA_VIEW_HEIGHT
+    return Math.max(this.host.clientWidth, 1) < 620 ? 19.8 : CAMERA_VIEW_HEIGHT
   }
 
   private currentViewHeight() {
@@ -1624,7 +1765,7 @@ class ThreeOffice {
     this.cameraDetached = false
     this.cameraTargetViewScale = 1
     const self = this.selfNode()
-    if (self) this.snapCameraTo(self.current.x, self.current.y)
+    if (self) this.setCameraDesired(self.current.x, self.current.y)
   }
 
   private snapCameraTo(x: number, z: number) {
@@ -1635,8 +1776,18 @@ class ThreeOffice {
 
   private applyCameraTransform() {
     this.floor.position.set(this.cameraCenter.x, -0.006, this.cameraCenter.z)
+    this.updateFloorTextureOffset()
     this.camera.position.set(this.cameraCenter.x, 31, this.cameraCenter.z + 27)
     this.camera.lookAt(this.cameraCenter.x, 0, this.cameraCenter.z)
+  }
+
+  private updateFloorTextureOffset() {
+    if (!this.floorTexture) return
+    const unitsToTexture = FLOOR_TEXTURE_REPEAT / FLOOR_SIZE
+    this.floorTexture.offset.set(
+      wrapTextureOffset(this.cameraCenter.x * unitsToTexture),
+      wrapTextureOffset(-this.cameraCenter.z * unitsToTexture),
+    )
   }
 
   private rebuildWorld(force = false) {
@@ -1698,15 +1849,15 @@ class ThreeOffice {
     roomGroup.rotation.y = room.rotation
     this.worldRoot.add(roomGroup)
 
-    const shadow = makeRoundedPlane(room.width, room.depth, 1.25, new THREE.MeshBasicMaterial({ color: 0x222222, opacity: 0.04, transparent: true }))
+    const shadow = makeContactShadow(room.width + 1.65, room.depth + 1.65, 0.14)
     shadow.position.set(0.3, 0.006, 0.38)
     roomGroup.add(shadow)
 
-    const pad = makeRoundedPlane(room.width, room.depth, 1.05, roomMaterials[room.tone])
+    const pad = makeRectPlane(room.width, room.depth, roomMaterials[room.tone])
     pad.position.y = 0.018
     roomGroup.add(pad)
 
-    const walls = makeRoomWall(room.width, room.depth)
+    const walls = makeRoomWall(room.width, room.depth, room.seed)
     roomGroup.add(walls)
 
     const labelWorld = roomLocal(room, -room.width / 2 + 1.5, -room.depth / 2 + 0.65)
@@ -1917,7 +2068,7 @@ function EdgePresenceOverlay({
     if (!self || size.width < 10 || size.height < 10) return []
 
     const aspect = size.width / size.height
-    const viewHeight = size.width < 620 ? 22 : CAMERA_VIEW_HEIGHT
+    const viewHeight = size.width < 620 ? 19.8 : CAMERA_VIEW_HEIGHT
     const viewWidth = viewHeight * aspect
     const users = new Map(snapshot.users.map((user) => [user.pubkey, user]))
     const raw = snapshot.positions

@@ -31,6 +31,7 @@ describe('NIP-51 simple groups', () => {
       'wss://relay.example',
       'wss://public.example',
     ])
+    expect(parsed?.explicitRelayUrls).toEqual(['wss://public.example'])
   })
 
   it('ignores malformed and duplicate group tags', () => {

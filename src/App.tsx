@@ -20,6 +20,7 @@ import {
   PhoneOff,
   Download,
   File as FileIcon,
+  Home,
   Image,
   Info,
   Paperclip,
@@ -54,17 +55,21 @@ import { Label } from '@/components/ui/label'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { OfficeRenderer } from './game/OfficeRenderer'
 import { avatarCss, npubForPubkey, resolvePubkey, seededPubkey, shortNpub } from './lib/avatar'
-import { DEVELOPMENT_RELAYS, parseLaunch, type LaunchConfig, type LiveLaunch, type MockLaunch } from './lib/launch'
+import { parseLaunch, type LaunchConfig, type LiveLaunch, type MockLaunch } from './lib/launch'
 import { createLiveRelay } from './lib/liveRelay'
+import {
+  NIP29_DISCOVERY_BOOTSTRAP_RELAYS,
+  subscribeNip29RelayDiscovery,
+  type DiscoveredNip29Relay,
+} from './lib/nip29RelayDiscovery'
 import { createMockRelay, type MockUser, type RelaySnapshot } from './lib/mockRelay'
 import { NIP29_KINDS, OFFICE_KINDS, hasTag, tagValue, type NestrAttachment, type NestrEvent, type NestrSigner } from './lib/nostr'
 import {
   normalizeRelayUrl,
-  readSavedRelayUrls,
+  relayGroupKey,
   relayUrlFromGroupEvent,
   sameRelayUrl,
   uniqueRelayUrls,
-  writeSavedRelayUrls,
 } from './lib/relayDiscovery'
 import { fetchRelayInfo, relayIconCandidates, type RelayInfo } from './lib/relayInfo'
 import { filterFailedImages, markImageFailed } from './lib/imageFailures'
@@ -109,7 +114,7 @@ import {
 } from './lib/secureSession'
 import { BLOSSOM_FALLBACK_SERVERS } from './lib/profileImages'
 import { estimateWebRtcMesh, nearbyPeers } from './lib/videoMesh'
-import { buildOfficeMap, spawnForPubkey } from './lib/world'
+import { buildOfficeMap, spawnAwayFromPositions } from './lib/world'
 import {
   isPositionFresh,
   POSITION_REBROADCAST_INTERVAL_MS,
@@ -117,9 +122,24 @@ import {
 } from './lib/positionEvents'
 
 const PEOPLE_RENDER_STEP = 80
+const PROXIMITY_CALL_RADIUS = 136
+const ICE_CANDIDATE_BATCH_DELAY_MS = 350
+const AUTO_CALL_PREFS_STORAGE_PREFIX = 'nestr:auto-call-media:v1'
+const JOIN_STATUS_REFRESH_DELAYS_MS = [1200, 3500, 8000, 15000, 25000, 40000, 60000, 90000, 120000]
+const HOME_RELAY_URL = 'wss://groups.0xchat.com'
+const HOME_LAUNCH: LiveLaunch = {
+  mode: 'live',
+  relayUrl: HOME_RELAY_URL,
+  nostrConnectRelays: [],
+  initialView: 'home',
+}
 
 function nameFor(pubkey: string, users: MockUser[]) {
   return users.find((user) => user.pubkey === pubkey)?.name ?? shortNpub(pubkey)
+}
+
+function njumpProfileUrl(pubkey: string) {
+  return `https://njump.me/${npubForPubkey(pubkey)}`
 }
 
 function appPath(url: URL) {
@@ -165,6 +185,17 @@ function groupTagLabel(snapshot: RelaySnapshot) {
   return tags.length > 0 ? tags.join(' ') : 'open group'
 }
 
+function relayGroupName(event: NestrEvent, fallbackGroupId: string) {
+  return tagValue(event, 'name') ?? tagValue(event, 'd') ?? fallbackGroupId
+}
+
+function relayGroupSavedKey(event: NestrEvent, fallbackRelayUrl: string, fallbackGroupId: string) {
+  return relayGroupKey(
+    relayUrlFromGroupEvent(event, fallbackRelayUrl),
+    tagValue(event, 'd') ?? fallbackGroupId,
+  )
+}
+
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
@@ -204,6 +235,38 @@ function roleList(value: string) {
     .filter(Boolean)
 }
 
+const ADMIN_PERMISSION_ALIASES: Record<number, string[]> = {
+  [NIP29_KINDS.putUser]: ['put-user', 'put_user', 'add-user', 'add_user', 'manage-members', 'manage_members'],
+  [NIP29_KINDS.removeUser]: ['remove-user', 'remove_user', 'manage-members', 'manage_members'],
+  [NIP29_KINDS.editMetadata]: ['edit-metadata', 'edit_metadata', 'edit-group', 'edit_group'],
+  [NIP29_KINDS.deleteEvent]: ['delete-event', 'delete_event', 'delete-message', 'delete_message', 'moderate'],
+  [NIP29_KINDS.createInvite]: ['create-invite', 'create_invite', 'invite'],
+  [NIP29_KINDS.deleteGroup]: ['delete-group', 'delete_group'],
+}
+
+function normalizedPermissionToken(value: string) {
+  return value.trim().toLowerCase()
+}
+
+function permissionTokensForKind(kind: number) {
+  return new Set([String(kind), `kind:${kind}`, `sign_event:${kind}`, ...(ADMIN_PERMISSION_ALIASES[kind] ?? [])])
+}
+
+function roleAllowsKind(permissions: Set<string>, kind: number) {
+  const allowed = permissionTokensForKind(kind)
+  return Array.from(allowed).some((token) => permissions.has(normalizedPermissionToken(token)))
+}
+
+function rolePermissionLabel(kind: number) {
+  if (kind === NIP29_KINDS.putUser) return 'add/update members'
+  if (kind === NIP29_KINDS.removeUser) return 'remove members'
+  if (kind === NIP29_KINDS.editMetadata) return 'edit group'
+  if (kind === NIP29_KINDS.deleteEvent) return 'delete messages'
+  if (kind === NIP29_KINDS.createInvite) return 'create invites'
+  if (kind === NIP29_KINDS.deleteGroup) return 'delete group'
+  return `kind ${kind}`
+}
+
 function randomInviteCode() {
   const bytes = new Uint8Array(4)
   crypto.getRandomValues(bytes)
@@ -226,6 +289,10 @@ function relayHostLabel(relayUrl: string) {
 
 function trimRelayProtocol(relayUrl: string) {
   return relayUrl.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').replace(/\/$/, '')
+}
+
+function relayHref(relayUrl: string) {
+  return `/?${new URLSearchParams({ relay: relayUrl }).toString()}`
 }
 
 function relayGroupSearchText(groupEvent: NestrEvent, fallbackGroupId: string) {
@@ -613,7 +680,7 @@ interface StreamTileProps {
 }
 
 type AuthState = 'mock' | 'idle' | 'connecting' | 'reconnecting' | 'connected' | 'disconnected'
-type AppView = 'relay' | 'group' | 'dm'
+type AppView = 'home' | 'relay' | 'group' | 'dm'
 type AuthPromptKind = 'relay' | 'dm' | 'write' | 'admin' | 'reconnect' | 'manual'
 type AdminDialog = 'join' | 'member' | 'invite' | 'details' | 'moderation' | 'joins' | null
 
@@ -635,7 +702,41 @@ interface CallMediaState {
   screen?: boolean
 }
 
+interface AutoCallMediaPrefs {
+  key: string
+  video: boolean
+  audio: boolean
+}
+
 type StoredPositionMovement = PositionMovement & { sentAt: number }
+
+function buildAutoCallMediaPrefsKey(relayUrl: string, groupId: string) {
+  return `${AUTO_CALL_PREFS_STORAGE_PREFIX}:${normalizeRelayUrl(relayUrl)}:${groupId}`
+}
+
+function readAutoCallMediaPrefs(relayUrl: string, groupId: string): AutoCallMediaPrefs {
+  const key = buildAutoCallMediaPrefsKey(relayUrl, groupId)
+  try {
+    const raw = window.localStorage.getItem(key)
+    if (!raw) return { key, video: true, audio: true }
+    const parsed = JSON.parse(raw) as Partial<Pick<AutoCallMediaPrefs, 'video' | 'audio'>>
+    return {
+      key,
+      video: parsed.video !== false,
+      audio: parsed.audio !== false,
+    }
+  } catch {
+    return { key, video: true, audio: true }
+  }
+}
+
+function writeAutoCallMediaPrefs(prefs: AutoCallMediaPrefs) {
+  try {
+    window.localStorage.setItem(prefs.key, JSON.stringify({ video: prefs.video, audio: prefs.audio }))
+  } catch {
+    // Media auto-connect preferences are local convenience state; storage failures are non-fatal.
+  }
+}
 
 function signerRequired(reason?: string) {
   const value = String(reason ?? '').toLowerCase()
@@ -787,12 +888,18 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   const [message, setMessage] = useState('')
   const [messageFiles, setMessageFiles] = useState<File[]>([])
   const [relaySearch, setRelaySearch] = useState('')
+  const [discoveredRelays, setDiscoveredRelays] = useState<DiscoveredNip29Relay[]>([])
+  const [discoveryStatus, setDiscoveryStatus] = useState('Preparing relay discovery')
+  const [discoveryRun, setDiscoveryRun] = useState(0)
   const routeViewKey = `${launch.relayUrl}:${launch.groupId ?? ''}:${launch.initialView}`
   const [appViewState, setAppViewState] = useState<{ key: string; view: AppView }>(() => ({
     key: routeViewKey,
     view: launch.initialView,
   }))
-  const appView = appViewState.key === routeViewKey ? appViewState.view : launch.initialView
+  const storedRouteView = appViewState.key === routeViewKey ? appViewState.view : launch.initialView
+  const appView = launch.mode === 'live' && !launch.groupId && storedRouteView === 'group'
+    ? launch.initialView
+    : storedRouteView
   const setAppView = useCallback(
     (view: AppView) => setAppViewState({ key: routeViewKey, view }),
     [routeViewKey],
@@ -809,8 +916,12 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   const [liveCallPeers, setLiveCallPeers] = useState<Array<{ pubkey: string; name: string }>>([])
   const [cameraEnabled, setCameraEnabled] = useState(true)
   const [micEnabled, setMicEnabled] = useState(true)
+  const [autoCallMediaPrefs, setAutoCallMediaPrefs] = useState(() =>
+    readAutoCallMediaPrefs(snapshot.group.relay, snapshot.group.id),
+  )
   const [callExpanded, setCallExpanded] = useState(false)
   const [authState, setAuthState] = useState<AuthState>(() => (launch.mode === 'live' ? 'idle' : 'mock'))
+  const [authBootstrapPending, setAuthBootstrapPending] = useState(() => launch.mode === 'live')
   const [authStatus, setAuthStatus] = useState(() =>
     launch.mode === 'live' ? 'opening live chatroom' : 'local development relay',
   )
@@ -828,6 +939,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   const [newGroupName, setNewGroupName] = useState('')
   const [newGroupId, setNewGroupId] = useState(() => randomGroupId())
   const [relayUrlInput, setRelayUrlInput] = useState('')
+  const [openGroupIdInput, setOpenGroupIdInput] = useState('')
   const [metadataEdits, setMetadataEdits] = useState<Partial<Nip29MetadataDraft>>({})
   const [connectSession, setConnectSession] = useState<NostrConnectSession | null>(null)
   const [storedConnectSession, setStoredConnectSession] = useState<NostrConnectStoredSession | null>(null)
@@ -836,6 +948,9 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   const [showAccountDialog, setShowAccountDialog] = useState(false)
   const [showCreateGroupDialog, setShowCreateGroupDialog] = useState(false)
   const [showAddRelayDialog, setShowAddRelayDialog] = useState(false)
+  const [showOpenGroupDialog, setShowOpenGroupDialog] = useState(false)
+  const [showRemoveRelayDialog, setShowRemoveRelayDialog] = useState(false)
+  const [relayErrorToast, setRelayErrorToast] = useState<RelaySnapshot['relayError'] | null>(null)
   const [adminDialog, setAdminDialog] = useState<AdminDialog>(null)
   const [signerPendingPrompt, setSignerPendingPrompt] = useState<SignerPendingPrompt | null>(null)
   const [mobileChatOpen, setMobileChatOpen] = useState(false)
@@ -845,9 +960,6 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   const [blockedAdminKinds, setBlockedAdminKinds] = useState<Set<number>>(() => new Set())
   const [lastSignerPingAt, setLastSignerPingAt] = useState<number | null>(() => (launch.mode === 'live' ? null : Date.now()))
   const [nowMs, setNowMs] = useState(() => Date.now())
-  const [storedRelayUrls, setStoredRelayUrls] = useState<string[]>(() =>
-    launch.mode === 'live' ? uniqueRelayUrls([...readSavedRelayUrls(), launch.relayUrl]) : [launch.relayUrl],
-  )
   const [uploadStatus, setUploadStatus] = useState('')
   const callStageRef = useRef<HTMLDivElement | null>(null)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
@@ -869,14 +981,20 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   const remoteMediaStatesRef = useRef<Map<string, CallMediaState>>(new Map())
   const livePeerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map())
   const liveVideoSendersRef = useRef<Map<string, RTCRtpSender>>(new Map())
+  const liveAudioSendersRef = useRef<Map<string, RTCRtpSender>>(new Map())
   const pendingIceCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map())
+  const liveIceCandidateBuffersRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map())
+  const liveIceCandidateKeysRef = useRef<Map<string, Set<string>>>(new Map())
+  const liveIceCandidateTimersRef = useRef<Map<string, number>>(new Map())
   const callPeersRef = useRef<Array<{ pubkey: string; name: string }>>([])
+  const autoCallMediaPrefsRef = useRef(autoCallMediaPrefs)
   const liveParticipantAnnouncementTimerRef = useRef<number | null>(null)
   const lastOwnPositionRef = useRef<StoredPositionMovement | null>(null)
   const latestPositionsRef = useRef<RelaySnapshot['positions']>(snapshot.positions)
   const canEnterOfficeRef = useRef(false)
   const positionRefreshRef = useRef<() => void>(() => undefined)
   const positionRefreshFallbackInFlightRef = useRef(false)
+  const joinStatusTimersRef = useRef<number[]>([])
   const callStartedRef = useRef(false)
   const autoCallKeyRef = useRef('')
   const spawnPublishKeyRef = useRef('')
@@ -893,19 +1011,53 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   const metadataName = tagValue(snapshot.group.metadata, 'name') ?? 'Chatroom'
   const groupAbout = tagValue(snapshot.group.metadata, 'about') ?? ''
   const relayHost = relayHostLabel(snapshot.group.relay)
+  const autoCallMediaStorageKey = useMemo(
+    () => buildAutoCallMediaPrefsKey(snapshot.group.relay, snapshot.group.id),
+    [snapshot.group.id, snapshot.group.relay],
+  )
+  const storedAutoCallMediaPrefs = useMemo(
+    () => readAutoCallMediaPrefs(snapshot.group.relay, snapshot.group.id),
+    [snapshot.group.id, snapshot.group.relay],
+  )
   const snapshotRelayUrls = useMemo(
     () => snapshot.relayUrls ?? [snapshot.group.relay],
     [snapshot.group.relay, snapshot.relayUrls],
   )
-  const savedRelayUrls = useMemo(
-    () => uniqueRelayUrls([...storedRelayUrls, ...snapshotRelayUrls, snapshot.group.relay]),
-    [snapshot.group.relay, snapshotRelayUrls, storedRelayUrls],
+  const snapshotSavedRelayUrls = useMemo(
+    () => snapshot.savedRelayUrls ?? [],
+    [snapshot.savedRelayUrls],
   )
-  const savedRelayUrlsKey = savedRelayUrls.join('|')
+  const railRelayUrls = useMemo(
+    () => uniqueRelayUrls([...snapshotSavedRelayUrls, ...snapshotRelayUrls, snapshot.group.relay]),
+    [snapshot.group.relay, snapshotRelayUrls, snapshotSavedRelayUrls],
+  )
+  const currentRelayIsSaved = useMemo(
+    () => snapshotSavedRelayUrls.some((relayUrl) => sameRelayUrl(relayUrl, snapshot.group.relay)),
+    [snapshot.group.relay, snapshotSavedRelayUrls],
+  )
   const hasSelectedGroup = relay.mode === 'mock' || (launch.mode === 'live' && Boolean(launch.groupId))
+  const savedGroupKeySet = useMemo(() => new Set(snapshot.savedGroupKeys ?? []), [snapshot.savedGroupKeys])
+  const savedGroupsLoading = Boolean(snapshot.savedGroupsLoading)
+  const showSavedGroupsLoading = appView === 'home' && savedGroupsLoading
   const relayGroups = useMemo(
-    () => (snapshot.relayGroups.length > 0 || !hasSelectedGroup ? snapshot.relayGroups : [snapshot.group.metadata]),
-    [hasSelectedGroup, snapshot.group.metadata, snapshot.relayGroups],
+    () => {
+      const groups = snapshot.relayGroups.length > 0 || !hasSelectedGroup ? snapshot.relayGroups : [snapshot.group.metadata]
+      const localGroups = groups.filter((groupEvent) =>
+        sameRelayUrl(relayUrlFromGroupEvent(groupEvent, snapshot.group.relay), snapshot.group.relay),
+      )
+      return localGroups.slice().sort((a, b) => {
+        const aSaved = savedGroupKeySet.has(relayGroupSavedKey(a, snapshot.group.relay, snapshot.group.id))
+        const bSaved = savedGroupKeySet.has(relayGroupSavedKey(b, snapshot.group.relay, snapshot.group.id))
+        if (aSaved !== bSaved) return aSaved ? -1 : 1
+
+        const aLocal = sameRelayUrl(relayUrlFromGroupEvent(a, snapshot.group.relay), snapshot.group.relay)
+        const bLocal = sameRelayUrl(relayUrlFromGroupEvent(b, snapshot.group.relay), snapshot.group.relay)
+        if (aLocal !== bLocal) return aLocal ? -1 : 1
+
+        return relayGroupName(a, snapshot.group.id).localeCompare(relayGroupName(b, snapshot.group.id))
+      })
+    },
+    [hasSelectedGroup, savedGroupKeySet, snapshot.group.id, snapshot.group.metadata, snapshot.group.relay, snapshot.relayGroups],
   )
   const normalizedRelaySearch = relaySearch.trim().toLowerCase()
   const filteredRelayGroups = useMemo(
@@ -921,6 +1073,64 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     filteredRelayGroups.length === relayGroups.length
       ? String(relayGroups.length)
       : `${filteredRelayGroups.length} / ${relayGroups.length}`
+  const homepageRelays = useMemo(() => {
+    const byRelayUrl = new Map<string, DiscoveredNip29Relay & { saved?: boolean }>()
+
+    snapshotSavedRelayUrls.forEach((relayUrl) => {
+      const normalized = normalizeRelayUrl(relayUrl)
+      if (!normalized) return
+      byRelayUrl.set(normalized, {
+        url: normalized,
+        name: relayHostLabel(normalized),
+        description: 'Saved in your NIP-51 relay list.',
+        icon: '',
+        updatedAt: 0,
+        monitorCount: 0,
+        rttOpen: null,
+        rttRead: null,
+        requiresAuth: null,
+        requiresPayment: null,
+        sourceRelays: [],
+        saved: true,
+      })
+    })
+
+    snapshotRelayUrls.forEach((relayUrl) => {
+      const normalized = normalizeRelayUrl(relayUrl)
+      if (!normalized || byRelayUrl.has(normalized)) return
+      byRelayUrl.set(normalized, {
+        url: normalized,
+        name: relayHostLabel(normalized),
+        description: 'Found from your saved groups or current session.',
+        icon: '',
+        updatedAt: 0,
+        monitorCount: 0,
+        rttOpen: null,
+        rttRead: null,
+        requiresAuth: null,
+        requiresPayment: null,
+        sourceRelays: [],
+      })
+    })
+
+    discoveredRelays.forEach((relay) => {
+      const normalized = normalizeRelayUrl(relay.url)
+      const existing = byRelayUrl.get(normalized)
+      byRelayUrl.set(normalized, {
+        ...relay,
+        url: normalized,
+        saved: existing?.saved,
+      })
+    })
+
+    return Array.from(byRelayUrl.values()).sort((a, b) => {
+      if (a.saved !== b.saved) return a.saved ? -1 : 1
+      const aRtt = a.rttRead ?? a.rttOpen ?? Number.POSITIVE_INFINITY
+      const bRtt = b.rttRead ?? b.rttOpen ?? Number.POSITIVE_INFINITY
+      if (aRtt !== bRtt) return aRtt - bRtt
+      return a.url.localeCompare(b.url)
+    })
+  }, [discoveredRelays, snapshotRelayUrls, snapshotSavedRelayUrls])
   const connectionStatus = snapshot.connectionStatus ?? relay.mode
   const connectionMessage = authDetail || snapshot.connectionMessage || authStatus
   const roomAccessStatus = snapshot.roomAccessStatus ?? 'unknown'
@@ -982,13 +1192,15 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     },
     [canEnterOffice, nowMs, relay.mode, selfPubkey, snapshot.positions],
   )
+  const selfPlacedInOffice = officePositions.some((position) => position.pubkey === selfPubkey)
   const nearby = useMemo(
-    () => (canEnterOffice ? nearbyPeers(selfPubkey, officePositions, 136) : []),
+    () => (canEnterOffice ? nearbyPeers(selfPubkey, officePositions, PROXIMITY_CALL_RADIUS) : []),
     [canEnterOffice, officePositions, selfPubkey],
   )
   const nearbyKey = nearby.map((peer) => peer.pubkey).sort().join('|')
-  const signerDisplayName =
-    currentUser?.name && currentUser.name !== 'You' ? currentUser.name : shortNpub(selfPubkey)
+  const currentProfileName = currentUser?.name && currentUser.name !== 'You' ? currentUser.name : ''
+  const signerDisplayName = currentProfileName || shortNpub(selfPubkey)
+  const homeGreeting = currentProfileName ? `Welcome, ${currentProfileName}` : 'Welcome'
   const showSignerPill =
     relay.mode === 'live' &&
     (authState === 'reconnecting' ||
@@ -1001,44 +1213,124 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   const showMesh = isSignedIn && nearby.length > 0
   const nearbyCallLabel =
     nearby.length === 1 ? nameFor(nearby[0].pubkey, snapshot.users) : `${nearby.length} plebs`
+  const supportedRoles = supportedRoleTags(snapshot.group.roles)
+  const currentRoleDefinitions = supportedRoles.filter((role) => currentRoles.includes(role.name))
+  const explicitRolePermissions = supportedRoles.some((role) => role.permissions.length > 0)
+  const currentPermissionTokens = new Set(
+    currentRoleDefinitions.flatMap((role) => role.permissions).map(normalizedPermissionToken),
+  )
   const canManageGroup = currentRoles.length > 0 || currentUser?.role === 'admin' || currentUser?.role === 'moderator'
   const canUseChatroomActions = relay.mode === 'mock' || authState === 'connected'
   const canCreateRelayGroup = relay.mode === 'mock' || authState === 'connected'
-  const canCreateInvite = canManageGroup && !blockedAdminKinds.has(NIP29_KINDS.createInvite)
+  const canPublishAdminKind = (kind: number) => {
+    if (!canManageGroup || blockedAdminKinds.has(kind)) return false
+    if (!explicitRolePermissions || currentRoles.length === 0) return true
+    return roleAllowsKind(currentPermissionTokens, kind)
+  }
+  const canPutUser = canPublishAdminKind(NIP29_KINDS.putUser)
+  const canRemoveUser = canPublishAdminKind(NIP29_KINDS.removeUser)
+  const canEditGroup = canPublishAdminKind(NIP29_KINDS.editMetadata)
+  const canDeleteMessages = canPublishAdminKind(NIP29_KINDS.deleteEvent)
+  const canCreateInvite = canPublishAdminKind(NIP29_KINDS.createInvite)
+  const canDeleteRoom = canPublishAdminKind(NIP29_KINDS.deleteGroup)
+  const canReviewJoins = canPutUser || canRemoveUser
+  const canManageMembers = canPutUser || canRemoveUser
+  const allowedRoleActions = [
+    NIP29_KINDS.putUser,
+    NIP29_KINDS.removeUser,
+    NIP29_KINDS.editMetadata,
+    NIP29_KINDS.deleteEvent,
+    NIP29_KINDS.createInvite,
+    NIP29_KINDS.deleteGroup,
+  ].filter((kind) => roleAllowsKind(currentPermissionTokens, kind))
+  const adminCapabilityLabel = currentRoles.length === 0
+    ? 'Using local admin fallback'
+    : explicitRolePermissions
+    ? allowedRoleActions.length > 0
+      ? `Allowed: ${allowedRoleActions.map(rolePermissionLabel).join(', ')}`
+      : 'No explicit admin permissions for this role'
+    : 'Relay has not published per-role permissions'
+
+  useEffect(() => {
+    return () => {
+      joinStatusTimersRef.current.forEach((timer) => window.clearTimeout(timer))
+      joinStatusTimersRef.current = []
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!currentIsMember) return
+    joinStatusTimersRef.current.forEach((timer) => window.clearTimeout(timer))
+    joinStatusTimersRef.current = []
+  }, [currentIsMember])
 
   useEffect(() => {
     document.title =
-      appView === 'group' && hasSelectedGroup
+      appView === 'home'
+        ? 'Nestr'
+        : appView === 'group' && hasSelectedGroup
         ? `Nestr - ${metadataName}`
         : `Nestr - ${trimRelayProtocol(snapshot.group.relay)}`
   }, [appView, hasSelectedGroup, metadataName, snapshot.group.relay])
 
   useEffect(() => {
-    if (relay.mode !== 'live') return undefined
-    const timeout = window.setTimeout(() => {
-      setStoredRelayUrls((current) => (current.join('|') === savedRelayUrlsKey ? current : savedRelayUrls))
-      writeSavedRelayUrls(savedRelayUrls)
+    const relayError = snapshot.relayError
+    if (!relayError) return undefined
+
+    const showTimer = window.setTimeout(() => setRelayErrorToast(relayError), 0)
+    const dismissTimer = window.setTimeout(() => {
+      setRelayErrorToast((current) => (current?.id === relayError.id ? null : current))
+    }, 7000)
+
+    return () => {
+      window.clearTimeout(showTimer)
+      window.clearTimeout(dismissTimer)
+    }
+  }, [snapshot.relayError])
+
+  useEffect(() => {
+    if (appView !== 'home') return undefined
+
+    let unsubscribe: () => void = () => undefined
+    const timer = window.setTimeout(() => {
+      setDiscoveredRelays([])
+      setDiscoveryStatus('Listening for NIP-66 relay announcements')
+      unsubscribe = subscribeNip29RelayDiscovery(setDiscoveredRelays, setDiscoveryStatus)
     }, 0)
-    return () => window.clearTimeout(timeout)
-  }, [relay.mode, savedRelayUrls, savedRelayUrlsKey])
-  const supportedRoles = supportedRoleTags(snapshot.group.roles)
+
+    return () => {
+      window.clearTimeout(timer)
+      unsubscribe()
+    }
+  }, [appView, discoveryRun])
+
   const peopleListKey = `${appView}:${snapshot.group.relay}:${snapshot.group.id}`
   const peopleRenderLimit = peopleRenderState.key === peopleListKey ? peopleRenderState.limit : PEOPLE_RENDER_STEP
+  const isOnline = useCallback(
+    (pubkey: string) => isOnlineFromActivity(pubkey, snapshot.presence, snapshot.positions),
+    [snapshot.positions, snapshot.presence],
+  )
   const visiblePeople = useMemo(
-    () => snapshot.users.filter(
-      (user) => groupMemberSet.has(user.pubkey) || (canEnterOffice && user.pubkey === selfPubkey),
-    ),
-    [canEnterOffice, groupMemberSet, selfPubkey, snapshot.users],
+    () =>
+      snapshot.users
+        .filter((user) => groupMemberSet.has(user.pubkey) || (canEnterOffice && user.pubkey === selfPubkey))
+        .sort((a, b) => {
+          if (a.pubkey === selfPubkey) return -1
+          if (b.pubkey === selfPubkey) return 1
+
+          const aOnline = isOnline(a.pubkey)
+          const bOnline = isOnline(b.pubkey)
+          if (aOnline !== bOnline) return aOnline ? -1 : 1
+
+          return a.name.localeCompare(b.name)
+        }),
+    [canEnterOffice, groupMemberSet, isOnline, selfPubkey, snapshot.users],
   )
   const renderedPeople = useMemo(
     () => visiblePeople.slice(0, peopleRenderLimit),
     [peopleRenderLimit, visiblePeople],
   )
   const hiddenPeopleCount = Math.max(0, visiblePeople.length - renderedPeople.length)
-  const isOnline = useCallback(
-    (pubkey: string) => isOnlineFromActivity(pubkey, snapshot.presence, snapshot.positions),
-    [snapshot.positions, snapshot.presence],
-  )
   const officePresenceLabel = useMemo(() => {
     const onlineCount = visiblePeople.filter((user) => isOnline(user.pubkey)).length
     const officeCount = new Set(officePositions.map((position) => position.pubkey)).size
@@ -1106,7 +1398,15 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   const remoteVideoPubkeys = useMemo(() => new Set(remoteVideos.map((video) => video.pubkey)), [remoteVideos])
   const canScreenShare = Boolean(navigator.mediaDevices?.getDisplayMedia)
   const localCallStream = screenStream ?? (cameraEnabled ? localStream : null)
+  const activeAutoCallMediaPrefs = useMemo(
+    () => (autoCallMediaPrefs.key === autoCallMediaStorageKey ? autoCallMediaPrefs : storedAutoCallMediaPrefs),
+    [autoCallMediaPrefs, autoCallMediaStorageKey, storedAutoCallMediaPrefs],
+  )
   const unreadChatCount = Math.max(0, snapshot.messages.length - seenChatCount)
+
+  useEffect(() => {
+    autoCallMediaPrefsRef.current = activeAutoCallMediaPrefs
+  }, [activeAutoCallMediaPrefs])
 
   useEffect(() => {
     localStreamRef.current = localStream
@@ -1167,6 +1467,8 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
 
   useEffect(() => {
     if (previousRelayRef.current === relay) return
+    joinStatusTimersRef.current.forEach((timer) => window.clearTimeout(timer))
+    joinStatusTimersRef.current = []
     previousRelayRef.current = relay
     setCallStarted(false)
     setLiveCallPeers([])
@@ -1180,7 +1482,9 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     livePeerConnectionsRef.current.forEach((connection) => connection.close())
     livePeerConnectionsRef.current.clear()
     liveVideoSendersRef.current.clear()
+    liveAudioSendersRef.current.clear()
     pendingIceCandidatesRef.current.clear()
+    clearAllLiveIceCandidateBatches()
     localStreamRef.current?.getTracks().forEach((track) => track.stop())
     screenStreamRef.current?.getTracks().forEach((track) => track.stop())
     localStreamRef.current = null
@@ -1388,7 +1692,9 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
       livePeerConnectionsRef.current.forEach((connection) => connection.close())
       livePeerConnectionsRef.current.clear()
       liveVideoSendersRef.current.clear()
+      liveAudioSendersRef.current.clear()
       pendingIceCandidatesRef.current.clear()
+      clearAllLiveIceCandidateBatches()
       remoteVideosRef.current.forEach((video) => video.stop())
       remoteVideosRef.current = []
       remoteMediaStatesRef.current.clear()
@@ -1475,6 +1781,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
 
     const attempt = authAttemptRef.current + 1
     authAttemptRef.current = attempt
+    setAuthBootstrapPending(false)
     activeSignerRef.current = null
     setActiveSigner(null)
     setAuthPrompt(
@@ -1590,70 +1897,77 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
 
     const attempt = authAttemptRef.current + 1
     authAttemptRef.current = attempt
+    setAuthBootstrapPending(true)
     clearConnectSession()
     debugLog('auth', 'beginAutoAuth start', { attempt, interactiveFallback, relay: relay.relayUrl })
-    const storedSession = await readStoredNostrConnectSession()
-    const normalizedStoredSession = storedSession ? normalizeStoredNostrConnectSession(storedSession) : null
 
-    if (attempt !== authAttemptRef.current) return
-    setStoredConnectSession(normalizedStoredSession)
-    debugLog('auth', 'stored Nostr Connect session read', {
-      attempt,
-      found: Boolean(normalizedStoredSession),
-      pubkey: shortId(normalizedStoredSession?.userPubkey),
-      relays: nostrConnectStoredRelayHints(normalizedStoredSession),
-    })
+    try {
+      const storedSession = await readStoredNostrConnectSession()
+      const normalizedStoredSession = storedSession ? normalizeStoredNostrConnectSession(storedSession) : null
 
-    if (normalizedStoredSession) {
-      const restoreRelays = nostrConnectStoredRelayHints(normalizedStoredSession).map(relayHostLabel).join(', ')
-      const restoreStartedAt = performance.now()
-      setAuthState('reconnecting')
-      setAuthStatus('reconnecting signer')
-      setAuthDetail(
-        `restoring ${shortNpub(normalizedStoredSession.userPubkey)}${restoreRelays ? ` via ${restoreRelays}` : ''}`,
-      )
-      try {
-        debugLog('auth', 'restore signer probe start', {
-          attempt,
-          pubkey: shortId(normalizedStoredSession.userPubkey),
-          relays: nostrConnectStoredRelayHints(normalizedStoredSession),
-        })
-        const result = await withTimeout(
-          restoreNostrConnectSigner(normalizedStoredSession),
-          9_000,
-          'signer reconnect timed out',
+      if (attempt !== authAttemptRef.current) return
+      setStoredConnectSession(normalizedStoredSession)
+      debugLog('auth', 'stored Nostr Connect session read', {
+        attempt,
+        found: Boolean(normalizedStoredSession),
+        pubkey: shortId(normalizedStoredSession?.userPubkey),
+        relays: nostrConnectStoredRelayHints(normalizedStoredSession),
+      })
+
+      if (normalizedStoredSession) {
+        const restoreRelays = nostrConnectStoredRelayHints(normalizedStoredSession).map(relayHostLabel).join(', ')
+        const restoreStartedAt = performance.now()
+        setAuthState('reconnecting')
+        setAuthStatus('reconnecting signer')
+        setAuthDetail(
+          `restoring ${shortNpub(normalizedStoredSession.userPubkey)}${restoreRelays ? ` via ${restoreRelays}` : ''}`,
         )
-        debugLog('auth', 'restore signer probe success', {
-          attempt,
-          pubkey: shortId(result.signer.pubkey),
-          elapsedMs: debugDuration(restoreStartedAt),
+        try {
+          debugLog('auth', 'restore signer probe start', {
+            attempt,
+            pubkey: shortId(normalizedStoredSession.userPubkey),
+            relays: nostrConnectStoredRelayHints(normalizedStoredSession),
+          })
+          const result = await withTimeout(
+            restoreNostrConnectSigner(normalizedStoredSession),
+            9_000,
+            'signer reconnect timed out',
+          )
+          debugLog('auth', 'restore signer probe success', {
+            attempt,
+            pubkey: shortId(result.signer.pubkey),
+            elapsedMs: debugDuration(restoreStartedAt),
+          })
+          await completeAuthAttempt(attempt, result.signer, result.storedSession)
+          return
+        } catch (error) {
+          if (attempt !== authAttemptRef.current) return
+          debugError('auth', 'restore signer probe failed', {
+            attempt,
+            elapsedMs: debugDuration(restoreStartedAt),
+            error: errorMessage(error),
+          })
+          markSignerDisconnected(`could not reconnect: ${errorMessage(error)}`)
+          return
+        }
+      }
+
+      if (interactiveFallback) {
+        setAuthBootstrapPending(false)
+        await beginLogin({
+          kind: 'manual',
+          title: authPromptTitle('manual'),
+          detail: 'No stored signer session was found. Connect a signer to continue.',
         })
-        await completeAuthAttempt(attempt, result.signer, result.storedSession)
-        return
-      } catch (error) {
-        if (attempt !== authAttemptRef.current) return
-        debugError('auth', 'restore signer probe failed', {
-          attempt,
-          elapsedMs: debugDuration(restoreStartedAt),
-          error: errorMessage(error),
-        })
-        markSignerDisconnected(`could not reconnect: ${errorMessage(error)}`)
         return
       }
-    }
 
-    if (interactiveFallback) {
-      await beginLogin({
-        kind: 'manual',
-        title: authPromptTitle('manual'),
-        detail: 'No stored signer session was found. Connect a signer to continue.',
-      })
-      return
+      setAuthState('idle')
+      setAuthStatus('signer ready when needed')
+      setAuthDetail('waiting for an auth-gated action')
+    } finally {
+      if (attempt === authAttemptRef.current) setAuthBootstrapPending(false)
     }
-
-    setAuthState('idle')
-    setAuthStatus('signer ready when needed')
-    setAuthDetail('waiting for an auth-gated action')
   }, [beginLogin, clearConnectSession, completeAuthAttempt, markSignerDisconnected, relay])
 
   useEffect(() => {
@@ -1780,6 +2094,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
 
   useEffect(() => {
     if (relay.mode !== 'live') return
+    if (authBootstrapPending || authPrompt) return
     if (authState === 'connected' || authState === 'connecting' || authState === 'reconnecting') return
     const key = `${snapshot.connectionStatus ?? ''}:${snapshot.connectionMessage ?? ''}`
     if (key === lastRelayAuthPromptRef.current || !signerRequired(snapshot.connectionMessage)) return
@@ -1794,10 +2109,11 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     }, 0)
 
     return () => window.clearTimeout(timer)
-  }, [authState, beginLogin, relay.mode, relayHost, snapshot.connectionMessage, snapshot.connectionStatus])
+  }, [authBootstrapPending, authPrompt, authState, beginLogin, relay.mode, relayHost, snapshot.connectionMessage, snapshot.connectionStatus])
 
   useEffect(() => {
     if (relay.mode !== 'live' || appView !== 'dm') return
+    if (authBootstrapPending || authPrompt) return
     if (authState === 'connected' || authState === 'connecting' || authState === 'reconnecting') return
     const timer = window.setTimeout(() => {
       void beginLogin({
@@ -1808,7 +2124,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     }, 0)
 
     return () => window.clearTimeout(timer)
-  }, [appView, authState, beginLogin, relay.mode, relayHost])
+  }, [appView, authBootstrapPending, authPrompt, authState, beginLogin, relay.mode, relayHost])
 
   useEffect(() => {
     if (relay.mode !== 'live' || appView !== 'group' || !hasSelectedGroup || !canReadGroup) return undefined
@@ -1869,6 +2185,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     stopRemoteVideos()
     setCallExpanded(false)
     setAuthState('idle')
+    setAuthBootstrapPending(false)
     setAuthStatus('logged out')
     setAuthDetail('waiting for an auth-gated action')
     setLastSignerPingAt(null)
@@ -1881,6 +2198,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     clearConnectSession()
     if (authState === 'connecting') {
       setAuthState('idle')
+      setAuthBootstrapPending(false)
       setAuthStatus('signer ready when needed')
       setAuthDetail('waiting for an auth-gated action')
     }
@@ -1992,45 +2310,59 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   }, [authState, canEnterOffice, relay.mode])
 
   useEffect(() => {
-    if (relay.mode !== 'live' || authState !== 'connected' || !hasSelectedGroup || !canEnterOffice) return
-    if (roomAccessStatus !== 'open') return
-    if (snapshot.positions.some((position) => position.pubkey === selfPubkey)) return
+    if (relay.mode !== 'live' || authState !== 'connected' || !hasSelectedGroup || !canEnterOffice) return undefined
+    if (roomAccessStatus !== 'open') return undefined
+    if (officePositions.some((position) => position.pubkey === selfPubkey)) return undefined
 
     const spawnKey = `${snapshot.group.id}:${selfPubkey}`
-    if (spawnPublishKeyRef.current === spawnKey) return
-    spawnPublishKeyRef.current = spawnKey
+    if (spawnPublishKeyRef.current === spawnKey) return undefined
 
-    const spawn = spawnForPubkey(officeMap, selfPubkey, snapshot.users.length)
-    const spawnMovement = {
-      startX: spawn.x,
-      startY: spawn.y,
-      endX: spawn.x,
-      endY: spawn.y,
-      speed: 0,
-      sentAt: Date.now(),
-    }
-    lastOwnPositionRef.current = spawnMovement
-    const { sentAt, ...movement } = spawnMovement
-    void relay.publishPosition(selfPubkey, movement, sentAt).then((result) => {
-      if (
-        !result.ok &&
-        result.reason !== 'position-publish-queued' &&
-        result.reason !== 'stale-position-discarded' &&
-        result.reason !== 'group-required'
-      ) {
-        setAuthDetail(`position publish failed: ${result.reason}`)
+    const timer = window.setTimeout(() => {
+      const now = Date.now()
+      const freshPositions = latestPositionsRef.current.filter((position) => isPositionFresh(position, now))
+      if (freshPositions.some((position) => position.pubkey === selfPubkey)) return
+
+      spawnPublishKeyRef.current = spawnKey
+      const spawn = spawnAwayFromPositions(
+        officeMap,
+        selfPubkey,
+        snapshot.users.length,
+        freshPositions.filter((position) => position.pubkey !== selfPubkey),
+        PROXIMITY_CALL_RADIUS + officeMap.tileSize,
+      )
+      const spawnMovement = {
+        startX: spawn.x,
+        startY: spawn.y,
+        endX: spawn.x,
+        endY: spawn.y,
+        speed: 0,
+        sentAt: now,
       }
-    })
+      lastOwnPositionRef.current = spawnMovement
+      const { sentAt, ...movement } = spawnMovement
+      void relay.publishPosition(selfPubkey, movement, sentAt).then((result) => {
+        if (
+          !result.ok &&
+          result.reason !== 'position-publish-queued' &&
+          result.reason !== 'stale-position-discarded' &&
+          result.reason !== 'group-required'
+        ) {
+          setAuthDetail(`position publish failed: ${result.reason}`)
+        }
+      })
+    }, 650)
+
+    return () => window.clearTimeout(timer)
   }, [
     authState,
     canEnterOffice,
     hasSelectedGroup,
     officeMap,
+    officePositions,
     relay,
     roomAccessStatus,
     selfPubkey,
     snapshot.group.id,
-    snapshot.positions,
     snapshot.users.length,
   ])
 
@@ -2148,7 +2480,13 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     url.searchParams.delete('group')
     url.searchParams.delete('h')
     url.searchParams.delete('view')
-    setAppView('relay')
+    navigateInApp(url)
+  }
+
+  function navigateToHome() {
+    const url = new URL(window.location.href)
+    url.search = ''
+    url.hash = ''
     navigateInApp(url)
   }
 
@@ -2156,7 +2494,6 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     const url = new URL(window.location.href)
     url.searchParams.set('relay', snapshot.group.relay)
     url.searchParams.set('view', 'dm')
-    setAppView('dm')
     navigateInApp(url)
   }
 
@@ -2167,15 +2504,11 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     url.searchParams.delete('group')
     url.searchParams.delete('h')
     url.searchParams.delete('view')
-    setAppView('group')
     navigateInApp(url)
   }
 
   function switchToRelay(relayUrl: string) {
     const normalized = normalizeRelayUrl(relayUrl)
-    const next = uniqueRelayUrls([...storedRelayUrls, normalized])
-    setStoredRelayUrls(next)
-    writeSavedRelayUrls(next)
     if (sameRelayUrl(normalized, snapshot.group.relay) && appView === 'relay') return
     navigateToRelayView(normalized)
   }
@@ -2187,6 +2520,15 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     setShowAddRelayDialog(false)
     setRelayUrlInput('')
     switchToRelay(normalized)
+  }
+
+  function openDirectGroup(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const groupId = openGroupIdInput.trim()
+    if (!groupId) return
+    setShowOpenGroupDialog(false)
+    setOpenGroupIdInput('')
+    navigateToGroupView(groupId, snapshot.group.relay)
   }
 
   function selectRelayGroup(groupId: string, relayUrl = snapshot.group.relay) {
@@ -2252,6 +2594,22 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     }
   }
 
+  function clearJoinStatusChecks() {
+    joinStatusTimersRef.current.forEach((timer) => window.clearTimeout(timer))
+    joinStatusTimersRef.current = []
+  }
+
+  function scheduleJoinStatusChecks() {
+    if (relay.mode !== 'live') return
+    clearJoinStatusChecks()
+    JOIN_STATUS_REFRESH_DELAYS_MS.forEach((delayMs) => {
+      const timer = window.setTimeout(() => {
+        void relay.refreshGroupState()
+      }, delayMs)
+      joinStatusTimersRef.current.push(timer)
+    })
+  }
+
   async function requestJoin(event: FormEvent) {
     event.preventDefault()
     const ok = await runNip29Action('join request', () => relay.publishJoinRequest(selfPubkey, joinReason, joinCode))
@@ -2259,6 +2617,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
       setJoinReason('')
       setJoinCode('')
       setAdminDialog(null)
+      scheduleJoinStatusChecks()
     }
   }
 
@@ -2386,6 +2745,24 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     await runNip29Action('delete chatroom', () => relay.publishDeleteGroup(selfPubkey, 'group deleted from nestr'))
   }
 
+  async function saveCurrentRelay() {
+    const ok = await runNip29Action('save relay', () =>
+      relay.mode === 'live'
+        ? relay.publishSaveRelay(selfPubkey, snapshot.group.relay)
+        : { ok: false, reason: 'live-relay-required' },
+    )
+    if (ok) setShowRemoveRelayDialog(false)
+  }
+
+  async function removeCurrentRelay() {
+    const ok = await runNip29Action('remove relay', () =>
+      relay.mode === 'live'
+        ? relay.publishRemoveRelay(selfPubkey, snapshot.group.relay)
+        : { ok: false, reason: 'live-relay-required' },
+    )
+    if (ok) setShowRemoveRelayDialog(false)
+  }
+
   function targetForCallEvent(event: NestrEvent) {
     return event.tags.find((tag) => tag[0] === 'p' && tag[1])?.[1] ?? ''
   }
@@ -2397,10 +2774,22 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     return description
   }
 
-  function callSignalCandidate(payload: unknown) {
-    if (!payload || typeof payload !== 'object') return null
-    const candidate = (payload as { candidate?: RTCIceCandidateInit }).candidate
-    return candidate?.candidate ? candidate : null
+  function callSignalCandidate(value: unknown) {
+    if (!value || typeof value !== 'object') return null
+    const candidate = value as RTCIceCandidateInit
+    return candidate.candidate ? candidate : null
+  }
+
+  function callSignalCandidates(payload: unknown) {
+    if (!payload || typeof payload !== 'object') return []
+    const directCandidate = callSignalCandidate((payload as { candidate?: unknown }).candidate)
+    if (directCandidate) return [directCandidate]
+    const candidates = (payload as { candidates?: unknown }).candidates
+    if (!Array.isArray(candidates)) return []
+    return candidates.flatMap((candidate) => {
+      const parsed = callSignalCandidate(candidate)
+      return parsed ? [parsed] : []
+    })
   }
 
   function parseCallSignalPayload(event: NestrEvent) {
@@ -2464,6 +2853,60 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     if (!result.ok && result.reason !== 'throttled') setAuthDetail(`call signal failed: ${result.reason}`)
   }
 
+  function iceCandidateKey(candidate: RTCIceCandidateInit) {
+    return `${candidate.sdpMid ?? ''}:${candidate.sdpMLineIndex ?? ''}:${candidate.candidate ?? ''}`
+  }
+
+  function clearLiveIceCandidateBatch(peerPubkey: string) {
+    const timer = liveIceCandidateTimersRef.current.get(peerPubkey)
+    if (timer !== undefined) window.clearTimeout(timer)
+    liveIceCandidateTimersRef.current.delete(peerPubkey)
+    liveIceCandidateBuffersRef.current.delete(peerPubkey)
+    liveIceCandidateKeysRef.current.delete(peerPubkey)
+  }
+
+  function clearAllLiveIceCandidateBatches() {
+    liveIceCandidateTimersRef.current.forEach((timer) => window.clearTimeout(timer))
+    liveIceCandidateTimersRef.current.clear()
+    liveIceCandidateBuffersRef.current.clear()
+    liveIceCandidateKeysRef.current.clear()
+  }
+
+  function flushLiveIceCandidates(peerPubkey: string) {
+    const timer = liveIceCandidateTimersRef.current.get(peerPubkey)
+    if (timer !== undefined) window.clearTimeout(timer)
+    liveIceCandidateTimersRef.current.delete(peerPubkey)
+
+    const candidates = liveIceCandidateBuffersRef.current.get(peerPubkey) ?? []
+    liveIceCandidateBuffersRef.current.delete(peerPubkey)
+    liveIceCandidateKeysRef.current.delete(peerPubkey)
+    if (candidates.length === 0) return
+
+    void publishLiveCallSignal(OFFICE_KINDS.iceCandidate, peerPubkey, { candidates })
+  }
+
+  function queueLiveIceCandidate(peerPubkey: string, candidate: RTCIceCandidate) {
+    const value = candidate.toJSON()
+    if (!value.candidate) return
+
+    const key = iceCandidateKey(value)
+    const keys = liveIceCandidateKeysRef.current.get(peerPubkey) ?? new Set<string>()
+    if (keys.has(key)) return
+    keys.add(key)
+    liveIceCandidateKeysRef.current.set(peerPubkey, keys)
+
+    liveIceCandidateBuffersRef.current.set(peerPubkey, [
+      ...(liveIceCandidateBuffersRef.current.get(peerPubkey) ?? []),
+      value,
+    ])
+
+    if (liveIceCandidateTimersRef.current.has(peerPubkey)) return
+    liveIceCandidateTimersRef.current.set(
+      peerPubkey,
+      window.setTimeout(() => flushLiveIceCandidates(peerPubkey), ICE_CANDIDATE_BATCH_DELAY_MS),
+    )
+  }
+
   function scheduleLiveCallParticipantAnnouncement() {
     if (relay.mode !== 'live' || !callStartedRef.current) return
     if (liveParticipantAnnouncementTimerRef.current !== null) {
@@ -2507,6 +2950,12 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     })
   }
 
+  function setSenderDirection(connection: RTCPeerConnection, sender: RTCRtpSender, track: MediaStreamTrack | null) {
+    const transceiver = connection.getTransceivers().find((candidate) => candidate.sender === sender)
+    if (!transceiver) return
+    transceiver.direction = track ? 'sendrecv' : 'recvonly'
+  }
+
   async function updateLiveVideoSenders(track: MediaStreamTrack | null, sourceStream: MediaStream | null) {
     if (relay.mode !== 'live') return
 
@@ -2517,11 +2966,35 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
           connection.getSenders().find((candidate) => candidate.track?.kind === 'video')
         if (sender) {
           liveVideoSendersRef.current.set(peerPubkey, sender)
+          setSenderDirection(connection, sender, track)
           await sender.replaceTrack(track)
+          await renegotiateLivePeerConnection(peerPubkey)
           return
         }
         if (!track || !sourceStream) return
         liveVideoSendersRef.current.set(peerPubkey, connection.addTrack(track, sourceStream))
+        await renegotiateLivePeerConnection(peerPubkey)
+      }),
+    )
+  }
+
+  async function updateLiveAudioSenders(track: MediaStreamTrack | null, sourceStream: MediaStream | null) {
+    if (relay.mode !== 'live') return
+
+    await Promise.all(
+      Array.from(livePeerConnectionsRef.current.entries()).map(async ([peerPubkey, connection]) => {
+        const sender =
+          liveAudioSendersRef.current.get(peerPubkey) ??
+          connection.getSenders().find((candidate) => candidate.track?.kind === 'audio')
+        if (sender) {
+          liveAudioSendersRef.current.set(peerPubkey, sender)
+          setSenderDirection(connection, sender, track)
+          await sender.replaceTrack(track)
+          await renegotiateLivePeerConnection(peerPubkey)
+          return
+        }
+        if (!track || !sourceStream) return
+        liveAudioSendersRef.current.set(peerPubkey, connection.addTrack(track, sourceStream))
         await renegotiateLivePeerConnection(peerPubkey)
       }),
     )
@@ -2616,16 +3089,32 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
       iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
     })
 
+    let hasAudioTransceiver = false
+    let hasVideoTransceiver = false
     liveCallMediaTracks(stream).forEach((track) => {
       const sourceStream = screenStreamRef.current?.getVideoTracks()[0] === track ? screenStreamRef.current : stream
       const sender = connection.addTrack(track, sourceStream ?? stream)
-      if (track.kind === 'video') liveVideoSendersRef.current.set(peerPubkey, sender)
+      if (track.kind === 'video') {
+        hasVideoTransceiver = true
+        liveVideoSendersRef.current.set(peerPubkey, sender)
+      }
+      if (track.kind === 'audio') {
+        hasAudioTransceiver = true
+        liveAudioSendersRef.current.set(peerPubkey, sender)
+      }
     })
+    if (!hasAudioTransceiver) {
+      liveAudioSendersRef.current.set(peerPubkey, connection.addTransceiver('audio', { direction: 'recvonly' }).sender)
+    }
+    if (!hasVideoTransceiver) {
+      liveVideoSendersRef.current.set(peerPubkey, connection.addTransceiver('video', { direction: 'recvonly' }).sender)
+    }
     connection.onicecandidate = (event) => {
-      if (!event.candidate) return
-      void publishLiveCallSignal(OFFICE_KINDS.iceCandidate, peerPubkey, {
-        candidate: event.candidate.toJSON(),
-      })
+      if (!event.candidate) {
+        flushLiveIceCandidates(peerPubkey)
+        return
+      }
+      queueLiveIceCandidate(peerPubkey, event.candidate)
     }
     connection.ontrack = (event) => {
       const [remoteStream] = event.streams
@@ -2650,13 +3139,14 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
 
   async function ensureLiveCallMedia() {
     if (localStreamRef.current) return localStreamRef.current
+    const prefs = autoCallMediaPrefsRef.current
     callStartedRef.current = true
     setCallStarted(true)
-    setCameraEnabled(true)
-    setMicEnabled(true)
-    cameraEnabledRef.current = true
-    micEnabledRef.current = true
-    return requestLocalMedia(true, true)
+    setCameraEnabled(prefs.video)
+    setMicEnabled(prefs.audio)
+    cameraEnabledRef.current = prefs.video
+    micEnabledRef.current = prefs.audio
+    return requestLocalMedia(prefs.video, prefs.audio)
   }
 
   async function startLivePeerConnections(stream: MediaStream | null) {
@@ -2701,14 +3191,19 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     }
 
     if (event.kind === OFFICE_KINDS.iceCandidate) {
-      const candidate = callSignalCandidate(payload)
-      if (!candidate) return
+      const candidates = callSignalCandidates(payload)
+      if (candidates.length === 0) return
       const connection = livePeerConnectionsRef.current.get(peerPubkey)
-      if (connection?.remoteDescription) await connection.addIceCandidate(candidate)
-      else pendingIceCandidatesRef.current.set(peerPubkey, [
-        ...(pendingIceCandidatesRef.current.get(peerPubkey) ?? []),
-        candidate,
-      ])
+      if (connection?.remoteDescription) {
+        for (const candidate of candidates) {
+          await connection.addIceCandidate(candidate)
+        }
+      } else {
+        pendingIceCandidatesRef.current.set(peerPubkey, [
+          ...(pendingIceCandidatesRef.current.get(peerPubkey) ?? []),
+          ...candidates,
+        ])
+      }
       return
     }
 
@@ -2804,7 +3299,9 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     livePeerConnectionsRef.current.get(pubkey)?.close()
     livePeerConnectionsRef.current.delete(pubkey)
     liveVideoSendersRef.current.delete(pubkey)
+    liveAudioSendersRef.current.delete(pubkey)
     pendingIceCandidatesRef.current.delete(pubkey)
+    clearLiveIceCandidateBatch(pubkey)
     remoteVideosRef.current.find((video) => video.pubkey === pubkey)?.stop()
     remoteMediaStatesRef.current.delete(pubkey)
     remoteVideosRef.current = remoteVideosRef.current.filter((video) => video.pubkey !== pubkey)
@@ -2858,7 +3355,9 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     livePeerConnectionsRef.current.forEach((connection) => connection.close())
     livePeerConnectionsRef.current.clear()
     liveVideoSendersRef.current.clear()
+    liveAudioSendersRef.current.clear()
     pendingIceCandidatesRef.current.clear()
+    clearAllLiveIceCandidateBatches()
   }
 
   function stopRemoteVideos() {
@@ -2877,13 +3376,29 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     window.setTimeout(publishLiveMediaState, 0)
   }
 
+  function updateAutoCallMediaPrefs(patch: Partial<Pick<AutoCallMediaPrefs, 'video' | 'audio'>>) {
+    setAutoCallMediaPrefs((current) => {
+      const base =
+        current.key === autoCallMediaStorageKey
+          ? current
+          : readAutoCallMediaPrefs(snapshot.group.relay, snapshot.group.id)
+      const next = { ...base, ...patch, key: autoCallMediaStorageKey }
+      autoCallMediaPrefsRef.current = next
+      writeAutoCallMediaPrefs(next)
+      return next
+    })
+  }
+
   async function requestLocalMedia(nextCamera = cameraEnabled, nextMic = micEnabled) {
-    localStream?.getTracks().forEach((track) => track.stop())
+    localStreamRef.current?.getTracks().forEach((track) => track.stop())
     setLocalStream(null)
 
     if (!nextCamera && !nextMic) {
-      setMediaState('idle')
-      return null
+      const emptyStream = new MediaStream()
+      localStreamRef.current = emptyStream
+      setLocalStream(emptyStream)
+      setMediaState('live')
+      return emptyStream
     }
 
     setMediaState('requesting')
@@ -2909,6 +3424,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
       stream.getVideoTracks().forEach((track) => {
         track.enabled = nextCamera
       })
+      localStreamRef.current = stream
       setLocalStream(stream)
       setMediaState('live')
       return stream
@@ -2926,11 +3442,12 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
       return
     }
 
-    setMediaState('requesting')
-    setCameraEnabled(true)
-    setMicEnabled(true)
-    cameraEnabledRef.current = true
-    micEnabledRef.current = true
+    const prefs = autoCallMediaPrefsRef.current
+    setMediaState(prefs.video || prefs.audio ? 'requesting' : 'live')
+    setCameraEnabled(prefs.video)
+    setMicEnabled(prefs.audio)
+    cameraEnabledRef.current = prefs.video
+    micEnabledRef.current = prefs.audio
     if (relay.mode === 'live') {
       setActiveLiveCallPeers(callPeers)
       callPeersRef.current = callPeers
@@ -2939,7 +3456,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     }
     callStartedRef.current = true
     setCallStarted(true)
-    const stream = await requestLocalMedia(true, true)
+    const stream = await requestLocalMedia(prefs.video, prefs.audio)
     if (relay.mode === 'mock') {
       replaceRemoteVideos(reconcileMockVideos(callPeerKey))
       return
@@ -2966,6 +3483,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     if (!screenStreamRef.current) {
       await updateLiveVideoSenders(nextCamera ? stream?.getVideoTracks()[0] ?? null : null, stream)
     }
+    await updateLiveAudioSenders(micEnabled ? stream?.getAudioTracks()[0] ?? null : null, stream)
     publishLiveMediaState()
   }
 
@@ -2980,7 +3498,11 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
       publishLiveMediaState()
       return
     }
-    await requestLocalMedia(cameraEnabled, nextMic)
+    const stream = await requestLocalMedia(cameraEnabled, nextMic)
+    await updateLiveAudioSenders(nextMic ? stream?.getAudioTracks()[0] ?? null : null, stream)
+    if (!screenStreamRef.current) {
+      await updateLiveVideoSenders(cameraEnabled ? stream?.getVideoTracks()[0] ?? null : null, stream)
+    }
     publishLiveMediaState()
   }
 
@@ -3068,6 +3590,26 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
               <LogOut size={15} />
             </Button>
           )}
+        </section>
+      )}
+
+      {relayErrorToast && (
+        <section className="relay-error-toast" role="alert" aria-live="assertive">
+          <div>
+            <strong>Relay publish failed</strong>
+            <span>
+              {relayErrorToast.kind ? `kind ${relayErrorToast.kind}: ` : ''}
+              {relayErrorToast.message}
+            </span>
+          </div>
+          <Button
+            type="button"
+            className="icon-soft"
+            onClick={() => setRelayErrorToast(null)}
+            aria-label="Dismiss relay error"
+          >
+            <X size={15} />
+          </Button>
         </section>
       )}
 
@@ -3321,11 +3863,11 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
           <DialogHeader className="auth-modal-header">
             <div>
               <p className="eyebrow">NIP-29</p>
-              <DialogTitle>Add Relay</DialogTitle>
+              <DialogTitle>Open Relay</DialogTitle>
             </div>
           </DialogHeader>
           <DialogDescription className="auth-modal-copy">
-            Add a NIP-29 relay to the rail. Nestr will discover its chatrooms from kind 39000 metadata.
+            Connect to a chatroom relay.
           </DialogDescription>
           <form className="admin-form" onSubmit={addRelay}>
             <Input
@@ -3341,10 +3883,66 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
               </Button>
               <Button type="submit" className="primary-action">
                 <Radio size={16} />
-                Add
+                Open
               </Button>
             </div>
           </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showOpenGroupDialog} onOpenChange={setShowOpenGroupDialog}>
+        <DialogContent className="auth-modal create-chatroom-modal">
+          <DialogHeader className="auth-modal-header">
+            <div>
+              <p className="eyebrow">{relayHost}</p>
+              <DialogTitle>Open Group</DialogTitle>
+            </div>
+          </DialogHeader>
+          <DialogDescription className="auth-modal-copy">
+            Paste a group ID to open it on this relay.
+          </DialogDescription>
+          <form className="admin-form" onSubmit={openDirectGroup}>
+            <Input
+              value={openGroupIdInput}
+              onChange={(event) => setOpenGroupIdInput(event.target.value)}
+              placeholder="Group ID"
+              aria-label="Group ID"
+              spellCheck={false}
+            />
+            <div className="auth-actions">
+              <Button type="button" className="secondary-action" onClick={() => setShowOpenGroupDialog(false)}>
+                Cancel
+              </Button>
+              <Button type="submit" className="primary-action">
+                <DoorOpen size={16} />
+                Open
+              </Button>
+            </div>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showRemoveRelayDialog} onOpenChange={setShowRemoveRelayDialog}>
+        <DialogContent className="auth-modal create-chatroom-modal">
+          <DialogHeader className="auth-modal-header">
+            <div>
+              <p className="eyebrow">{relayHost}</p>
+              <DialogTitle>Remove relay?</DialogTitle>
+            </div>
+          </DialogHeader>
+          <DialogDescription className="auth-modal-copy">
+            Remove this relay from your NIP-51 saved relay list. This will not delete chatrooms or messages.
+          </DialogDescription>
+          <div className="auth-actions">
+            <Button type="button" className="secondary-action" onClick={() => setShowRemoveRelayDialog(false)}>
+              Cancel
+            </Button>
+            <Button type="button" className="secondary-action danger" onClick={() => void removeCurrentRelay()}>
+              <Trash2 size={16} />
+              Remove relay
+            </Button>
+          </div>
+          <span className="admin-log">{adminStatus}</span>
         </DialogContent>
       </Dialog>
 
@@ -3394,34 +3992,59 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
               <DialogHeader className="auth-modal-header">
                 <div>
                   <p className="eyebrow">{metadataName}</p>
-                  <DialogTitle>Add member</DialogTitle>
+                  <DialogTitle>Manage members</DialogTitle>
                 </div>
               </DialogHeader>
               <DialogDescription className="auth-modal-copy">
-                Add or update a person in this chatroom.
+                Add or update a member with optional roles, or remove the selected member.
               </DialogDescription>
               <form className="admin-form" onSubmit={putUser}>
+                <Label htmlFor="member-pubkey">Member pubkey</Label>
                 <Input
+                  id="member-pubkey"
                   value={targetInput}
                   onChange={(event) => setTargetInput(event.target.value)}
-                  placeholder="npub or hex pubkey"
+                  placeholder="npub or 64-char hex pubkey"
                   aria-label="Member pubkey"
                   spellCheck={false}
                 />
+                <Label htmlFor="member-roles">Roles to grant</Label>
                 <Input
+                  id="member-roles"
                   value={targetRoles}
                   onChange={(event) => setTargetRoles(event.target.value)}
-                  placeholder={supportedRoles.length ? supportedRoles.map((role) => role.name).join(', ') : 'roles'}
+                  placeholder={
+                    supportedRoles.length
+                      ? `Optional: ${supportedRoles.map((role) => role.name).join(', ')}`
+                      : 'Optional roles, comma separated'
+                  }
                   aria-label="Roles"
                 />
-                <div className="admin-row">
-                  <Button type="submit" className="primary-action">
+                {supportedRoles.length > 0 && (
+                  <div className="role-reference">
+                    {supportedRoles.map((role) => (
+                      <span key={role.name} title={role.description || role.name}>
+                        {role.label || role.name}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <span className="form-hint">
+                  Leave roles blank for a normal member. Use Remove member to revoke access for this pubkey.
+                </span>
+                <div className="admin-row member-admin-actions">
+                  <Button type="submit" className="primary-action" disabled={!canPutUser}>
                     <UserPlus size={16} />
-                    Add
+                    Add / update member
                   </Button>
-                  <Button type="button" className="secondary-action danger" onClick={() => void removeUser()}>
+                  <Button
+                    type="button"
+                    className="secondary-action danger"
+                    onClick={() => void removeUser()}
+                    disabled={!canRemoveUser}
+                  >
                     <UserMinus size={16} />
-                    Remove
+                    Remove member
                   </Button>
                 </div>
               </form>
@@ -3537,11 +4160,11 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
               <DialogHeader className="auth-modal-header">
                 <div>
                   <p className="eyebrow">{metadataName}</p>
-                  <DialogTitle>Review joins</DialogTitle>
+                  <DialogTitle>Join requests</DialogTitle>
                 </div>
               </DialogHeader>
               <DialogDescription className="auth-modal-copy">
-                Accept or reject people waiting to enter this chatroom.
+                Review pending requests, then add the requester as a member or reject the request.
               </DialogDescription>
               <div className="admin-stack">
                 {snapshot.joinRequests.length === 0 ? (
@@ -3554,11 +4177,15 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
                         user={snapshot.users.find((user) => user.pubkey === request.pubkey)}
                         small
                       />
-                      <span>{nameFor(request.pubkey, snapshot.users)}</span>
+                      <span className="join-request-details">
+                        <strong>{nameFor(request.pubkey, snapshot.users)}</strong>
+                        <small>{request.content.trim() || shortNpub(request.pubkey)}</small>
+                      </span>
                       <Button
                         type="button"
                         className="icon-soft"
                         onClick={() => void acceptJoin(request.pubkey)}
+                        disabled={!canPutUser}
                         aria-label={`Accept ${nameFor(request.pubkey, snapshot.users)}`}
                       >
                         <Check size={15} />
@@ -3567,6 +4194,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
                         type="button"
                         className="icon-soft danger"
                         onClick={() => void rejectJoin(request.pubkey)}
+                        disabled={!canRemoveUser}
                         aria-label={`Reject ${nameFor(request.pubkey, snapshot.users)}`}
                       >
                         <UserMinus size={15} />
@@ -3598,8 +4226,19 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
           <Send size={23} />
         </Button>
         <div className="rail-divider" />
-        {savedRelayUrls.map((relayUrl) => {
-          const activeRelay = sameRelayUrl(relayUrl, snapshot.group.relay)
+        {showSavedGroupsLoading && (
+          <Button
+            type="button"
+            className="rail-button relay loading"
+            disabled
+            aria-label="Loading saved relays"
+            title="Loading saved relays"
+          >
+            <LoaderCircle size={21} className="spin-icon" />
+          </Button>
+        )}
+        {railRelayUrls.map((relayUrl) => {
+          const activeRelay = appView !== 'home' && sameRelayUrl(relayUrl, snapshot.group.relay)
           return (
             <RelayRailButton
               key={relayUrl}
@@ -3616,12 +4255,21 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
           type="button"
           className="rail-button relay add"
           onClick={() => setShowAddRelayDialog(true)}
-          aria-label="Add relay"
-          title="Add relay"
+          aria-label="Open relay"
+          title="Open relay"
         >
           <Plus size={22} />
         </Button>
         <div className="rail-spacer" />
+        <Button
+          type="button"
+          className={`rail-button ${appView === 'home' ? 'active' : ''}`}
+          onClick={navigateToHome}
+          aria-label="Home"
+          title="Home"
+        >
+          <Home size={22} />
+        </Button>
         <Button
           type="button"
           className={`rail-button account ${canOpenAccountPanel ? 'signed-in' : ''}`}
@@ -3633,12 +4281,13 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
         </Button>
       </nav>
 
-      <aside
-        className={`side-panel left-panel ${
-          appView === 'dm' ? 'dm-sidebar' : appView === 'relay' ? 'relay-sidebar' : ''
-        } ${appView === 'group' && mobileDetailsOpen ? 'mobile-open' : ''}`}
-        aria-label={appView === 'dm' ? 'Direct messages' : appView === 'relay' ? 'Relay chats' : 'Office'}
-      >
+      {appView !== 'home' && (
+        <aside
+          className={`side-panel left-panel ${
+            appView === 'dm' ? 'dm-sidebar' : appView === 'relay' ? 'relay-sidebar' : ''
+          } ${appView === 'group' && mobileDetailsOpen ? 'mobile-open' : ''}`}
+          aria-label={appView === 'dm' ? 'Direct messages' : appView === 'relay' ? 'Relay chats' : 'Office'}
+        >
         {appView === 'dm' ? (
           <>
             <div className="brand-row">
@@ -3708,6 +4357,12 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
                   aria-label="Search relay groups"
                 />
               </Label>
+              {showSavedGroupsLoading && (
+                <div className="saved-groups-loading">
+                  <LoaderCircle size={14} className="spin-icon" />
+                  <span>Loading saved relays and groups</span>
+                </div>
+              )}
               {relayGroups.length === 0 ? (
                 <div className="empty-state">Waiting for chatrooms from this relay.</div>
               ) : filteredRelayGroups.length === 0 ? (
@@ -3791,6 +4446,12 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
                 <ShieldCheck size={16} />
                 <span>{adminStatus}</span>
               </div>
+              {canManageGroup && (
+                <span className="admin-capability">
+                  {currentRoles.length > 0 ? `Role: ${currentRoles.join(', ')}` : 'Admin controls'}
+                  <small>{adminCapabilityLabel}</small>
+                </span>
+              )}
 
               <div className="admin-action-grid">
                 {!currentIsMember ? (
@@ -3807,38 +4468,37 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
 
                 {canManageGroup && (
                   <>
-                    {snapshot.joinRequests.length > 0 && (
+                    {canReviewJoins && (
                       <Button type="button" className="secondary-action" onClick={() => setAdminDialog('joins')}>
                         <Check size={16} />
-                        Review joins
+                        Join requests
+                        <span className="button-count">{snapshot.joinRequests.length}</span>
                       </Button>
                     )}
-                    <Button type="button" className="secondary-action" onClick={() => setAdminDialog('member')}>
-                      <UserPlus size={16} />
-                      Add member
-                    </Button>
+                    {canManageMembers && (
+                      <Button type="button" className="secondary-action" onClick={() => setAdminDialog('member')}>
+                        <UserPlus size={16} />
+                        Manage members
+                      </Button>
+                    )}
                     {canCreateInvite && (
                       <Button type="button" className="secondary-action" onClick={() => setAdminDialog('invite')}>
                         <Ticket size={16} />
                         Invite
                       </Button>
                     )}
-                    <Button type="button" className="secondary-action" onClick={() => setAdminDialog('details')}>
-                      <Edit3 size={16} />
-                      Edit group
-                    </Button>
-                    <Button type="button" className="secondary-action" onClick={() => setAdminDialog('moderation')}>
-                      <Trash2 size={16} />
-                      Moderate
-                    </Button>
-                    <Button type="button" className="secondary-action" onClick={() => setShowCreateGroupDialog(true)}>
-                      <MessageCircle size={16} />
-                      Create chatroom
-                    </Button>
-                    <Button type="button" className="secondary-action danger" onClick={() => void deleteGroup()}>
-                      <Trash2 size={16} />
-                      Delete chatroom
-                    </Button>
+                    {canEditGroup && (
+                      <Button type="button" className="secondary-action" onClick={() => setAdminDialog('details')}>
+                        <Edit3 size={16} />
+                        Edit group
+                      </Button>
+                    )}
+                    {canDeleteRoom && (
+                      <Button type="button" className="secondary-action danger" onClick={() => void deleteGroup()}>
+                        <Trash2 size={16} />
+                        Delete chatroom
+                      </Button>
+                    )}
                   </>
                 )}
               </div>
@@ -3860,35 +4520,45 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
             <span>Members</span>
             <span>{groupMemberPubkeys.length} members</span>
           </div>
-          {renderedPeople.map((user) => (
-            <Button
-              type="button"
-              key={user.pubkey}
-              className={`person ${user.pubkey === selfPubkey ? 'active' : ''}`}
-              disabled={relay.mode === 'live' && user.pubkey !== selfPubkey}
-              onClick={() => {
-                if (relay.mode !== 'mock') return
-                setSelfPubkey(user.pubkey)
-                setNpubInput(user.npub)
-                setCallStarted(false)
-                stopScreenShare()
-                stopRemoteVideos()
-                setCallExpanded(false)
-              }}
-            >
-              <span className="avatar-stack">
-                <AvatarChip pubkey={user.pubkey} user={user} />
-                <span
-                  className={`presence-dot ${isOnline(user.pubkey) ? 'online' : 'offline'}`}
-                  title={isOnline(user.pubkey) ? 'Online' : 'Offline'}
-                />
-              </span>
-              <span>
-                <strong>{user.pubkey === selfPubkey ? 'You' : user.name}</strong>
-                <small>{user.role}</small>
-              </span>
-            </Button>
-          ))}
+          {renderedPeople.map((user) => {
+            const isSelf = user.pubkey === selfPubkey
+            const selectable = relay.mode === 'mock'
+            return (
+              <div
+                key={user.pubkey}
+                className={`person ${isSelf ? 'active' : ''} ${selectable ? 'selectable' : 'disabled'}`}
+                onClick={() => {
+                  if (relay.mode !== 'mock') return
+                  setSelfPubkey(user.pubkey)
+                  setNpubInput(user.npub)
+                  setCallStarted(false)
+                  stopScreenShare()
+                  stopRemoteVideos()
+                  setCallExpanded(false)
+                }}
+              >
+                <span className="avatar-stack">
+                  <AvatarChip pubkey={user.pubkey} user={user} />
+                  <span
+                    className={`presence-dot ${isOnline(user.pubkey) ? 'online' : 'offline'}`}
+                    title={isOnline(user.pubkey) ? 'Online' : 'Offline'}
+                  />
+                </span>
+                <span>
+                  <a
+                    className="person-name-link"
+                    href={njumpProfileUrl(user.pubkey)}
+                    target="_blank"
+                    rel="noreferrer"
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <strong>{isSelf ? 'You' : user.name}</strong>
+                  </a>
+                  <small>{user.role}</small>
+                </span>
+              </div>
+            )
+          })}
           {hiddenPeopleCount > 0 && (
             <Button
               type="button"
@@ -3906,7 +4576,73 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
         </section>
           </>
         )}
-      </aside>
+        </aside>
+      )}
+
+      {appView === 'home' && (
+        <section className="world-panel relay-directory-panel landing-panel" aria-label="Chatroom servers">
+          <div className="directory-header">
+            <div>
+              <p className="eyebrow">nestr</p>
+              <div className="relay-title-row">
+                <h2>{homeGreeting}</h2>
+              </div>
+              <span className="landing-intro">Here are some chatroom servers you can try out.</span>
+              <span className="landing-discovery-status">
+                {showSavedGroupsLoading ? 'Loading your saved relays and groups' : discoveryStatus}
+              </span>
+            </div>
+            <div className="landing-discovery-actions">
+              <span>{homepageRelays.length} relays</span>
+              <Button
+                type="button"
+                className="icon-soft"
+                onClick={() => setDiscoveryRun((run) => run + 1)}
+                aria-label="Refresh relay discovery"
+                title={`Refresh ${NIP29_DISCOVERY_BOOTSTRAP_RELAYS.length} discovery relays`}
+              >
+                <RefreshCcw size={15} />
+              </Button>
+            </div>
+          </div>
+
+          <div className="relay-chat-grid landing-relay-grid">
+            {homepageRelays.length === 0 ? (
+              <div className="empty-state landing-empty">
+                Waiting for relay monitors to advertise NIP-29 support.
+              </div>
+            ) : (
+              homepageRelays.map((relayCard) => {
+                const latency = relayCard.rttRead ?? relayCard.rttOpen
+                return (
+                  <a
+                    key={relayCard.url}
+                    className="relay-chat-card landing-relay-card"
+                    href={relayHref(relayCard.url)}
+                    onClick={handleInternalLink}
+                  >
+                    <span className="relay-chat-hash">
+                      {relayCard.icon ? <img src={relayCard.icon} alt="" /> : <Radio size={21} />}
+                    </span>
+                    <span>
+                      <strong>{relayCard.name || relayHostLabel(relayCard.url)}</strong>
+                      <small>{relayCard.description}</small>
+                      <span className="landing-relay-meta">
+                        <span>{trimRelayProtocol(relayCard.url)}</span>
+                        {relayCard.saved && <span>saved</span>}
+                        {latency !== null && <span>{latency}ms</span>}
+                        {relayCard.requiresAuth === true && <span>auth</span>}
+                        {relayCard.requiresPayment === true && <span>paid</span>}
+                        {relayCard.monitorCount > 1 && <span>{relayCard.monitorCount} monitors</span>}
+                      </span>
+                    </span>
+                  </a>
+                )
+              })
+            )}
+          </div>
+        </section>
+      )}
 
       {appView === 'group' && hasSelectedGroup && !canReadGroup && (
         <section className="world-panel access-panel" aria-label="Room access required">
@@ -3952,6 +4688,30 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
             <div className="office-count-chip" aria-label={officePresenceLabel}>
               {officePresenceLabel}
             </div>
+            {selfPlacedInOffice && !callStarted && (
+              <div className="auto-connect-controls" aria-label="Call auto-connect settings">
+                <Button
+                  type="button"
+                  className={activeAutoCallMediaPrefs.video ? 'active' : ''}
+                  onClick={() => updateAutoCallMediaPrefs({ video: !activeAutoCallMediaPrefs.video })}
+                  aria-pressed={activeAutoCallMediaPrefs.video}
+                  aria-label={activeAutoCallMediaPrefs.video ? 'Disable auto-connect video' : 'Enable auto-connect video'}
+                >
+                  {activeAutoCallMediaPrefs.video ? <Camera size={16} /> : <CameraOff size={16} />}
+                  <span>Video</span>
+                </Button>
+                <Button
+                  type="button"
+                  className={activeAutoCallMediaPrefs.audio ? 'active' : ''}
+                  onClick={() => updateAutoCallMediaPrefs({ audio: !activeAutoCallMediaPrefs.audio })}
+                  aria-pressed={activeAutoCallMediaPrefs.audio}
+                  aria-label={activeAutoCallMediaPrefs.audio ? 'Disable auto-connect audio' : 'Enable auto-connect audio'}
+                >
+                  {activeAutoCallMediaPrefs.audio ? <Mic size={16} /> : <MicOff size={16} />}
+                  <span>Audio</span>
+                </Button>
+              </div>
+            )}
             <Button
               type="button"
               className="office-chat-toggle"
@@ -4121,7 +4881,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
                         <AvatarChip pubkey={event.pubkey} user={sender} small />
                         <strong>{nameFor(event.pubkey, snapshot.users)}</strong>
                       <time dateTime={messageDateTime(event.created_at)}>{messageDate(event.created_at)}</time>
-                      {canManageGroup && (
+                      {canDeleteMessages && (
                         <Button
                           type="button"
                           className="message-delete"
@@ -4204,10 +4964,23 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
               />
             </Label>
             <div className="relay-toolbar-actions">
-              <Button type="button" className="secondary-action" onClick={() => setShowAddRelayDialog(true)}>
-                <Plus size={16} />
-                Relay
+              <Button type="button" className="secondary-action" onClick={() => setShowOpenGroupDialog(true)}>
+                <DoorOpen size={16} />
+                Open group
               </Button>
+              {relay.mode === 'live' && (
+                currentRelayIsSaved ? (
+                  <Button type="button" className="secondary-action danger" onClick={() => setShowRemoveRelayDialog(true)}>
+                    <Trash2 size={16} />
+                    Remove relay
+                  </Button>
+                ) : (
+                  <Button type="button" className="secondary-action" onClick={() => void saveCurrentRelay()}>
+                    <Plus size={16} />
+                    Save relay
+                  </Button>
+                )
+              )}
               {canCreateRelayGroup && (
                 <Button type="button" className="primary-action" onClick={() => setShowCreateGroupDialog(true)}>
                   <MessageCircle size={16} />
@@ -4216,6 +4989,12 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
               )}
             </div>
           </div>
+          {showSavedGroupsLoading && (
+            <div className="saved-groups-loading">
+              <LoaderCircle size={14} className="spin-icon" />
+              <span>Loading saved relays and groups</span>
+            </div>
+          )}
           <div className="relay-chat-grid">
             {relayGroups.length === 0 ? (
               <div className="empty-state">Waiting for chatrooms from this relay.</div>
@@ -4250,179 +5029,67 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
         </section>
       )}
 
-      {appView === 'dm' && (
+      {appView === 'dm' && activeDmPubkey && (
         <section className="world-panel dm-main-panel" aria-label="Direct messages">
-          {activeDmPubkey ? (
-            <>
-              <div className="directory-header">
-                <div>
-                  <p className="eyebrow">dm</p>
-                  <h2>{activeDmPeer?.name ?? nameFor(activeDmPubkey, snapshot.users)}</h2>
-                </div>
-                <Button type="button" className="dm-back" onClick={() => setActiveDmPubkey(null)}>
-                  <ChevronLeft size={17} />
-                  Threads
-                </Button>
-              </div>
-              <div className="messages dm-messages" role="log" aria-label="Direct messages">
-                {activeDmMessages.map((dm) => {
-                  const outgoing = dm.senderPubkey === selfPubkey
-                  const sender = snapshot.users.find((user) => user.pubkey === dm.senderPubkey)
+          <div className="directory-header">
+            <div>
+              <p className="eyebrow">dm</p>
+              <h2>{activeDmPeer?.name ?? nameFor(activeDmPubkey, snapshot.users)}</h2>
+            </div>
+            <Button type="button" className="dm-back" onClick={() => setActiveDmPubkey(null)}>
+              <ChevronLeft size={17} />
+              Threads
+            </Button>
+          </div>
+          <div className="messages dm-messages" role="log" aria-label="Direct messages">
+            {activeDmMessages.map((dm) => {
+              const outgoing = dm.senderPubkey === selfPubkey
+              const sender = snapshot.users.find((user) => user.pubkey === dm.senderPubkey)
 
-                  return (
-                    <Card key={dm.id} className={`message dm-message ${outgoing ? 'outgoing' : 'incoming'}`} size="sm">
-                      <div className="message-meta">
-                        <AvatarChip pubkey={dm.senderPubkey} user={sender} small />
-                        <strong>{outgoing ? 'You' : nameFor(dm.senderPubkey, snapshot.users)}</strong>
-                        <time dateTime={messageDateTime(dm.createdAt)}>{messageDate(dm.createdAt)}</time>
-                      </div>
-                      <DirectMessageContent message={dm} users={snapshot.users} />
-                    </Card>
-                  )
-                })}
-                <div ref={dmMessagesEndRef} />
-              </div>
-              <form className="composer" onSubmit={sendDirectMessage}>
-                <Label htmlFor="dm-message">Direct message</Label>
-                <SelectedFiles files={dmFiles} onRemove={removeDmFile} />
-                <div className="input-row">
-                  <Input
-                    id="dm-message"
-                    value={dmMessage}
-                    onChange={(event) => setDmMessage(event.target.value)}
-                    placeholder="Send a direct message"
-                  />
-                  <Label className="file-picker" aria-label="Attach files">
-                    <Paperclip size={17} />
-                    <input
-                      type="file"
-                      multiple
-                      onChange={(event) => {
-                        const files = Array.from(event.currentTarget.files ?? [])
-                        setDmFiles((current) => [...current, ...files])
-                        event.currentTarget.value = ''
-                      }}
-                    />
-                  </Label>
-                  <Button type="submit" aria-label="Send direct message">
-                    {uploadStatus ? <LoaderCircle size={18} className="spin-icon" /> : <Send size={18} />}
-                  </Button>
-                </div>
-                {uploadStatus && <span className="upload-status">{uploadStatus}</span>}
-              </form>
-            </>
-          ) : (
-            <>
-              <div className="directory-header">
-                <div>
-                  <p className="eyebrow">dm</p>
-                  <h2>Direct Messages</h2>
-                </div>
-                <span>{dmThreads.length} threads</span>
-              </div>
-              <div className="dm-overview-grid">
-                {dmThreads.length === 0 ? (
-                  <div className="empty-state">No direct messages have arrived yet.</div>
-                ) : (
-                  dmThreads.map((thread) => {
-                    const user = snapshot.users.find((candidate) => candidate.pubkey === thread.pubkey)
-                    return (
-                      <Button
-                        key={thread.pubkey}
-                        type="button"
-                        className="dm-overview-card"
-                        onClick={() => setActiveDmPubkey(thread.pubkey)}
-                      >
-                        <span className="avatar-stack">
-                          <AvatarChip pubkey={thread.pubkey} user={user} />
-                          <span
-                            className={`presence-dot ${isOnline(thread.pubkey) ? 'online' : 'offline'}`}
-                            title={isOnline(thread.pubkey) ? 'Online' : 'Offline'}
-                          />
-                        </span>
-                        <span>
-                          <strong>{nameFor(thread.pubkey, snapshot.users)}</strong>
-                          <small>{thread.preview}</small>
-                        </span>
-                      </Button>
-                    )
-                  })
-                )}
-              </div>
-            </>
-          )}
+              return (
+                <Card key={dm.id} className={`message dm-message ${outgoing ? 'outgoing' : 'incoming'}`} size="sm">
+                  <div className="message-meta">
+                    <AvatarChip pubkey={dm.senderPubkey} user={sender} small />
+                    <strong>{outgoing ? 'You' : nameFor(dm.senderPubkey, snapshot.users)}</strong>
+                    <time dateTime={messageDateTime(dm.createdAt)}>{messageDate(dm.createdAt)}</time>
+                  </div>
+                  <DirectMessageContent message={dm} users={snapshot.users} />
+                </Card>
+              )
+            })}
+            <div ref={dmMessagesEndRef} />
+          </div>
+          <form className="composer" onSubmit={sendDirectMessage}>
+            <Label htmlFor="dm-message">Direct message</Label>
+            <SelectedFiles files={dmFiles} onRemove={removeDmFile} />
+            <div className="input-row">
+              <Input
+                id="dm-message"
+                value={dmMessage}
+                onChange={(event) => setDmMessage(event.target.value)}
+                placeholder="Send a direct message"
+              />
+              <Label className="file-picker" aria-label="Attach files">
+                <Paperclip size={17} />
+                <input
+                  type="file"
+                  multiple
+                  onChange={(event) => {
+                    const files = Array.from(event.currentTarget.files ?? [])
+                    setDmFiles((current) => [...current, ...files])
+                    event.currentTarget.value = ''
+                  }}
+                />
+              </Label>
+              <Button type="submit" aria-label="Send direct message">
+                {uploadStatus ? <LoaderCircle size={18} className="spin-icon" /> : <Send size={18} />}
+              </Button>
+            </div>
+            {uploadStatus && <span className="upload-status">{uploadStatus}</span>}
+          </form>
         </section>
       )}
     </main>
-    </TooltipProvider>
-  )
-}
-
-function LandingApp() {
-  useEffect(() => {
-    document.title = 'Nestr'
-  }, [])
-
-  return (
-    <TooltipProvider>
-      <main className="app-shell landing-shell" data-view="landing">
-        <nav className="app-rail" aria-label="Primary navigation">
-          <Button type="button" className="rail-button active" aria-label="Relays">
-            <Radio size={22} />
-          </Button>
-          <div className="rail-spacer" />
-          <Button
-            type="button"
-            className="rail-button account"
-            onClick={() => {
-              navigateInApp('/?relay=relay.nestr.development')
-            }}
-            aria-label="Sign in"
-          >
-            <LogIn size={22} />
-          </Button>
-        </nav>
-
-        <section className="world-panel relay-directory-panel landing-panel" aria-label="Relay directory">
-          <div className="directory-header">
-            <div>
-              <p className="eyebrow">nestr</p>
-              <div className="relay-title-row">
-                <h2>Choose a relay</h2>
-              </div>
-            </div>
-            <span>{DEVELOPMENT_RELAYS.length + 1} relays</span>
-          </div>
-
-          <div className="relay-chat-grid landing-relay-grid">
-            {DEVELOPMENT_RELAYS.map((relay) => (
-              <a
-                key={relay.host}
-                className="relay-chat-card landing-relay-card"
-                href={`/?relay=${relay.host}`}
-                onClick={handleInternalLink}
-              >
-                <span className="relay-chat-hash">
-                  <Radio size={21} />
-                </span>
-                <span>
-                  <strong>{relay.host}</strong>
-                  <small>{relay.description}</small>
-                </span>
-              </a>
-            ))}
-            <a className="relay-chat-card landing-relay-card" href="/?relay=groups.0xchat.com" onClick={handleInternalLink}>
-              <span className="relay-chat-hash">
-                <Radio size={21} />
-              </span>
-              <span>
-                <strong>groups.0xchat.com</strong>
-                <small>Live public group relay for testing real chatroom subscriptions.</small>
-              </span>
-            </a>
-          </div>
-        </section>
-      </main>
     </TooltipProvider>
   )
 }
@@ -4436,8 +5103,8 @@ function App() {
     return () => window.removeEventListener('popstate', syncLaunch)
   }, [])
 
-  if (launch.mode === 'landing') return <LandingApp />
-  return <OfficeApp key={launchKey(launch)} launch={launch} />
+  const officeLaunch: MockLaunch | LiveLaunch = launch.mode === 'landing' ? HOME_LAUNCH : launch
+  return <OfficeApp key={launchKey(officeLaunch)} launch={officeLaunch} />
 }
 
 export default App

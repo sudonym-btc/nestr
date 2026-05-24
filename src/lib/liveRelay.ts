@@ -80,6 +80,7 @@ const PROFILE_RELAYS = ['wss://purplepag.es', 'wss://relay.damus.io']
 const NIP65_RELAY_LIST_KIND = 10002
 const PROFILE_FETCH_BATCH_SIZE = 80
 const PROFILE_FETCH_BATCH_DELAY_MS = 320
+const simpleGroupsListCache = new Map<string, NestrEvent>()
 
 interface PendingPositionPublish {
   pubkey: string
@@ -222,10 +223,22 @@ function callSignalParticipants(payload: unknown) {
 
 export function directMessageSubscriptionFilters(pubkey: string): Filter[] {
   return [
-    { kinds: [DM_KINDS.giftWrap], '#p': [pubkey], limit: 120 },
-    { kinds: [DM_KINDS.legacyDirectMessage], '#p': [pubkey], limit: 120 },
-    { kinds: [DM_KINDS.legacyDirectMessage], authors: [pubkey], limit: 120 },
+    ...nip17DirectMessageSubscriptionFilters(pubkey),
+    ...legacyDirectMessageReadFilters(pubkey),
+    ...legacyDirectMessageWriteFilters(pubkey),
   ]
+}
+
+export function nip17DirectMessageSubscriptionFilters(pubkey: string): Filter[] {
+  return [{ kinds: [DM_KINDS.giftWrap], '#p': [pubkey], limit: 120 }]
+}
+
+export function legacyDirectMessageReadFilters(pubkey: string): Filter[] {
+  return [{ kinds: [DM_KINDS.legacyDirectMessage], '#p': [pubkey], limit: 120 }]
+}
+
+export function legacyDirectMessageWriteFilters(pubkey: string): Filter[] {
+  return [{ kinds: [DM_KINDS.legacyDirectMessage], authors: [pubkey], limit: 120 }]
 }
 
 export class LiveNip29Relay {
@@ -247,7 +260,10 @@ export class LiveNip29Relay {
   private readonly dmRelayEvents = new Map<string, NestrEvent>()
   private readonly relayListEvents = new Map<string, NestrEvent>()
   private readonly simpleGroupListEvents = new Map<string, NestrEvent>()
+  private readonly savedGroupKeys = new Set<string>()
   private readonly savedRelayUrls = new Set<string>()
+  private readonly userSavedRelayUrls = new Set<string>()
+  private readonly directoryGroupKeys = new Set<string>()
   private readonly readRelays = new Map<string, string[]>()
   private readonly writeRelays = new Map<string, string[]>()
   private readonly activityAt = new Map<string, number>()
@@ -263,13 +279,16 @@ export class LiveNip29Relay {
   private presenceSub?: ReturnType<SimplePool['subscribe']>
   private profileFetchTimer?: ReturnType<typeof setTimeout>
   private roomAccessTimer?: ReturnType<typeof setTimeout>
+  private dmSubscriptionGeneration = 0
   private group: Nip29Group
   private signer?: NestrSigner
   private connectionStatus: RelaySnapshot['connectionStatus'] = 'connecting'
   private connectionMessage = 'connecting to live relay'
   private readonly connectionLog: string[] = ['connecting to live relay']
+  private relayError?: RelaySnapshot['relayError']
   private roomAccessStatus: RelaySnapshot['roomAccessStatus'] = 'unknown'
   private roomAccessMessage = 'room not checked yet'
+  private savedGroupsLoading = false
   private positionPublishInFlight = false
   private pendingPositionPublish?: PendingPositionPublish
   private positionPublishVersion = 0
@@ -319,9 +338,13 @@ export class LiveNip29Relay {
       connectionStatus: this.connectionStatus,
       connectionMessage: this.connectionMessage,
       connectionLog: this.connectionLog,
+      relayError: this.relayError,
       roomAccessStatus: this.roomAccessStatus,
       roomAccessMessage: this.roomAccessMessage,
       relayUrls: Array.from(this.savedRelayUrls).sort((a, b) => a.localeCompare(b)),
+      savedRelayUrls: Array.from(this.userSavedRelayUrls).sort((a, b) => a.localeCompare(b)),
+      savedGroupsLoading: this.savedGroupsLoading,
+      savedGroupKeys: Array.from(this.savedGroupKeys),
       group: this.group,
       relayGroups: Array.from(this.relayGroups.values()).sort((a, b) =>
         `${relayUrlFromGroupEvent(a, this.relayUrl)} ${tagValue(a, 'name') ?? tagValue(a, 'd') ?? ''}`.localeCompare(
@@ -351,13 +374,24 @@ export class LiveNip29Relay {
 
   setSigner(signer: NestrSigner) {
     if (this.closed) return
+    const signerChanged = this.signer?.pubkey !== signer.pubkey
     debugLog('relay', 'setSigner', {
       pubkey: shortId(signer.pubkey),
       label: signer.label,
       relay: this.relayUrl,
       relayConnected: Boolean(this.relay),
     })
+    if (signerChanged) {
+      this.savedGroupKeys.clear()
+      this.userSavedRelayUrls.clear()
+      this.savedGroupsLoading = false
+    }
     this.signer = signer
+    const cachedSimpleGroups = simpleGroupsListCache.get(signer.pubkey)
+    if (cachedSimpleGroups) {
+      const parsed = this.receiveSimpleGroupsList(cachedSimpleGroups)
+      if (parsed) void this.fetchSavedGroupState(parsed.groups.slice(0, 80))
+    }
     if (this.relay) this.relay.onauth = relayAuthSigner(signer)
     this.upsertUser(signer.pubkey)
     this.queueProfileFetch([signer.pubkey])
@@ -366,18 +400,23 @@ export class LiveNip29Relay {
     this.refreshDirectMessageSubscriptions()
     this.emit()
     void this.authenticateAndRefetch()
-    void this.fetchSavedSimpleGroups(signer.pubkey)
+    void this.fetchSavedSimpleGroups(signer.pubkey, { showLoading: !cachedSimpleGroups })
   }
 
   clearSigner() {
     if (this.closed) return
     debugWarn('relay', 'clearSigner', { pubkey: shortId(this.signer?.pubkey), relay: this.relayUrl })
     this.signer = undefined
+    this.savedGroupKeys.clear()
+    this.userSavedRelayUrls.clear()
+    this.savedGroupsLoading = false
     if (this.relay) this.relay.onauth = undefined
     this.dmSub?.close()
     this.dmSub = undefined
+    this.dmSubscriptionGeneration += 1
     this.closeDmRelaySubs()
     this.setConnection(this.connectionStatus, 'Account disconnected')
+    this.openGroupSubscription({ resetDirectory: true })
     this.emit()
   }
 
@@ -391,6 +430,7 @@ export class LiveNip29Relay {
     })
     this.dmSub?.close()
     this.dmSub = undefined
+    this.dmSubscriptionGeneration += 1
     this.closeDmRelaySubs()
     this.openDmSubscription()
   }
@@ -769,6 +809,14 @@ export class LiveNip29Relay {
     return this.publishNip29Event(pubkey, NIP29_KINDS.deleteGroup, [], content, false)
   }
 
+  async publishSaveRelay(pubkey: string, relayUrl = this.relayUrl) {
+    return this.publishSimpleGroupsRelay(pubkey, relayUrl, 'save')
+  }
+
+  async publishRemoveRelay(pubkey: string, relayUrl = this.relayUrl) {
+    return this.publishSimpleGroupsRelay(pubkey, relayUrl, 'remove')
+  }
+
   async publishCallSignal(pubkey: string, kind: number, targetPubkey: string, payload: unknown) {
     debugLog('call', 'publishCallSignal start', {
       kind,
@@ -784,27 +832,59 @@ export class LiveNip29Relay {
       return { ok: false, reason: 'unsupported-call-signal' }
     }
 
+    const signer = this.signer
+    const pTags = [
+      targetPubkey,
+      ...callSignalParticipants(payload).filter((participant) => participant !== targetPubkey && participant !== pubkey),
+    ]
+    return this.signAndPublishCallSignal(signer, kind, pTags, payload)
+  }
+
+  async publishCallBroadcastSignal(pubkey: string, kind: number, payload: unknown) {
+    debugLog('call', 'publishCallBroadcastSignal start', {
+      kind,
+      pubkey: shortId(pubkey),
+    })
+    if (!this.hasSelectedGroup) return { ok: false, reason: 'group-required' }
+    if (!this.signer || this.signer.pubkey !== pubkey || !this.relay) {
+      return { ok: false, reason: 'live-signer-required' }
+    }
+
+    if (!isOfficeCallSignalKind(kind)) {
+      return { ok: false, reason: 'unsupported-call-signal' }
+    }
+
+    const signer = this.signer
+    const pTags = callSignalParticipants(payload).filter((participant) => participant !== pubkey)
+    if (pTags.length === 0) return { ok: false, reason: 'call-participants-required' }
+    return this.signAndPublishCallSignal(signer, kind, pTags, payload)
+  }
+
+  private async signCallSignalEvent(signer: NestrSigner, kind: number, pTags: string[], payload: unknown) {
+    const signStartedAt = performance.now()
+    const uniquePTags = Array.from(new Set(pTags.filter(Boolean)))
+    const event = await signer.signEvent({
+      kind,
+      created_at: now(),
+      tags: [
+        groupTag(this.groupId),
+        ...uniquePTags.map((participant) => ['p', participant]),
+        ['client', 'nestr'],
+      ],
+      content: JSON.stringify(payload),
+    })
+    debugLog('call', 'call signal signed', {
+      kind,
+      id: shortId(event.id),
+      elapsedMs: debugDuration(signStartedAt),
+    })
+    return event
+  }
+
+  private async signAndPublishCallSignal(signer: NestrSigner, kind: number, pTags: string[], payload: unknown) {
     let event: NestrEvent
     try {
-      const signStartedAt = performance.now()
-      event = await this.signer.signEvent({
-        kind,
-        created_at: now(),
-        tags: [
-          groupTag(this.groupId),
-          ['p', targetPubkey],
-          ...callSignalParticipants(payload)
-            .filter((participant) => participant !== targetPubkey && participant !== pubkey)
-            .map((participant) => ['p', participant]),
-          ['client', 'nestr'],
-        ],
-        content: JSON.stringify(payload),
-      })
-      debugLog('call', 'call signal signed', {
-        kind,
-        id: shortId(event.id),
-        elapsedMs: debugDuration(signStartedAt),
-      })
+      event = await this.signCallSignalEvent(signer, kind, pTags, payload)
     } catch (error) {
       debugError('call', 'call signal sign failed', {
         kind,
@@ -815,7 +895,28 @@ export class LiveNip29Relay {
       return { ok: false, reason: this.connectionMessage }
     }
 
-    return this.publishSigned(event, false)
+    const result = await this.publishSigned(event, false, { suppressTooOldRelayError: true })
+    if (!result.ok && isEventTooOldReason(result.reason) && !this.closed && this.signer === signer && this.relay) {
+      debugLog('call', 'call signal rejected as too old; signing fresh copy', {
+        kind,
+        id: shortId(event.id),
+        reason: result.reason,
+      })
+      try {
+        const freshEvent = await this.signCallSignalEvent(signer, kind, pTags, payload)
+        return this.publishSigned(freshEvent, false)
+      } catch (error) {
+        debugError('call', 'fresh call signal sign failed', {
+          kind,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        this.setConnection(this.connectionStatus, error instanceof Error ? error.message : String(error))
+        this.emit()
+        return { ok: false, reason: this.connectionMessage }
+      }
+    }
+
+    return result
   }
 
   async publishCreateInvite(pubkey: string, code: string, content = '') {
@@ -868,6 +969,17 @@ export class LiveNip29Relay {
     this.recordConnectionMessage(message)
   }
 
+  private setRelayError(event: NestrEvent, message: string) {
+    const createdAt = Date.now()
+    this.relayError = {
+      id: `${event.id}:${createdAt}`,
+      kind: event.kind,
+      eventId: event.id,
+      message,
+      createdAt,
+    }
+  }
+
   private setRoomAccess(status: NonNullable<RelaySnapshot['roomAccessStatus']>, message: string) {
     this.roomAccessStatus = status
     this.roomAccessMessage = message
@@ -912,16 +1024,18 @@ export class LiveNip29Relay {
     }
   }
 
-  private openGroupSubscription() {
+  private openGroupSubscription(options: { resetDirectory?: boolean } = {}) {
     if (this.closed || !this.relay) return
 
     this.groupSub?.close()
     if (this.roomAccessTimer) clearTimeout(this.roomAccessTimer)
     this.roomAccessTimer = undefined
+    if (options.resetDirectory && !this.hasSelectedGroup) this.clearRelayDirectoryGroups()
 
     const filters: Filter[] = this.hasSelectedGroup
       ? [
         { kinds: [39000, 39001, 39002, 39003], '#d': [this.groupId], limit: 32 },
+        { kinds: [NIP29_KINDS.joinRequest, NIP29_KINDS.leaveRequest], '#h': [this.groupId], limit: 80 },
         { kinds: [OFFICE_KINDS.avatarPosition], '#h': [this.groupId], limit: 256 },
         { '#h': [this.groupId], limit: 180 },
       ]
@@ -981,76 +1095,136 @@ export class LiveNip29Relay {
     }
   }
 
-  private openDmSubscription() {
-    if (this.closed || !this.relay || !this.signer) return
+  private clearRelayDirectoryGroups() {
+    this.directoryGroupKeys.forEach((key) => this.relayGroups.delete(key))
+    this.directoryGroupKeys.clear()
+  }
 
-    this.dmSub?.close()
-    try {
-      this.dmSub = this.relay.subscribe(
-        directMessageSubscriptionFilters(this.signer.pubkey),
-        {
-          onevent: (event) => {
-            if (!this.closed) void this.receiveDirectMessage(event as NestrEvent)
-          },
-          onclose: (reason) => {
-            if (this.closed) return
-            if (reason?.startsWith('auth-required') && this.signer) {
-              this.setConnection(this.connectionStatus, 'relay requested auth for direct messages')
-              this.emit()
-              void this.authenticateAndRefetch()
-            }
-          },
-          eoseTimeout: 3500,
-        },
-      )
-    } catch (error) {
-      if (this.closed) return
-      debugWarn('dm', 'room DM subscription failed', {
-        relay: this.relayUrl,
-        signer: shortId(this.signer.pubkey),
-        message: error instanceof Error ? error.message : String(error),
-      })
-      this.dmSub = undefined
-      return
-    }
+  private openDmSubscription() {
+    if (this.closed || !this.signer) return
     void this.openDmRelaySubscriptions()
   }
 
   private async openDmRelaySubscriptions() {
     if (this.closed || !this.signer) return
     const signer = this.signer
+    const generation = ++this.dmSubscriptionGeneration
+    this.dmSub?.close()
+    this.dmSub = undefined
     this.closeDmRelaySubs()
 
-    const [nip17Relays, legacyReadRelays] = await Promise.all([
+    const [nip17Relays, legacyRelays] = await Promise.all([
       this.fetchDmRelays(signer.pubkey),
-      this.fetchLegacyDmReadRelays(signer.pubkey),
+      this.fetchLegacyDmRelayHints(signer.pubkey),
     ])
-    if (this.closed || this.signer !== signer) return
-    const relayUrls = Array.from(new Set([...nip17Relays, ...legacyReadRelays])).filter((url) => url !== this.relayUrl)
-    if (relayUrls.length === 0) return
+    if (this.closed || this.signer !== signer || generation !== this.dmSubscriptionGeneration) return
 
-    directMessageSubscriptionFilters(signer.pubkey).forEach((filter) => {
-      try {
-        const sub = this.profilePool.subscribe(relayUrls, filter, {
-          onevent: (event) => {
-            if (!this.closed) void this.receiveDirectMessage(event as NestrEvent)
-          },
-          onauth: relayAuthSigner(signer),
-          eoseTimeout: 3500,
-        })
-        this.dmRelaySubs.push(sub)
-      } catch (error) {
-        if (this.closed) return
-        debugWarn('dm', 'extra relay DM subscription failed', {
-          signer: shortId(signer.pubkey),
-          message: error instanceof Error ? error.message : String(error),
-        })
+    const legacyReadRelays = legacyRelays.read.length > 0 ? legacyRelays.read : [this.relayUrl]
+    const legacyWriteRelays = legacyRelays.write.length > 0 ? legacyRelays.write : [this.relayUrl]
+    const plans = [
+      {
+        label: 'nip17 gift wraps',
+        relays: nip17Relays,
+        filters: nip17DirectMessageSubscriptionFilters(signer.pubkey),
+      },
+      {
+        label: 'legacy incoming',
+        relays: legacyReadRelays,
+        filters: legacyDirectMessageReadFilters(signer.pubkey),
+      },
+      {
+        label: 'legacy authored',
+        relays: legacyWriteRelays,
+        filters: legacyDirectMessageWriteFilters(signer.pubkey),
+      },
+    ]
+
+    const roomFilters: Filter[] = []
+    plans.forEach((plan) => {
+      const relayUrls = normalizeRelayUrls(plan.relays)
+      if (relayUrls.length === 0) return
+      if (relayUrls.some((relayUrl) => sameRelayUrl(relayUrl, this.relayUrl))) {
+        roomFilters.push(...plan.filters)
       }
+      const extraRelays = relayUrls.filter((relayUrl) => !sameRelayUrl(relayUrl, this.relayUrl))
+      if (extraRelays.length === 0) return
+
+      plan.filters.forEach((filter) => {
+        this.subscribeProfileDmRelays(extraRelays, filter, plan.label, signer)
+      })
     })
+
+    debugLog('dm', 'openDmRelaySubscriptions resolved', {
+      signer: shortId(signer.pubkey),
+      nip17Relays,
+      legacyReadRelays,
+      legacyWriteRelays,
+      roomFilters: roomFilters.length,
+      extraRelaySubs: this.dmRelaySubs.length,
+    })
+
+    if (roomFilters.length === 0 || !this.relay) return
+    try {
+      this.dmSub = this.relay.subscribe(roomFilters, {
+        onevent: (event) => {
+          if (!this.closed) void this.receiveDirectMessage(event as NestrEvent)
+        },
+        onclose: (reason) => {
+          if (this.closed) return
+          if (reason?.startsWith('auth-required') && this.signer) {
+            this.setConnection(this.connectionStatus, 'relay requested auth for direct messages')
+            this.emit()
+            void this.authenticateAndRefetch()
+          }
+        },
+        eoseTimeout: 3500,
+      })
+    } catch (error) {
+      if (this.closed) return
+      debugWarn('dm', 'room DM subscription failed', {
+        relay: this.relayUrl,
+        signer: shortId(signer.pubkey),
+        message: error instanceof Error ? error.message : String(error),
+      })
+      this.dmSub = undefined
+    }
+  }
+
+  private subscribeProfileDmRelays(relayUrls: string[], filter: Filter, label: string, signer: NestrSigner) {
+    try {
+      const sub = this.profilePool.subscribe(relayUrls, filter, {
+        onevent: (event) => {
+          if (!this.closed) void this.receiveDirectMessage(event as NestrEvent)
+        },
+        onauth: relayAuthSigner(signer),
+        eoseTimeout: 3500,
+      })
+      this.dmRelaySubs.push(sub)
+      debugLog('dm', 'extra relay DM subscription opened', {
+        label,
+        signer: shortId(signer.pubkey),
+        relays: relayUrls,
+        filter,
+      })
+    } catch (error) {
+      if (this.closed) return
+      debugWarn('dm', 'extra relay DM subscription failed', {
+        label,
+        signer: shortId(signer.pubkey),
+        relays: relayUrls,
+        message: error instanceof Error ? error.message : String(error),
+      })
+    }
   }
 
   private closeDmRelaySubs() {
-    this.dmRelaySubs.splice(0).forEach((sub) => sub.close())
+    this.dmRelaySubs.splice(0).forEach((sub) => {
+      try {
+        sub.close()
+      } catch {
+        // Subscription may already be closing.
+      }
+    })
   }
 
   private queryRoomRelay(filters: Filter[], maxWait: number) {
@@ -1103,6 +1277,39 @@ export class LiveNip29Relay {
     return settled.flatMap((result) => (result.status === 'fulfilled' ? result.value : []))
   }
 
+  async refreshGroupState(maxWait = 2500) {
+    if (this.closed || !this.relay || !this.hasSelectedGroup) return
+    const startedAt = performance.now()
+    debugLog('relay', 'refreshGroupState start', {
+      relay: this.relayUrl,
+      groupId: this.groupId,
+      maxWait,
+    })
+
+    const events = await this.queryRoomRelay(
+      [
+        { kinds: [39000, 39001, 39002, 39003], '#d': [this.groupId], limit: 32 },
+        { kinds: [NIP29_KINDS.joinRequest, NIP29_KINDS.leaveRequest], '#h': [this.groupId], limit: 80 },
+        { '#h': [this.groupId], limit: 180 },
+      ],
+      maxWait,
+    )
+    if (this.closed) return
+
+    debugLog('relay', 'refreshGroupState resolved', {
+      relay: this.relayUrl,
+      groupId: this.groupId,
+      events: events.length,
+      elapsedMs: debugDuration(startedAt),
+    })
+    if (events.length === 0) return
+
+    this.markRoomAccessOpen('room state refreshed')
+    events.forEach((event) => this.receive(event))
+    this.openGroupSubscription()
+    this.emit()
+  }
+
   private refreshPresenceSubscription() {
     if (this.closed) return
     const authors = Array.from(new Set([...this.memberPubkeys, ...this.adminRoles.keys()]))
@@ -1140,6 +1347,7 @@ export class LiveNip29Relay {
   private async authenticateAndRefetch() {
     if (this.closed || !this.relay || !this.signer) return
     const signer = this.signer
+    const relay = this.relay
     const startedAt = performance.now()
     debugLog('relay-auth', 'authenticateAndRefetch start', {
       signer: shortId(signer.pubkey),
@@ -1147,16 +1355,18 @@ export class LiveNip29Relay {
     })
 
     try {
-      await this.relay.auth(relayAuthSigner(signer))
-      if (this.closed || this.signer !== signer) return
+      const relayAuthState = relay as unknown as { authPromise?: Promise<string> }
+      relayAuthState.authPromise = undefined
+      await relay.auth(relayAuthSigner(signer))
+      if (this.closed || this.signer !== signer || this.relay !== relay) return
       debugLog('relay-auth', 'relay auth ok', {
         signer: shortId(signer.pubkey),
         elapsedMs: debugDuration(startedAt),
       })
       this.setConnection('authenticated', `relay authenticated as ${shortNpub(signer.pubkey)}`)
-      this.openGroupSubscription()
+      this.openGroupSubscription({ resetDirectory: true })
     } catch (error) {
-      if (this.closed || this.signer !== signer) return
+      if (this.closed || this.signer !== signer || this.relay !== relay) return
       const message = error instanceof Error ? error.message : String(error)
       const details = {
         signer: shortId(signer.pubkey),
@@ -1176,7 +1386,7 @@ export class LiveNip29Relay {
     this.emit()
   }
 
-  private async publishSigned(event: NestrEvent, optimistic = true) {
+  private async publishSigned(event: NestrEvent, optimistic = true, options: { suppressTooOldRelayError?: boolean } = {}) {
     if (optimistic) this.receive(event)
     const isPositionEvent = isOfficePositionKind(event.kind)
     const startedAt = performance.now()
@@ -1206,6 +1416,8 @@ export class LiveNip29Relay {
       return { ok: true, event }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
+      const suppressRelayError =
+        (isPositionEvent || options.suppressTooOldRelayError === true) && isEventTooOldReason(message)
       debugWarn('relay', 'publish failed', {
         kind: event.kind,
         id: shortId(event.id),
@@ -1231,18 +1443,21 @@ export class LiveNip29Relay {
           if (!isPositionEvent) this.emit(event)
           return { ok: true, event }
         } catch (retryError) {
+          const retryMessage = retryError instanceof Error ? retryError.message : String(retryError)
           debugError('relay', 'publish retry failed', {
             kind: event.kind,
             id: shortId(event.id),
             elapsedMs: debugDuration(startedAt),
-            message: retryError instanceof Error ? retryError.message : String(retryError),
+            message: retryMessage,
           })
-          this.setConnection(this.connectionStatus, retryError instanceof Error ? retryError.message : String(retryError))
+          if (!(isPositionEvent && isEventTooOldReason(retryMessage))) this.setRelayError(event, retryMessage)
+          this.setConnection(this.connectionStatus, retryMessage)
           this.emit()
           return { ok: false, reason: this.connectionMessage }
         }
       }
 
+      if (!suppressRelayError) this.setRelayError(event, message)
       this.setConnection(this.connectionStatus, message)
       this.emit()
       return { ok: false, reason: this.connectionMessage }
@@ -1333,11 +1548,13 @@ export class LiveNip29Relay {
   private receive(event: NestrEvent) {
     if (event.kind === NIP29_KINDS.groupMetadata) {
       const groupId = tagValue(event, 'd')
-      const eventRelayUrl = relayUrlFromGroupEvent(event, this.relayUrl)
+      const eventRelayUrl = this.relayUrl
       const groupMetadata = withRelayTag(event, eventRelayUrl)
       if (groupId) {
+        const groupKey = relayGroupKey(eventRelayUrl, groupId)
         this.savedRelayUrls.add(eventRelayUrl)
-        this.relayGroups.set(relayGroupKey(eventRelayUrl, groupId), groupMetadata)
+        this.directoryGroupKeys.add(groupKey)
+        this.relayGroups.set(groupKey, groupMetadata)
       }
       if (this.hasSelectedGroup && groupId === this.groupId && sameRelayUrl(eventRelayUrl, this.relayUrl)) {
         this.receiveGroupEvent(groupMetadata)
@@ -1589,8 +1806,18 @@ export class LiveNip29Relay {
   }
 
   private async fetchLegacyDmReadRelays(pubkey: string) {
-    const cached = this.readRelays.get(pubkey)
-    if (cached) return cached
+    return (await this.fetchLegacyDmRelayHints(pubkey)).read
+  }
+
+  private async fetchLegacyDmRelayHints(pubkey: string) {
+    const cachedRead = this.readRelays.get(pubkey)
+    const cachedWrite = this.writeRelays.get(pubkey)
+    if (cachedRead || cachedWrite) {
+      return {
+        read: cachedRead ?? [],
+        write: cachedWrite ?? [],
+      }
+    }
 
     try {
       const events = await this.queryRelays(
@@ -1599,22 +1826,31 @@ export class LiveNip29Relay {
         3000,
       )
       const newest = events.sort((a, b) => b.created_at - a.created_at)[0]
-      if (!newest) return []
+      if (!newest) return { read: [], write: [] }
       this.receiveRelayList(newest)
-      return this.readRelays.get(pubkey) ?? []
+      return {
+        read: this.readRelays.get(pubkey) ?? [],
+        write: this.writeRelays.get(pubkey) ?? [],
+      }
     } catch {
-      return []
+      return { read: [], write: [] }
     }
   }
 
-  private async fetchSavedSimpleGroups(pubkey: string) {
+  private async fetchSavedSimpleGroups(pubkey: string, options: { showLoading?: boolean } = {}) {
     const signer = this.signer
-    const relayHints = new Set([this.relayUrl, ...PROFILE_RELAYS])
-    const readRelays = await this.fetchLegacyDmReadRelays(pubkey)
-    readRelays.forEach((relayUrl) => relayHints.add(relayUrl))
-    if (this.signer !== signer) return
+    const showLoading = options.showLoading ?? true
+    if (showLoading) {
+      this.savedGroupsLoading = true
+      this.emit()
+    }
 
     try {
+      const relayHints = new Set([this.relayUrl, ...PROFILE_RELAYS])
+      const readRelays = await this.fetchLegacyDmReadRelays(pubkey)
+      readRelays.forEach((relayUrl) => relayHints.add(relayUrl))
+      if (this.signer !== signer) return
+
       const events = await this.queryRelays(
         Array.from(relayHints),
         { kinds: [NIP51_KINDS.simpleGroups], authors: [pubkey], limit: 8 },
@@ -1622,23 +1858,106 @@ export class LiveNip29Relay {
       )
       const newest = events.sort((a, b) => b.created_at - a.created_at)[0]
       if (!newest) return
-      const previous = this.simpleGroupListEvents.get(pubkey)
-      if (previous && previous.created_at > newest.created_at) return
-
-      const parsed = parseSimpleGroupsEvent(newest)
+      const parsed = this.receiveSimpleGroupsList(newest)
       if (!parsed) return
-
-      this.simpleGroupListEvents.set(pubkey, newest)
-      parsed.relays.forEach((relayUrl) => this.savedRelayUrls.add(relayUrl))
-      parsed.groups.slice(0, 80).forEach((group) => {
-        this.savedRelayUrls.add(group.relayUrl)
-        this.relayGroups.set(relayGroupKey(group.relayUrl, group.groupId), this.savedGroupPlaceholder(group, newest))
-      })
-      this.emit(newest)
       await this.fetchSavedGroupState(parsed.groups.slice(0, 80))
     } catch {
       // Saved group lists are best-effort. The active relay directory still comes from kind 39000.
+    } finally {
+      if (showLoading && this.signer === signer) {
+        this.savedGroupsLoading = false
+        this.emit()
+      }
     }
+  }
+
+  private receiveSimpleGroupsList(event: NestrEvent) {
+    const parsed = parseSimpleGroupsEvent(event)
+    if (!parsed) return null
+
+    const previous = this.simpleGroupListEvents.get(event.pubkey)
+    if (previous && previous.created_at > event.created_at) return null
+    const cached = simpleGroupsListCache.get(event.pubkey)
+    if (cached && cached.created_at > event.created_at) return null
+
+    this.simpleGroupListEvents.set(event.pubkey, event)
+    simpleGroupsListCache.set(event.pubkey, event)
+    parsed.relays.forEach((relayUrl) => this.savedRelayUrls.add(relayUrl))
+
+    const isCurrentUserList = this.signer?.pubkey === event.pubkey
+    if (isCurrentUserList) {
+      this.userSavedRelayUrls.clear()
+      this.savedGroupKeys.clear()
+      parsed.explicitRelayUrls.forEach((relayUrl) => this.userSavedRelayUrls.add(relayUrl))
+    }
+
+    parsed.groups.slice(0, 80).forEach((group) => {
+      this.savedRelayUrls.add(group.relayUrl)
+      if (isCurrentUserList) this.savedGroupKeys.add(relayGroupKey(group.relayUrl, group.groupId))
+      this.relayGroups.set(relayGroupKey(group.relayUrl, group.groupId), this.savedGroupPlaceholder(group, event))
+    })
+    this.emit(event)
+    return parsed
+  }
+
+  private async publishSimpleGroupsRelay(pubkey: string, relayUrl: string, action: 'save' | 'remove') {
+    if (!this.signer || this.signer.pubkey !== pubkey || !this.relay) {
+      return { ok: false, reason: 'live-signer-required' }
+    }
+
+    const normalizedRelayUrl = normalizeRelayUrl(relayUrl)
+    if (!normalizedRelayUrl) return { ok: false, reason: 'relay-url-required' }
+
+    if (!this.simpleGroupListEvents.has(pubkey)) {
+      await this.fetchSavedSimpleGroups(pubkey)
+    }
+
+    const previous = this.simpleGroupListEvents.get(pubkey)
+    const nextTags: string[][] = []
+    const explicitRelays = new Set<string>()
+
+    for (const tag of previous?.tags ?? []) {
+      if (tag[0] !== 'r') {
+        nextTags.push([...tag])
+        continue
+      }
+
+      const existingRelayUrl = normalizeRelayUrl(tag[1] ?? '')
+      if (!existingRelayUrl) continue
+      if (action === 'remove' && sameRelayUrl(existingRelayUrl, normalizedRelayUrl)) continue
+      if (explicitRelays.has(existingRelayUrl)) continue
+
+      explicitRelays.add(existingRelayUrl)
+      nextTags.push(['r', existingRelayUrl, ...tag.slice(2)])
+    }
+
+    if (
+      action === 'save' &&
+      !Array.from(explicitRelays).some((existingRelayUrl) => sameRelayUrl(existingRelayUrl, normalizedRelayUrl))
+    ) {
+      nextTags.push(['r', normalizedRelayUrl])
+    }
+
+    let event: NestrEvent
+    try {
+      event = await this.signer.signEvent({
+        kind: NIP51_KINDS.simpleGroups,
+        created_at: now(),
+        tags: nextTags,
+        content: previous?.content ?? '',
+      })
+    } catch (error) {
+      this.setConnection(this.connectionStatus, error instanceof Error ? error.message : String(error))
+      this.emit()
+      return { ok: false, reason: this.connectionMessage }
+    }
+
+    const result = await this.publishSigned(event, false)
+    if (result.ok) {
+      const parsed = this.receiveSimpleGroupsList(event)
+      if (parsed) void this.fetchSavedGroupState(parsed.groups.slice(0, 80))
+    }
+    return result
   }
 
   private savedGroupPlaceholder(group: SimpleGroupPointer, source: NestrEvent) {
