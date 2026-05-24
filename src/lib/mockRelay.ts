@@ -101,6 +101,11 @@ export interface RelaySnapshot {
   relayUrls?: string[]
   savedRelayUrls?: string[]
   savedGroupsLoading?: boolean
+  dmSubscriptionsLoading?: boolean
+  dmSubscriptionStatus?: {
+    legacyEose: boolean
+    nip17Eose: boolean
+  }
   savedGroupKeys?: string[]
   group: Nip29Group
   relayGroups: NestrEvent[]
@@ -281,6 +286,8 @@ export class MockNip29Relay {
       roomAccessStatus: 'open',
       roomAccessMessage: 'local room open',
       savedGroupsLoading: false,
+      dmSubscriptionsLoading: false,
+      dmSubscriptionStatus: { legacyEose: true, nip17Eose: true },
       savedGroupKeys: [],
       group: this.group,
       relayGroups: Array.from(this.relayGroupEvents.values()),

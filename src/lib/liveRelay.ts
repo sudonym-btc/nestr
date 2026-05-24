@@ -48,7 +48,12 @@ import {
   profileNameFromContent,
   profilePictureFromContent,
 } from './profileImages'
-import { cacheProfileMetadata, getCachedProfileMetadatas } from './profileMetadataCache'
+import {
+  cacheProfileMetadata,
+  cacheProfileRelayList,
+  getCachedProfileMetadatas,
+  getCachedProfileRelayLists,
+} from './profileMetadataCache'
 import {
   createPositionPayload,
   isPositionFresh,
@@ -87,6 +92,8 @@ interface PendingPositionPublish {
   movement: PositionMovement
   sentAt: number
 }
+
+type DmSubscriptionProtocol = 'legacy' | 'nip17'
 
 function now() {
   return Math.floor(Date.now() / 1000)
@@ -289,6 +296,7 @@ export class LiveNip29Relay {
   private roomAccessStatus: RelaySnapshot['roomAccessStatus'] = 'unknown'
   private roomAccessMessage = 'room not checked yet'
   private savedGroupsLoading = false
+  private dmSubscriptionStatus: RelaySnapshot['dmSubscriptionStatus'] = { legacyEose: true, nip17Eose: true }
   private positionPublishInFlight = false
   private pendingPositionPublish?: PendingPositionPublish
   private positionPublishVersion = 0
@@ -344,6 +352,8 @@ export class LiveNip29Relay {
       relayUrls: Array.from(this.savedRelayUrls).sort((a, b) => a.localeCompare(b)),
       savedRelayUrls: Array.from(this.userSavedRelayUrls).sort((a, b) => a.localeCompare(b)),
       savedGroupsLoading: this.savedGroupsLoading,
+      dmSubscriptionsLoading: !this.dmSubscriptionStatus?.legacyEose || !this.dmSubscriptionStatus?.nip17Eose,
+      dmSubscriptionStatus: { ...(this.dmSubscriptionStatus ?? { legacyEose: true, nip17Eose: true }) },
       savedGroupKeys: Array.from(this.savedGroupKeys),
       group: this.group,
       relayGroups: Array.from(this.relayGroups.values()).sort((a, b) =>
@@ -397,6 +407,10 @@ export class LiveNip29Relay {
     this.queueProfileFetch([signer.pubkey])
     this.recordActivity(signer.pubkey)
     this.setConnection(this.connectionStatus, 'Account connected')
+    debugLog('dm', 'signer applied; starting inbox subscriptions', {
+      signer: shortId(signer.pubkey),
+      relay: this.relayUrl,
+    })
     this.refreshDirectMessageSubscriptions()
     this.emit()
     void this.authenticateAndRefetch()
@@ -410,6 +424,7 @@ export class LiveNip29Relay {
     this.savedGroupKeys.clear()
     this.userSavedRelayUrls.clear()
     this.savedGroupsLoading = false
+    this.setDmSubscriptionStatus({ legacyEose: true, nip17Eose: true }, false)
     if (this.relay) this.relay.onauth = undefined
     this.dmSub?.close()
     this.dmSub = undefined
@@ -432,7 +447,23 @@ export class LiveNip29Relay {
     this.dmSub = undefined
     this.dmSubscriptionGeneration += 1
     this.closeDmRelaySubs()
+    this.setDmSubscriptionStatus(
+      this.signer
+        ? { legacyEose: false, nip17Eose: false }
+        : { legacyEose: true, nip17Eose: true },
+    )
     this.openDmSubscription()
+  }
+
+  private setDmSubscriptionStatus(
+    status: Partial<NonNullable<RelaySnapshot['dmSubscriptionStatus']>>,
+    shouldEmit = true,
+  ) {
+    const current = this.dmSubscriptionStatus ?? { legacyEose: true, nip17Eose: true }
+    const next = { ...current, ...status }
+    if (current.legacyEose === next.legacyEose && current.nip17Eose === next.nip17Eose) return
+    this.dmSubscriptionStatus = next
+    if (shouldEmit && this.listeners) this.emit()
   }
 
   joinWithNpub(value: string) {
@@ -1112,6 +1143,7 @@ export class LiveNip29Relay {
     this.dmSub?.close()
     this.dmSub = undefined
     this.closeDmRelaySubs()
+    this.setDmSubscriptionStatus({ legacyEose: false, nip17Eose: false })
 
     const [nip17Relays, legacyRelays] = await Promise.all([
       this.fetchDmRelays(signer.pubkey),
@@ -1124,33 +1156,61 @@ export class LiveNip29Relay {
     const plans = [
       {
         label: 'nip17 gift wraps',
+        protocol: 'nip17' as const,
         relays: nip17Relays,
         filters: nip17DirectMessageSubscriptionFilters(signer.pubkey),
       },
       {
         label: 'legacy incoming',
+        protocol: 'legacy' as const,
         relays: legacyReadRelays,
         filters: legacyDirectMessageReadFilters(signer.pubkey),
       },
       {
         label: 'legacy authored',
+        protocol: 'legacy' as const,
         relays: legacyWriteRelays,
         filters: legacyDirectMessageWriteFilters(signer.pubkey),
       },
     ]
 
     const roomFilters: Filter[] = []
+    const roomProtocols = new Set<DmSubscriptionProtocol>()
+    const pendingProtocols: Record<DmSubscriptionProtocol, number> = { legacy: 0, nip17: 0 }
+    const completedProtocols: Record<DmSubscriptionProtocol, number> = { legacy: 0, nip17: 0 }
+    let subscriptionsRegistered = false
+    const protocolStatus = (protocol: DmSubscriptionProtocol) =>
+      protocol === 'legacy' ? { legacyEose: true } : { nip17Eose: true }
+    const completeProtocol = (protocol: DmSubscriptionProtocol) => {
+      completedProtocols[protocol] += 1
+      if (!subscriptionsRegistered || completedProtocols[protocol] < pendingProtocols[protocol]) return
+      this.setDmSubscriptionStatus(protocolStatus(protocol))
+    }
+    const registerSubscription = (protocols: DmSubscriptionProtocol[]) => {
+      protocols.forEach((protocol) => {
+        pendingProtocols[protocol] += 1
+      })
+      let settled = false
+      return () => {
+        if (settled) return
+        settled = true
+        if (this.closed || this.signer !== signer || generation !== this.dmSubscriptionGeneration) return
+        protocols.forEach(completeProtocol)
+      }
+    }
     plans.forEach((plan) => {
       const relayUrls = normalizeRelayUrls(plan.relays)
       if (relayUrls.length === 0) return
       if (relayUrls.some((relayUrl) => sameRelayUrl(relayUrl, this.relayUrl))) {
         roomFilters.push(...plan.filters)
+        roomProtocols.add(plan.protocol)
       }
       const extraRelays = relayUrls.filter((relayUrl) => !sameRelayUrl(relayUrl, this.relayUrl))
       if (extraRelays.length === 0) return
 
       plan.filters.forEach((filter) => {
-        this.subscribeProfileDmRelays(extraRelays, filter, plan.label, signer)
+        const finish = registerSubscription([plan.protocol])
+        if (!this.subscribeProfileDmRelays(extraRelays, filter, plan.label, signer, finish)) finish()
       })
     })
 
@@ -1163,39 +1223,58 @@ export class LiveNip29Relay {
       extraRelaySubs: this.dmRelaySubs.length,
     })
 
-    if (roomFilters.length === 0 || !this.relay) return
-    try {
-      this.dmSub = this.relay.subscribe(roomFilters, {
-        onevent: (event) => {
-          if (!this.closed) void this.receiveDirectMessage(event as NestrEvent)
-        },
-        onclose: (reason) => {
-          if (this.closed) return
-          if (reason?.startsWith('auth-required') && this.signer) {
-            this.setConnection(this.connectionStatus, 'relay requested auth for direct messages')
-            this.emit()
-            void this.authenticateAndRefetch()
-          }
-        },
-        eoseTimeout: 3500,
-      })
-    } catch (error) {
-      if (this.closed) return
-      debugWarn('dm', 'room DM subscription failed', {
-        relay: this.relayUrl,
-        signer: shortId(signer.pubkey),
-        message: error instanceof Error ? error.message : String(error),
-      })
-      this.dmSub = undefined
+    if (roomFilters.length > 0 && this.relay) {
+      const finishRoomSubscription = registerSubscription(Array.from(roomProtocols))
+      try {
+        this.dmSub = this.relay.subscribe(roomFilters, {
+          onevent: (event) => {
+            if (!this.closed) void this.receiveDirectMessage(event as NestrEvent)
+          },
+          oneose: finishRoomSubscription,
+          onclose: (reason) => {
+            finishRoomSubscription()
+            if (this.closed) return
+            if (reason?.startsWith('auth-required') && this.signer) {
+              this.setConnection(this.connectionStatus, 'relay requested auth for direct messages')
+              this.emit()
+              void this.authenticateAndRefetch()
+            }
+          },
+          eoseTimeout: 3500,
+        })
+      } catch (error) {
+        finishRoomSubscription()
+        if (this.closed) return
+        debugWarn('dm', 'room DM subscription failed', {
+          relay: this.relayUrl,
+          signer: shortId(signer.pubkey),
+          message: error instanceof Error ? error.message : String(error),
+        })
+        this.dmSub = undefined
+      }
     }
+
+    subscriptionsRegistered = true
+    ;(['legacy', 'nip17'] as DmSubscriptionProtocol[]).forEach((protocol) => {
+      if (pendingProtocols[protocol] === 0 || completedProtocols[protocol] >= pendingProtocols[protocol]) {
+        this.setDmSubscriptionStatus(protocolStatus(protocol))
+      }
+    })
   }
 
-  private subscribeProfileDmRelays(relayUrls: string[], filter: Filter, label: string, signer: NestrSigner) {
+  private subscribeProfileDmRelays(
+    relayUrls: string[],
+    filter: Filter,
+    label: string,
+    signer: NestrSigner,
+    onSettled: () => void,
+  ) {
     try {
       const sub = this.profilePool.subscribe(relayUrls, filter, {
         onevent: (event) => {
           if (!this.closed) void this.receiveDirectMessage(event as NestrEvent)
         },
+        oneose: onSettled,
         onauth: relayAuthSigner(signer),
         eoseTimeout: 3500,
       })
@@ -1206,14 +1285,16 @@ export class LiveNip29Relay {
         relays: relayUrls,
         filter,
       })
+      return true
     } catch (error) {
-      if (this.closed) return
+      if (this.closed) return false
       debugWarn('dm', 'extra relay DM subscription failed', {
         label,
         signer: shortId(signer.pubkey),
         relays: relayUrls,
         message: error instanceof Error ? error.message : String(error),
       })
+      return false
     }
   }
 
@@ -1773,6 +1854,9 @@ export class LiveNip29Relay {
     getCachedProfileMetadatas(candidates.filter((pubkey) => !this.profiles.has(pubkey))).forEach((event) => {
       changed = this.receiveProfile(event, false) || changed
     })
+    getCachedProfileRelayLists(candidates.filter((pubkey) => !this.relayListEvents.has(pubkey))).forEach((event) => {
+      changed = this.receiveRelayList(event, false, false) || changed
+    })
     if (changed) this.emit()
     const missing = candidates.filter((pubkey) => !this.profiles.has(pubkey))
     if (missing.length === 0) return
@@ -2026,6 +2110,7 @@ export class LiveNip29Relay {
     authors.forEach((pubkey) => this.profileQueue.delete(pubkey))
     if (authors.length === 0) return
 
+    let changed = false
     try {
       const events = await this.queryRelays(
         [this.relayUrl, ...PROFILE_RELAYS],
@@ -2034,17 +2119,21 @@ export class LiveNip29Relay {
       )
       await yieldToMainThread()
       if (this.closed) return
-      let changed = false
-      events.forEach((event) => {
-        if (event.kind === 0) changed = this.receiveProfile(event, false) || changed
-        if (event.kind === 10050) changed = this.receiveDmRelays(event, false) || changed
-        if (event.kind === NIP65_RELAY_LIST_KIND) changed = this.receiveRelayList(event, false) || changed
-        if (event.kind === 10063) changed = this.receiveBlossomServers(event, false) || changed
-      })
-      if (changed) this.emit()
+      changed = this.receiveProfileLookupEvents(events) || changed
+
+      const missingAfterBootstrap = authors.filter((pubkey) => !this.profiles.has(pubkey))
+      if (missingAfterBootstrap.length > 0) {
+        changed = (await this.fetchProfileRelayLists(missingAfterBootstrap)) || changed
+      }
+
+      const missingWithRelayLists = authors.filter((pubkey) => !this.profiles.has(pubkey))
+      if (missingWithRelayLists.length > 0) {
+        changed = (await this.fetchProfilesFromWriteRelays(missingWithRelayLists)) || changed
+      }
     } catch {
       // Profile details are best-effort; membership still comes from the group relay.
     }
+    if (changed && !this.closed) this.emit()
 
     if (this.profileQueue.size > 0) {
       this.profileFetchTimer = setTimeout(() => {
@@ -2053,6 +2142,70 @@ export class LiveNip29Relay {
         void this.fetchQueuedProfiles()
       }, PROFILE_FETCH_BATCH_DELAY_MS)
     }
+  }
+
+  private receiveProfileLookupEvents(events: NestrEvent[]) {
+    let changed = false
+    events.forEach((event) => {
+      if (event.kind === 0) changed = this.receiveProfile(event, false) || changed
+      if (event.kind === 10050) changed = this.receiveDmRelays(event, false) || changed
+      if (event.kind === NIP65_RELAY_LIST_KIND) changed = this.receiveRelayList(event, false) || changed
+      if (event.kind === 10063) changed = this.receiveBlossomServers(event, false) || changed
+    })
+    return changed
+  }
+
+  private async fetchProfileRelayLists(authors: string[]) {
+    const missingRelayListAuthors = Array.from(new Set(authors.filter((pubkey) => !this.relayListEvents.has(pubkey))))
+    if (missingRelayListAuthors.length === 0) return false
+
+    const events = await this.queryRelays(
+      [this.relayUrl, ...PROFILE_RELAYS],
+      {
+        kinds: [NIP65_RELAY_LIST_KIND],
+        authors: missingRelayListAuthors,
+        limit: Math.max(8, missingRelayListAuthors.length * 2),
+      },
+      2600,
+    )
+    await yieldToMainThread()
+    if (this.closed) return false
+    return this.receiveProfileLookupEvents(events)
+  }
+
+  private async fetchProfilesFromWriteRelays(authors: string[]) {
+    const authorsByRelay = new Map<string, string[]>()
+
+    authors.forEach((pubkey) => {
+      normalizeRelayUrls(this.writeRelays.get(pubkey) ?? []).forEach((relayUrl) => {
+        if (!relayUrl) return
+        const relayAuthors = authorsByRelay.get(relayUrl) ?? []
+        if (!relayAuthors.includes(pubkey)) relayAuthors.push(pubkey)
+        authorsByRelay.set(relayUrl, relayAuthors)
+      })
+    })
+
+    if (authorsByRelay.size === 0) return false
+
+    const results = await Promise.allSettled(
+      Array.from(authorsByRelay.entries()).map(([relayUrl, relayAuthors]) =>
+        this.queryRelays(
+          [relayUrl],
+          {
+            kinds: [0, 10063],
+            authors: relayAuthors,
+            limit: Math.max(2, relayAuthors.length * 2),
+          },
+          2600,
+        ),
+      ),
+    )
+    await yieldToMainThread()
+    if (this.closed) return false
+
+    return this.receiveProfileLookupEvents(
+      results.flatMap((result) => (result.status === 'fulfilled' ? result.value : [])),
+    )
   }
 
   private receiveBlossomServers(event: NestrEvent, shouldEmit = true) {
@@ -2079,13 +2232,14 @@ export class LiveNip29Relay {
     return true
   }
 
-  private receiveRelayList(event: NestrEvent, shouldEmit = true) {
+  private receiveRelayList(event: NestrEvent, shouldEmit = true, shouldCache = true) {
     const previous = this.relayListEvents.get(event.pubkey)
     if (previous && previous.created_at > event.created_at) return false
     if (previous?.id === event.id) return false
 
     const relays = readWriteRelaysFromTags(event.tags)
     this.relayListEvents.set(event.pubkey, event)
+    if (shouldCache) cacheProfileRelayList(event)
     this.readRelays.set(event.pubkey, relays.read)
     this.writeRelays.set(event.pubkey, relays.write)
     this.upsertUser(event.pubkey)

@@ -1027,17 +1027,32 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     () => snapshot.savedRelayUrls ?? [],
     [snapshot.savedRelayUrls],
   )
+  const authenticatedSavedRelayUrls = useMemo(
+    () => (authState === 'connected' ? snapshotSavedRelayUrls : []),
+    [authState, snapshotSavedRelayUrls],
+  )
+  const authenticatedSessionRelayUrls = useMemo(
+    () => (authState === 'connected' ? snapshotRelayUrls : []),
+    [authState, snapshotRelayUrls],
+  )
   const railRelayUrls = useMemo(
-    () => uniqueRelayUrls([...snapshotSavedRelayUrls, ...snapshotRelayUrls, snapshot.group.relay]),
-    [snapshot.group.relay, snapshotRelayUrls, snapshotSavedRelayUrls],
+    () => {
+      const currentRelay =
+        appView === 'relay' || appView === 'group'
+          ? [snapshot.group.relay]
+          : []
+      return uniqueRelayUrls([...authenticatedSavedRelayUrls, ...currentRelay])
+    },
+    [appView, authenticatedSavedRelayUrls, snapshot.group.relay],
   )
   const currentRelayIsSaved = useMemo(
-    () => snapshotSavedRelayUrls.some((relayUrl) => sameRelayUrl(relayUrl, snapshot.group.relay)),
-    [snapshot.group.relay, snapshotSavedRelayUrls],
+    () => authenticatedSavedRelayUrls.some((relayUrl) => sameRelayUrl(relayUrl, snapshot.group.relay)),
+    [authenticatedSavedRelayUrls, snapshot.group.relay],
   )
   const hasSelectedGroup = relay.mode === 'mock' || (launch.mode === 'live' && Boolean(launch.groupId))
   const savedGroupKeySet = useMemo(() => new Set(snapshot.savedGroupKeys ?? []), [snapshot.savedGroupKeys])
   const savedGroupsLoading = Boolean(snapshot.savedGroupsLoading)
+  const showSavedRelaysLoading = relay.mode === 'live' && authState === 'connected' && savedGroupsLoading
   const showSavedGroupsLoading = appView === 'home' && savedGroupsLoading
   const relayGroups = useMemo(
     () => {
@@ -1076,7 +1091,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   const homepageRelays = useMemo(() => {
     const byRelayUrl = new Map<string, DiscoveredNip29Relay & { saved?: boolean }>()
 
-    snapshotSavedRelayUrls.forEach((relayUrl) => {
+    authenticatedSavedRelayUrls.forEach((relayUrl) => {
       const normalized = normalizeRelayUrl(relayUrl)
       if (!normalized) return
       byRelayUrl.set(normalized, {
@@ -1095,7 +1110,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
       })
     })
 
-    snapshotRelayUrls.forEach((relayUrl) => {
+    authenticatedSessionRelayUrls.forEach((relayUrl) => {
       const normalized = normalizeRelayUrl(relayUrl)
       if (!normalized || byRelayUrl.has(normalized)) return
       byRelayUrl.set(normalized, {
@@ -1130,7 +1145,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
       if (aRtt !== bRtt) return aRtt - bRtt
       return a.url.localeCompare(b.url)
     })
-  }, [discoveredRelays, snapshotRelayUrls, snapshotSavedRelayUrls])
+  }, [authenticatedSavedRelayUrls, authenticatedSessionRelayUrls, discoveredRelays])
   const connectionStatus = snapshot.connectionStatus ?? relay.mode
   const connectionMessage = authDetail || snapshot.connectionMessage || authStatus
   const roomAccessStatus = snapshot.roomAccessStatus ?? 'unknown'
@@ -1368,6 +1383,15 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
         : [],
     [activeDmPubkey, selfPubkey, snapshot.directMessages],
   )
+  const dmSubscriptionsLoading =
+    relay.mode === 'live' && authState === 'connected' && Boolean(snapshot.dmSubscriptionsLoading)
+  const dmSubscriptionStatus = snapshot.dmSubscriptionStatus
+  const dmSyncTitle = dmSubscriptionsLoading
+    ? `Syncing ${[
+        dmSubscriptionStatus?.legacyEose ? null : 'legacy',
+        dmSubscriptionStatus?.nip17Eose ? null : 'NIP-17',
+      ].filter(Boolean).join(' and ') || 'direct message'} inbox`
+    : 'Direct messages synced'
   const activeDmPeer = activeDmPubkey ? snapshot.users.find((user) => user.pubkey === activeDmPubkey) : undefined
   const metadataBaseDraft = useMemo(
     () => groupMetadataDraft(snapshot.group.metadata),
@@ -1978,9 +2002,16 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     if (relay.mode !== 'live' || authState !== 'connected' || !activeSigner) return
     const applied = appliedSignerRelayRef.current
     if (applied?.relay === relay && applied.signer === activeSigner) {
-      relay.refreshDirectMessageSubscriptions()
+      debugLog('dm', 'auth connected with signer already applied; inbox sync is active', {
+        signer: shortId(activeSigner.pubkey),
+        relay: relay.relayUrl,
+      })
       return
     }
+    debugLog('dm', 'auth changed; applying signer and starting inbox sync', {
+      signer: shortId(activeSigner.pubkey),
+      relay: relay.relayUrl,
+    })
     relay.setSigner(activeSigner)
     appliedSignerRelayRef.current = { relay, signer: activeSigner }
   }, [activeSigner, authState, relay])
@@ -2746,19 +2777,25 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   }
 
   async function saveCurrentRelay() {
+    if (relay.mode !== 'live') return
+    if (authState !== 'connected') {
+      await beginLogin({
+        kind: 'manual',
+        title: 'Sign in to save relay',
+        detail: `Connect a signer to save ${relayHost} to your chatroom servers.`,
+      })
+      return
+    }
     const ok = await runNip29Action('save relay', () =>
-      relay.mode === 'live'
-        ? relay.publishSaveRelay(selfPubkey, snapshot.group.relay)
-        : { ok: false, reason: 'live-relay-required' },
+      relay.publishSaveRelay(selfPubkey, snapshot.group.relay),
     )
     if (ok) setShowRemoveRelayDialog(false)
   }
 
   async function removeCurrentRelay() {
+    if (relay.mode !== 'live' || authState !== 'connected') return
     const ok = await runNip29Action('remove relay', () =>
-      relay.mode === 'live'
-        ? relay.publishRemoveRelay(selfPubkey, snapshot.group.relay)
-        : { ok: false, reason: 'live-relay-required' },
+      relay.publishRemoveRelay(selfPubkey, snapshot.group.relay),
     )
     if (ok) setShowRemoveRelayDialog(false)
   }
@@ -4226,16 +4263,10 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
           <Send size={23} />
         </Button>
         <div className="rail-divider" />
-        {showSavedGroupsLoading && (
-          <Button
-            type="button"
-            className="rail-button relay loading"
-            disabled
-            aria-label="Loading saved relays"
-            title="Loading saved relays"
-          >
-            <LoaderCircle size={21} className="spin-icon" />
-          </Button>
+        {showSavedRelaysLoading && (
+          <span className="rail-loading-indicator" role="status" aria-label="Loading saved relays" title="Loading saved relays">
+            <LoaderCircle size={13} className="spin-icon" />
+          </span>
         )}
         {railRelayUrls.map((relayUrl) => {
           const activeRelay = appView !== 'home' && sameRelayUrl(relayUrl, snapshot.group.relay)
@@ -4301,10 +4332,20 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
             <section className="panel-section dm-thread-list" aria-label="Direct message threads">
               <div className="section-title">
                 <span>Threads</span>
-                <span>{dmThreads.length} threads</span>
+                <span className="section-title-detail">
+                  {dmSubscriptionsLoading && (
+                    <LoaderCircle size={12} className="spin-icon subtle-spinner" aria-label={dmSyncTitle} />
+                  )}
+                  <span>{dmThreads.length} threads</span>
+                </span>
               </div>
               {dmThreads.length === 0 ? (
-                <div className="empty-state">No direct messages have arrived yet.</div>
+                <div className="empty-state dm-empty-state">
+                  {dmSubscriptionsLoading && <LoaderCircle size={15} className="spin-icon subtle-spinner" />}
+                  <span>
+                    {dmSubscriptionsLoading ? 'Checking for direct messages.' : 'No direct messages have arrived yet.'}
+                  </span>
+                </div>
               ) : (
                 dmThreads.map((thread) => {
                   const user = snapshot.users.find((candidate) => candidate.pubkey === thread.pubkey)
@@ -4969,7 +5010,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
                 Open group
               </Button>
               {relay.mode === 'live' && (
-                currentRelayIsSaved ? (
+                authState === 'connected' && currentRelayIsSaved ? (
                   <Button type="button" className="secondary-action danger" onClick={() => setShowRemoveRelayDialog(true)}>
                     <Trash2 size={16} />
                     Remove relay
@@ -5035,6 +5076,12 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
             <div>
               <p className="eyebrow">dm</p>
               <h2>{activeDmPeer?.name ?? nameFor(activeDmPubkey, snapshot.users)}</h2>
+              {dmSubscriptionsLoading && (
+                <span className="dm-sync-status" title={dmSyncTitle}>
+                  <LoaderCircle size={12} className="spin-icon subtle-spinner" />
+                  Syncing inbox
+                </span>
+              )}
             </div>
             <Button type="button" className="dm-back" onClick={() => setActiveDmPubkey(null)}>
               <ChevronLeft size={17} />

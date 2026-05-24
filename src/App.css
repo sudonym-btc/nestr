@@ -123,6 +123,21 @@
   background: var(--line);
 }
 
+.rail-loading-indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-top: -6px;
+  margin-bottom: -6px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--muted-foreground);
+  opacity: 0.72;
+}
+
 .side-panel {
   display: flex;
   flex-direction: column;
@@ -1004,15 +1019,27 @@ input:focus {
   text-transform: uppercase;
 }
 
-.section-title span:first-child {
+.section-title > span:first-child {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.section-title span:last-child {
+.section-title > span:last-child {
   flex: 0 0 auto;
+}
+
+.section-title-detail {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.subtle-spinner {
+  color: var(--muted-foreground);
+  opacity: 0.72;
 }
 
 .mesh-pill {
@@ -1931,6 +1958,16 @@ input:focus {
   font-weight: 800;
 }
 
+.dm-sync-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .dm-back {
   align-self: flex-start;
   gap: 5px;
@@ -2010,6 +2047,11 @@ input:focus {
   line-height: 1.35;
   padding: 16px;
   text-align: center;
+}
+
+.dm-empty-state {
+  gap: 8px;
+  grid-template-rows: auto auto;
 }
 
 .directory-header {

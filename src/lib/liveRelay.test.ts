@@ -66,12 +66,18 @@ describe('live NIP-29 helpers', () => {
     const staleRoomClose = vi.fn()
     const staleRelayClose = vi.fn()
     const freshRoomClose = vi.fn()
-    const roomSubscribe = vi.fn(() => ({ close: freshRoomClose }))
+    let roomOptions: { oneose?: () => void } | undefined
+    const roomSubscribe = vi.fn((filters: unknown, options: { oneose?: () => void }) => {
+      void filters
+      roomOptions = options
+      return { close: freshRoomClose }
+    })
     const querySync = vi.fn(async () => [])
 
     const relay = Object.create(LiveNip29Relay.prototype) as Record<string, unknown> & {
       refreshDirectMessageSubscriptions: () => void
       dmRelaySubs: Array<{ close: () => void }>
+      dmSubscriptionStatus: { legacyEose: boolean; nip17Eose: boolean }
     }
     relay.relayUrl = 'wss://relay.example'
     relay.signer = {
@@ -87,6 +93,7 @@ describe('live NIP-29 helpers', () => {
     relay.readRelays = new Map()
     relay.writeRelays = new Map()
     relay.dmSubscriptionGeneration = 0
+    relay.dmSubscriptionStatus = { legacyEose: true, nip17Eose: true }
 
     relay.refreshDirectMessageSubscriptions()
     await vi.waitFor(() => expect(roomSubscribe).toHaveBeenCalledOnce())
@@ -97,7 +104,35 @@ describe('live NIP-29 helpers', () => {
       [...legacyDirectMessageReadFilters(pubkey), ...legacyDirectMessageWriteFilters(pubkey)],
       expect.objectContaining({ eoseTimeout: 3500 }),
     )
+    expect(relay.dmSubscriptionStatus).toEqual({ legacyEose: false, nip17Eose: true })
+    roomOptions?.oneose?.()
+    expect(relay.dmSubscriptionStatus).toEqual({ legacyEose: true, nip17Eose: true })
     expect(relay.dmRelaySubs).toEqual([])
+  })
+
+  it('starts inbox subscriptions as soon as a signer is applied', () => {
+    const pubkey = 'f'.repeat(64)
+    const relay = new LiveNip29Relay(undefined, 'wss://relay.example') as unknown as Record<string, unknown> & {
+      setSigner: (signer: { pubkey: string; label: string; signEvent: (event: NestrEventTemplate) => Promise<NestrEvent> }) => void
+      refreshDirectMessageSubscriptions: () => void
+      authenticateAndRefetch: () => Promise<void>
+      fetchSavedSimpleGroups: (pubkey: string, options?: { showLoading?: boolean }) => Promise<void>
+      emit: () => void
+    }
+    const refreshDirectMessageSubscriptions = vi
+      .spyOn(relay, 'refreshDirectMessageSubscriptions')
+      .mockImplementation(() => undefined)
+    vi.spyOn(relay, 'authenticateAndRefetch').mockResolvedValue(undefined)
+    vi.spyOn(relay, 'fetchSavedSimpleGroups').mockResolvedValue(undefined)
+    vi.spyOn(relay, 'emit').mockImplementation(() => undefined)
+
+    relay.setSigner({
+      pubkey,
+      label: 'test',
+      signEvent: vi.fn(),
+    })
+
+    expect(refreshDirectMessageSubscriptions).toHaveBeenCalledOnce()
   })
 
   it('routes direct message subscriptions to the user advertised DM relays', async () => {
@@ -300,6 +335,85 @@ describe('live NIP-29 helpers', () => {
       { maxWait: 50 },
     )
     expect(roomClose).toHaveBeenCalledOnce()
+  })
+
+  it('falls back to users advertised write relays for missing profile metadata in batches', async () => {
+    const alice = 'a'.repeat(64)
+    const bob = 'b'.repeat(64)
+    const relayList = (pubkey: string): NestrEvent => ({
+      id: `relay-${pubkey.slice(0, 1)}`,
+      sig: 'sig',
+      pubkey,
+      kind: 10002,
+      created_at: 2,
+      tags: [['r', 'wss://write.example', 'write']],
+      content: '',
+    })
+    const profile = (pubkey: string, name: string): NestrEvent => ({
+      id: `profile-${pubkey.slice(0, 1)}`,
+      sig: 'sig',
+      pubkey,
+      kind: 0,
+      created_at: 3,
+      tags: [],
+      content: JSON.stringify({ name }),
+    })
+    const profileQuery = vi.fn(async (relays: string[], filterArg: unknown) => {
+      const filter = filterArg as { kinds?: number[]; authors?: string[] }
+      if (filter.kinds?.includes(10002) && filter.kinds.includes(0)) {
+        return [relayList(alice), relayList(bob)]
+      }
+      if (
+        relays.length === 1 &&
+        relays[0] === 'wss://write.example' &&
+        filter.kinds?.includes(0) &&
+        filter.authors?.includes(alice) &&
+        filter.authors.includes(bob)
+      ) {
+        return [profile(alice, 'Alice'), profile(bob, 'Bob')]
+      }
+      return []
+    })
+    const relay = Object.create(LiveNip29Relay.prototype) as Record<string, unknown> & {
+      fetchQueuedProfiles: () => Promise<void>
+      users: Map<string, { name: string }>
+    }
+    relay.closed = false
+    relay.relayUrl = 'wss://groups.0xchat.com'
+    relay.profilePool = { querySync: profileQuery }
+    relay.profileQueue = new Set([alice, bob])
+    relay.profiles = new Map()
+    relay.users = new Map()
+    relay.blossomServers = new Map()
+    relay.dmRelays = new Map()
+    relay.dmRelayEvents = new Map()
+    relay.relayListEvents = new Map()
+    relay.readRelays = new Map()
+    relay.writeRelays = new Map()
+    relay.adminRoles = new Map()
+    relay.memberPubkeys = new Set()
+    relay.emit = vi.fn()
+
+    await relay.fetchQueuedProfiles()
+
+    expect(profileQuery).toHaveBeenCalledWith(
+      ['wss://purplepag.es', 'wss://relay.damus.io'],
+      expect.objectContaining({
+        kinds: [0, 10050, 10063, 10002],
+        authors: [alice, bob],
+      }),
+      { maxWait: 2600 },
+    )
+    expect(profileQuery).toHaveBeenCalledWith(
+      ['wss://write.example'],
+      expect.objectContaining({
+        kinds: [0, 10063],
+        authors: [alice, bob],
+      }),
+      { maxWait: 2600 },
+    )
+    expect(relay.users.get(alice)?.name).toBe('Alice')
+    expect(relay.users.get(bob)?.name).toBe('Bob')
   })
 
   it('saves the current relay by publishing the public NIP-51 relay tag', async () => {
