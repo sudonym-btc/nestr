@@ -3060,6 +3060,15 @@ input:focus {
   overflow-wrap: anywhere;
 }
 
+.left-panel > .about {
+  display: block;
+  overflow: visible;
+  margin-top: 0;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  -webkit-line-clamp: unset;
+}
+
 .brand-row > div,
 .relay-nav-row span,
 .person > span:last-child,

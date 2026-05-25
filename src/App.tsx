@@ -20,6 +20,7 @@ import {
   PhoneOff,
   Download,
   File as FileIcon,
+  CircleHelp,
   Home,
   Image,
   Info,
@@ -126,6 +127,7 @@ const PROXIMITY_CALL_RADIUS = 136
 const ICE_CANDIDATE_BATCH_DELAY_MS = 350
 const AUTO_CALL_PREFS_STORAGE_PREFIX = 'nestr:auto-call-media:v1'
 const JOIN_STATUS_REFRESH_DELAYS_MS = [1200, 3500, 8000, 15000, 25000, 40000, 60000, 90000, 120000]
+const GITHUB_ISSUES_URL = 'https://github.com/sudonym-btc/nestr/issues'
 const HOME_RELAY_URL = 'wss://groups.0xchat.com'
 const HOME_LAUNCH: LiveLaunch = {
   mode: 'live',
@@ -930,6 +932,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   )
   const [activeSigner, setActiveSigner] = useState<NestrSigner | null>(null)
   const [adminStatus, setAdminStatus] = useState('Chatroom controls ready')
+  const [joinRequestPending, setJoinRequestPending] = useState(false)
   const [joinReason, setJoinReason] = useState('')
   const [joinCode, setJoinCode] = useState('')
   const [targetInput, setTargetInput] = useState('')
@@ -994,6 +997,7 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
   const canEnterOfficeRef = useRef(false)
   const positionRefreshRef = useRef<() => void>(() => undefined)
   const positionRefreshFallbackInFlightRef = useRef(false)
+  const joinRequestPendingRef = useRef(false)
   const joinStatusTimersRef = useRef<number[]>([])
   const callStartedRef = useRef(false)
   const autoCallKeyRef = useRef('')
@@ -2521,6 +2525,10 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
     navigateInApp(url)
   }
 
+  function openHelpIssues() {
+    window.open(GITHUB_ISSUES_URL, '_blank', 'noopener,noreferrer')
+  }
+
   function navigateToDirectMessages() {
     const url = new URL(window.location.href)
     url.searchParams.set('relay', snapshot.group.relay)
@@ -2643,12 +2651,21 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
 
   async function requestJoin(event: FormEvent) {
     event.preventDefault()
-    const ok = await runNip29Action('join request', () => relay.publishJoinRequest(selfPubkey, joinReason, joinCode))
-    if (ok) {
-      setJoinReason('')
-      setJoinCode('')
-      setAdminDialog(null)
-      scheduleJoinStatusChecks()
+    if (joinRequestPendingRef.current) return
+
+    joinRequestPendingRef.current = true
+    setJoinRequestPending(true)
+    try {
+      const ok = await runNip29Action('join request', () => relay.publishJoinRequest(selfPubkey, joinReason, joinCode))
+      if (ok) {
+        setJoinReason('')
+        setJoinCode('')
+        setAdminDialog(null)
+        scheduleJoinStatusChecks()
+      }
+    } finally {
+      joinRequestPendingRef.current = false
+      setJoinRequestPending(false)
     }
   }
 
@@ -4016,9 +4033,9 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
                     ? 'Closed chatrooms ignore normal requests unless the relay recognizes this code.'
                     : 'The message and invite code are both optional. The relay decides how moderators see join requests.'}
                 </span>
-                <Button type="submit" className="primary-action">
-                  <DoorOpen size={16} />
-                  Request
+                <Button type="submit" className="primary-action" disabled={joinRequestPending}>
+                  {joinRequestPending ? <LoaderCircle size={16} className="spin-icon" /> : <DoorOpen size={16} />}
+                  {joinRequestPending ? 'Requesting' : 'Request'}
                 </Button>
               </form>
             </>
@@ -4300,6 +4317,15 @@ function OfficeApp({ launch }: { launch: MockLaunch | LiveLaunch }) {
           title="Home"
         >
           <Home size={22} />
+        </Button>
+        <Button
+          type="button"
+          className="rail-button"
+          onClick={openHelpIssues}
+          aria-label="Help"
+          title="Help"
+        >
+          <CircleHelp size={22} />
         </Button>
         <Button
           type="button"
