@@ -118,9 +118,17 @@ function normalizeRelayUrls(relays: string[]) {
 function roomRelayCanRunHelperFilter(filter: Filter) {
   const tagFilters = filter as Record<string, unknown>
   if (Array.isArray(tagFilters['#h']) || Array.isArray(tagFilters['#e']) || Array.isArray(tagFilters['#a'])) return true
+  const kinds = filter.kinds ?? []
+  if (
+    Array.isArray(filter.authors) &&
+    filter.authors.length > 0 &&
+    kinds.length > 0 &&
+    kinds.every((kind) => kind === NIP65_RELAY_LIST_KIND || kind === NIP51_KINDS.simpleGroups)
+  ) {
+    return true
+  }
   if (!Array.isArray(tagFilters['#d'])) return false
 
-  const kinds = filter.kinds ?? []
   return kinds.length > 0 && kinds.every((kind) => isRelayGeneratedGroupStateKind(kind))
 }
 
@@ -1889,35 +1897,35 @@ export class LiveNip29Relay {
     }
   }
 
-  private async fetchLegacyDmReadRelays(pubkey: string) {
-    return (await this.fetchLegacyDmRelayHints(pubkey)).read
-  }
-
-  private async fetchLegacyDmRelayHints(pubkey: string) {
+  private async fetchLegacyDmRelayHints(pubkey: string, options: { forceNetwork?: boolean } = {}) {
     const cachedRead = this.readRelays.get(pubkey)
     const cachedWrite = this.writeRelays.get(pubkey)
-    if (cachedRead || cachedWrite) {
+    if (!options.forceNetwork && (cachedRead || cachedWrite)) {
       return {
         read: cachedRead ?? [],
         write: cachedWrite ?? [],
       }
     }
 
+    const relayHints = new Set([this.relayUrl, ...PROFILE_RELAYS])
+    cachedWrite?.forEach((relayUrl) => relayHints.add(relayUrl))
+    cachedRead?.forEach((relayUrl) => relayHints.add(relayUrl))
+
     try {
       const events = await this.queryRelays(
-        [this.relayUrl, ...PROFILE_RELAYS],
+        Array.from(relayHints),
         { kinds: [NIP65_RELAY_LIST_KIND], authors: [pubkey], limit: 8 },
         3000,
       )
       const newest = events.sort((a, b) => b.created_at - a.created_at)[0]
-      if (!newest) return { read: [], write: [] }
+      if (!newest) return { read: cachedRead ?? [], write: cachedWrite ?? [] }
       this.receiveRelayList(newest)
       return {
         read: this.readRelays.get(pubkey) ?? [],
         write: this.writeRelays.get(pubkey) ?? [],
       }
     } catch {
-      return { read: [], write: [] }
+      return { read: cachedRead ?? [], write: cachedWrite ?? [] }
     }
   }
 
@@ -1931,9 +1939,19 @@ export class LiveNip29Relay {
 
     try {
       const relayHints = new Set([this.relayUrl, ...PROFILE_RELAYS])
-      const readRelays = await this.fetchLegacyDmReadRelays(pubkey)
+      const { read: readRelays, write: writeRelays } = await this.fetchLegacyDmRelayHints(pubkey, {
+        forceNetwork: true,
+      })
+      writeRelays.forEach((relayUrl) => relayHints.add(relayUrl))
       readRelays.forEach((relayUrl) => relayHints.add(relayUrl))
       if (this.signer !== signer) return
+
+      debugLog('relay', 'fetch saved simple groups', {
+        pubkey: shortId(pubkey),
+        relays: Array.from(relayHints),
+        writeRelays,
+        readRelays,
+      })
 
       const events = await this.queryRelays(
         Array.from(relayHints),

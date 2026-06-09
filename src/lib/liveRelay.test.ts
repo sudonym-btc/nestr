@@ -68,7 +68,11 @@ describe('live NIP-29 helpers', () => {
     const freshRoomClose = vi.fn()
     let roomOptions: { oneose?: () => void } | undefined
     const roomSubscribe = vi.fn((filters: unknown, options: { oneose?: () => void }) => {
-      void filters
+      const filterList = Array.isArray(filters) ? filters as Array<{ kinds?: number[] }> : []
+      if (filterList.some((filter) => filter.kinds?.includes(10002))) {
+        options.oneose?.()
+        return { close: vi.fn() }
+      }
       roomOptions = options
       return { close: freshRoomClose }
     })
@@ -96,14 +100,15 @@ describe('live NIP-29 helpers', () => {
     relay.dmSubscriptionStatus = { legacyEose: true, nip17Eose: true }
 
     relay.refreshDirectMessageSubscriptions()
-    await vi.waitFor(() => expect(roomSubscribe).toHaveBeenCalledOnce())
+    await vi.waitFor(() =>
+      expect(roomSubscribe).toHaveBeenCalledWith(
+        [...legacyDirectMessageReadFilters(pubkey), ...legacyDirectMessageWriteFilters(pubkey)],
+        expect.objectContaining({ eoseTimeout: 3500 }),
+      ),
+    )
 
     expect(staleRoomClose).toHaveBeenCalledOnce()
     expect(staleRelayClose).toHaveBeenCalledOnce()
-    expect(roomSubscribe).toHaveBeenCalledWith(
-      [...legacyDirectMessageReadFilters(pubkey), ...legacyDirectMessageWriteFilters(pubkey)],
-      expect.objectContaining({ eoseTimeout: 3500 }),
-    )
     expect(relay.dmSubscriptionStatus).toEqual({ legacyEose: false, nip17Eose: true })
     roomOptions?.oneose?.()
     expect(relay.dmSubscriptionStatus).toEqual({ legacyEose: true, nip17Eose: true })
@@ -133,6 +138,137 @@ describe('live NIP-29 helpers', () => {
     })
 
     expect(refreshDirectMessageSubscriptions).toHaveBeenCalledOnce()
+  })
+
+  it('fetches saved relays and groups from the signer advertised write relays', async () => {
+    const pubkey = '9'.repeat(64)
+    const relayList: NestrEvent = {
+      id: 'relay-list',
+      sig: 'sig',
+      pubkey,
+      kind: 10002,
+      created_at: 2,
+      tags: [
+        ['r', 'wss://read.example', 'read'],
+        ['r', 'wss://write.example', 'write'],
+      ],
+      content: '',
+    }
+    const simpleGroups: NestrEvent = {
+      id: 'simple-groups',
+      sig: 'sig',
+      pubkey,
+      kind: NIP51_KINDS.simpleGroups,
+      created_at: 3,
+      tags: [
+        ['r', 'wss://saved-relay.example'],
+        ['group', 'room', 'wss://saved-relay.example', 'Saved room'],
+      ],
+      content: '',
+    }
+    const queryRelays = vi.fn(async (relays: string[], filterArg: unknown) => {
+      const filter = filterArg as { kinds?: number[]; authors?: string[] }
+      if (filter.kinds?.includes(10002)) return [relayList]
+      if (filter.kinds?.includes(NIP51_KINDS.simpleGroups)) {
+        return relays.includes('wss://write.example') ? [simpleGroups] : []
+      }
+      return []
+    })
+    const relay = Object.create(LiveNip29Relay.prototype) as Record<string, unknown> & {
+      fetchSavedSimpleGroups: (pubkey: string, options?: { showLoading?: boolean }) => Promise<void>
+      savedRelayUrls: Set<string>
+      userSavedRelayUrls: Set<string>
+      savedGroupKeys: Set<string>
+    }
+    relay.closed = false
+    relay.relayUrl = 'wss://active.example'
+    relay.signer = { pubkey, label: 'test', signEvent: vi.fn() }
+    relay.queryRelays = queryRelays
+    relay.readRelays = new Map()
+    relay.writeRelays = new Map()
+    relay.relayListEvents = new Map()
+    relay.users = new Map()
+    relay.profiles = new Map()
+    relay.blossomServers = new Map()
+    relay.dmRelays = new Map()
+    relay.adminRoles = new Map()
+    relay.memberPubkeys = new Set()
+    relay.simpleGroupListEvents = new Map()
+    relay.savedRelayUrls = new Set()
+    relay.userSavedRelayUrls = new Set()
+    relay.savedGroupKeys = new Set()
+    relay.relayGroups = new Map()
+    relay.savedGroupsLoading = false
+    relay.emit = vi.fn()
+    relay.fetchSavedGroupState = vi.fn()
+
+    await relay.fetchSavedSimpleGroups(pubkey, { showLoading: false })
+    relay.closed = true
+
+    expect(queryRelays).toHaveBeenCalledWith(
+      expect.arrayContaining(['wss://active.example', 'wss://purplepag.es', 'wss://relay.damus.io']),
+      expect.objectContaining({ kinds: [10002], authors: [pubkey] }),
+      3000,
+    )
+    expect(queryRelays).toHaveBeenCalledWith(
+      expect.arrayContaining(['wss://write.example', 'wss://read.example']),
+      expect.objectContaining({ kinds: [NIP51_KINDS.simpleGroups], authors: [pubkey] }),
+      3200,
+    )
+    expect(relay.savedRelayUrls).toEqual(new Set(['wss://saved-relay.example']))
+    expect(relay.userSavedRelayUrls).toEqual(new Set(['wss://saved-relay.example']))
+    expect(relay.savedGroupKeys).toEqual(new Set([relayGroupKey('wss://saved-relay.example', 'room')]))
+    expect(relay.fetchSavedGroupState).toHaveBeenCalledWith([
+      expect.objectContaining({
+        groupId: 'room',
+        relayUrl: 'wss://saved-relay.example',
+        name: 'Saved room',
+      }),
+    ])
+  })
+
+  it('allows active-relay author lookups for NIP-65 and NIP-51 startup lists', async () => {
+    const pubkey = '1'.repeat(64)
+    const relayListEvent: NestrEvent = {
+      id: 'active-relay-list',
+      sig: 'sig',
+      pubkey,
+      kind: 10002,
+      created_at: 1,
+      tags: [['r', 'wss://active.example', 'write']],
+      content: '',
+    }
+    const simpleGroupsEvent: NestrEvent = {
+      id: 'active-simple-groups',
+      sig: 'sig',
+      pubkey,
+      kind: NIP51_KINDS.simpleGroups,
+      created_at: 2,
+      tags: [['r', 'wss://active.example']],
+      content: '',
+    }
+    const roomSubscribe = vi.fn((filters: unknown, options: { onevent?: (event: NestrEvent) => void; oneose?: () => void }) => {
+      const filter = Array.isArray(filters) ? filters[0] as { kinds?: number[] } : undefined
+      options.onevent?.(filter?.kinds?.includes(NIP51_KINDS.simpleGroups) ? simpleGroupsEvent : relayListEvent)
+      options.oneose?.()
+      return { close: vi.fn() }
+    })
+    const relay = Object.create(LiveNip29Relay.prototype) as Record<string, unknown> & {
+      queryRelays: (relays: string[], filter: { kinds: number[]; authors: string[] }, maxWait: number) => Promise<NestrEvent[]>
+    }
+    relay.closed = false
+    relay.relayUrl = 'wss://active.example'
+    relay.relay = { subscribe: roomSubscribe }
+    relay.profilePool = { querySync: vi.fn(async () => []) }
+
+    await expect(
+      relay.queryRelays(['wss://active.example'], { kinds: [10002], authors: [pubkey] }, 50),
+    ).resolves.toEqual([relayListEvent])
+    await expect(
+      relay.queryRelays(['wss://active.example'], { kinds: [NIP51_KINDS.simpleGroups], authors: [pubkey] }, 50),
+    ).resolves.toEqual([simpleGroupsEvent])
+
+    expect(roomSubscribe).toHaveBeenCalledTimes(2)
   })
 
   it('routes direct message subscriptions to the user advertised DM relays', async () => {
